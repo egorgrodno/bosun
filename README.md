@@ -14,6 +14,7 @@ A master Claude Code session that runs a tree of worker sessions. It answers the
 
 ```sh
 direnv allow     # or: nix develop
+git config core.hooksPath .githooks
 nix fmt
 nix flake check
 ```
