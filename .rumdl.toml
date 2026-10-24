@@ -1,0 +1,5 @@
+[global]
+# One physical line per paragraph, soft-wrapped by the editor.
+disable = ["MD013"]
+# treefmt runs rumdl from the tree root, where its cache would land.
+cache = false
