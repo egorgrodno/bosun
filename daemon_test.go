@@ -331,6 +331,47 @@ func TestWorkerExitTellsMaster(t *testing.T) {
 	}
 }
 
+func TestResume(t *testing.T) {
+	d, fc := testDaemon(t)
+	idleWait = 0
+	t.Cleanup(func() { idleWait = 30 * time.Second })
+	fc.mu.Lock()
+	fc.agents = append(fc.agents, agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a", Status: "busy"})
+	fc.mu.Unlock()
+	d.poll()
+	resume := Request{Op: "resume", Node: masterNode, Name: "a", Text: "fix the review"}
+	if _, err := call(context.Background(), resume); err == nil {
+		t.Fatal("resumed a worker in the middle of its turn")
+	}
+	fc.mu.Lock()
+	fc.agents[len(fc.agents)-1].Status = "idle"
+	fc.mu.Unlock()
+	if _, err := call(context.Background(), Request{Op: "resume", Node: "a", Name: "a", Text: "x"}); err == nil {
+		t.Fatal("a worker resumed itself")
+	}
+
+	mustCall(t, resume)
+	fc.mu.Lock()
+	dir := fc.dirs[len(fc.dirs)-1]
+	stopped := !slices.ContainsFunc(fc.agents, func(a agent) bool { return a.ID == "aaaaaaaa" })
+	fc.mu.Unlock()
+	if args := fc.lastStart(); dir != worktree || !slices.Equal(args, []string{"--bg", "--resume", "s-a", "--", "fix the review"}) {
+		t.Fatalf("claude ran in %s with %q", dir, args)
+	}
+	if !stopped {
+		t.Fatal("the worker was resumed without being stopped, which starts a copy")
+	}
+	d.poll()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if a := d.nodes["a"]; a.ID == "aaaaaaaa" || a.ID == "" {
+		t.Fatalf("a = %+v, want the id claude printed", a)
+	}
+	if len(d.events) != 0 {
+		t.Fatalf("the master got %+v", d.events)
+	}
+}
+
 func TestSpawn(t *testing.T) {
 	d, fc := testDaemon(t)
 	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1234")

@@ -28,7 +28,9 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Spawning.** `spawn` runs `claude --bg -n <node> -w <node>` with `--settings` and `--mcp-config`. The settings carry the hooks and `worktree.baseRef: head`. Sessions started outside bosun load nothing from it.
 
-**Models.** The daemon's `-master-model` and `-worker-model` pick the models, and `spawn` can pick one for a worker. A stopped `--bg` session keeps its options, model included. `claude --bg --resume <session-id>` without flags continues it under the same id. With any flag, it starts a copy of the conversation under a new id. `bosun model` switches the master that way, and the daemon follows the new id. Workers block on the daemon, not on the master, so they keep running through the switch.
+**Resuming.** A stopped `--bg` session keeps its options, model included. `claude --bg --resume <session-id>` without flags continues it under the same id. A prompt after `--` starts its next turn. With any flag, the command starts a copy of the conversation under a new id.
+
+**Models.** The daemon's `-master-model` and `-worker-model` pick the models, and `spawn` can pick one for a worker. `bosun model` switches the master by resuming it with `--model`, and the daemon follows the new id. Workers block on the daemon, not on the master, so they keep running through the switch.
 
 **Identity.** `--bg` ignores `--session-id` and picks its own. bosun knows a session by its node name, set in the environment of its hook commands and its MCP server. Each hook event carries Claude Code's `session_id`, which `claude agents --json` reports as `sessionId`, beside a short `id`.
 
@@ -75,6 +77,7 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 | `next_event` | master | blocks until a worker asks, needs a permission, ends a turn or exits, or a frontend sends `tell` |
 | `reply` | master | answers a question |
 | `decide` | master | allows or denies a permission |
+| `resume` | master | gives a worker that ended its turn a new prompt |
 | `escalate` | master | queues a question or a permission for you |
 
 **The master loops on `next_event`.** It calls `next_event`, handles the event, and calls it again. A `Stop` hook reports a turn's end, and `claude agents --json` reports an exit.

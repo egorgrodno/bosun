@@ -63,6 +63,10 @@ func tools(master bool) []tool {
 			"allow":   map[string]any{"type": "boolean", "description": "true to allow the tool call, false to deny it."},
 			"message": str("When denying, why. It reaches the worker verbatim, so tell it what to do instead."),
 		})},
+		{"resume", "Give a worker that ended its turn a new prompt, such as a fix after review. It carries on in the same conversation and worktree, and its next turn_end comes as an event.", object([]string{"name", "prompt"}, map[string]any{
+			"name":   str("The worker's node name."),
+			"prompt": str("What to do next. The worker remembers its task, so say only what is new."),
+		})},
 		{"escalate", "Hand a question or permission request to the user, who answers it from bosun. Its worker keeps waiting.", object([]string{"id"}, map[string]any{
 			"id":   str("The decision's id."),
 			"note": str("What the user should know, such as why you did not decide it yourself."),
@@ -248,6 +252,8 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	switch name {
 	case "spawn":
 		req.Name, req.Repo, req.Model, req.Text = args.Name, args.Repo, args.Model, args.Prompt
+	case "resume":
+		req.Name, req.Text = args.Name, args.Prompt
 	case "ask":
 		req.Text = args.Question
 	case "reply":

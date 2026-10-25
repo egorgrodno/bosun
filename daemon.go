@@ -41,6 +41,9 @@ const (
 	startGrace = 30 * time.Second
 )
 
+// idleWait bounds how long resume waits for a worker to be listed idle, which it is not until its Stop hook returns.
+var idleWait = 30 * time.Second
+
 var nodeName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
 
 type daemon struct {
@@ -324,6 +327,8 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 		err = d.tell(r.Text)
 	case "spawn":
 		resp.Session, err = d.spawn(r.Node, r.Name, r.Repo, r.Model, r.Text)
+	case "resume":
+		err = d.resume(ctx, r.Node, r.Name, r.Text)
 	case "kill":
 		err = d.kill(r.Name)
 	case "model":
@@ -939,6 +944,88 @@ func (d *daemon) kill(name string) error {
 		return fmt.Errorf("%s is still starting", name)
 	}
 	return d.claude.Stop(id)
+}
+
+// resume gives a worker that ended its turn a new prompt, which continues its conversation under the same id with its saved options.
+func (d *daemon) resume(ctx context.Context, caller, name, prompt string) error {
+	if caller != masterNode {
+		return errors.New("only the master resumes a worker")
+	}
+	if prompt == "" {
+		return errors.New("the prompt is empty")
+	}
+	d.mu.Lock()
+	n := d.nodes[name]
+	var id, dir, status string
+	if n != nil {
+		id, dir, status = n.ID, n.Dir, n.Status
+	}
+	d.mu.Unlock()
+	switch {
+	case n == nil || name == masterNode:
+		return fmt.Errorf("no worker %q", name)
+	case id == "":
+		return fmt.Errorf("%s is still starting", name)
+	case status == "exited":
+		return fmt.Errorf("%s has exited", name)
+	}
+	a, err := d.awaitIdle(ctx, name, id)
+	if err != nil {
+		return err
+	}
+
+	// Claude Code resumes a running session into a copy under a new id, so the worker stops first.
+	// Meanwhile the empty ID keeps poll from reporting it exited, and refuses a second resume.
+	d.mu.Lock()
+	if n.ID != id {
+		d.mu.Unlock()
+		return fmt.Errorf("%s is still starting", name)
+	}
+	n.ID = ""
+	d.mu.Unlock()
+	next := id
+	err = d.claude.Stop(id)
+	if err == nil {
+		next, err = d.claude.Start(dir, []string{"--bg", "--resume", a.SessionID, "--", prompt})
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err != nil {
+		n.ID = id
+		return err
+	}
+	n.ID, n.Status, n.State, n.pre = next, "starting", "", nil
+	d.started[name] = time.Now()
+	d.saveLocked()
+	d.broadcastSessionsLocked()
+	log.Printf("resumed %s (%s)", name, next)
+	return nil
+}
+
+// awaitIdle waits until Claude Code lists the session id as idle, and returns its listing.
+func (d *daemon) awaitIdle(ctx context.Context, name, id string) (agent, error) {
+	deadline := time.Now().Add(idleWait)
+	for {
+		agents, err := d.claude.Agents()
+		if err != nil {
+			return agent{}, err
+		}
+		i := slices.IndexFunc(agents, func(a agent) bool { return a.ID == id })
+		if i >= 0 && agents[i].Status == "idle" {
+			return agents[i], nil
+		}
+		if time.Now().After(deadline) {
+			if i < 0 {
+				return agent{}, fmt.Errorf("%s has exited", name)
+			}
+			return agent{}, fmt.Errorf("%s is still in its turn", name)
+		}
+		select {
+		case <-ctx.Done():
+			return agent{}, ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
 }
 
 // ensureMaster adopts the master of an earlier run while Claude Code still lists it, and starts one otherwise.
