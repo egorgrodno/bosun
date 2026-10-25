@@ -101,7 +101,10 @@ func printStatus(w io.Writer, s Response) {
 	walk = func(parent string, depth int) {
 		for _, n := range children[parent] {
 			state := n.Status
-			if n.State != "" {
+			switch {
+			case n.Killed:
+				state = "killed"
+			case n.State != "":
 				state += "/" + n.State
 			}
 			fmt.Fprintf(w, "  %s%-*s %-8s %-15s %s\n", strings.Repeat("  ", depth), 14-2*depth, n.Node, n.ID, state, n.Model)
