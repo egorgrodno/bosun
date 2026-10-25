@@ -378,6 +378,34 @@ func TestWorkerExitTellsMaster(t *testing.T) {
 	}
 }
 
+func TestPollDue(t *testing.T) {
+	d, fc := testDaemon(t)
+	fc.mu.Lock()
+	fc.agents = append(fc.agents, agent{ID: "aaaaaaaa", Name: "a", Status: "busy"})
+	fc.mu.Unlock()
+	d.poll()
+	if !d.pollDue(time.Now()) {
+		t.Fatal("no poll while sessions are in their turns")
+	}
+	fc.mu.Lock()
+	for i := range fc.agents {
+		fc.agents[i].Status = "idle"
+	}
+	fc.mu.Unlock()
+	d.poll()
+	now := time.Now()
+	if d.pollDue(now) {
+		t.Fatal("a poll while every session is idle")
+	}
+	if !d.pollDue(now.Add(quietPollEvery)) {
+		t.Fatal("no poll after a quiet minute")
+	}
+	receive(t, runHookAsync("a", hookEvent("PostToolUse", "t1", "Bash", bashTest)))
+	if !d.pollDue(now) {
+		t.Fatal("no poll after a hook")
+	}
+}
+
 func TestResume(t *testing.T) {
 	d, fc := testDaemon(t)
 	idleWait = 0

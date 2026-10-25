@@ -37,6 +37,8 @@ const (
 	// idleReturn bounds next_event, because text typed into the master waits until the call returns.
 	idleReturn = 4 * time.Minute
 	pollEvery  = 3 * time.Second
+	// quietPollEvery spaces the polls while no session is in its turn, since every turn begins with a hook.
+	quietPollEvery = time.Minute
 	// startGrace covers a session `claude --bg` started that `claude agents --json` does not list yet.
 	startGrace = 30 * time.Second
 )
@@ -74,6 +76,9 @@ type daemon struct {
 	stopBlocked bool
 	// asleep holds from a Stop that ends the master's turn with no events waiting until the next event resumes it.
 	asleep bool
+	// lastPoll and stirred decide whether the next tick polls: stirred holds from a hook or a kill until the poll after it.
+	lastPoll time.Time
+	stirred  bool
 }
 
 type watcher struct {
@@ -162,7 +167,9 @@ func runDaemon(args []string) error {
 		case <-ctx.Done():
 			return nil
 		case <-tick.C:
-			d.poll()
+			if d.pollDue(time.Now()) {
+				d.poll()
+			}
 		}
 	}
 }
@@ -401,6 +408,7 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 	if n.SessionID == "" {
 		n.SessionID = in.SessionID
 	}
+	d.stirred = true
 	var dec *Decision
 	var worktree string
 	switch in.Event {
@@ -960,6 +968,7 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 		},
 		"hooks": map[string]any{
 			"SessionStart":       quick,
+			"UserPromptSubmit":   quick,
 			"PreToolUse":         hold,
 			"PermissionRequest":  hold,
 			"PostToolUse":        quick,
@@ -1022,6 +1031,7 @@ func (d *daemon) kill(name string) error {
 	if n != nil {
 		id = n.ID
 	}
+	d.stirred = true
 	d.mu.Unlock()
 	switch {
 	case n == nil:
@@ -1213,11 +1223,33 @@ func (d *daemon) switchModel(model string) error {
 	return nil
 }
 
+// pollDue reports whether a poll could find a change: a session is in its turn or starting, something stirred since the last poll, or the last poll is quietPollEvery old.
+func (d *daemon) pollDue(now time.Time) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.stirred || now.Sub(d.lastPoll) >= quietPollEvery {
+		return true
+	}
+	for _, n := range d.nodes {
+		if n.ID == "" || (n.Status != "idle" && n.Status != "exited") {
+			return true
+		}
+	}
+	return false
+}
+
 // poll refreshes each session from `claude agents --json`, and tells the master of a worker that stopped being listed.
 func (d *daemon) poll() {
+	// A hook during the listing may begin a turn the listing misses, so it stirs the next poll.
+	d.mu.Lock()
+	d.stirred = false
+	d.mu.Unlock()
 	agents, err := d.claude.Agents()
 	if err != nil {
 		log.Print(err)
+		d.mu.Lock()
+		d.stirred = true
+		d.mu.Unlock()
 		return
 	}
 	byID := map[string]agent{}
@@ -1226,6 +1258,7 @@ func (d *daemon) poll() {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	d.lastPoll = time.Now()
 	changed := false
 	for _, n := range d.nodes {
 		if n.ID == "" {
