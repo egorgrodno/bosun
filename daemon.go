@@ -146,14 +146,17 @@ func runDaemon(args []string) error {
 	if err := d.fitsSockets(masterNode); err != nil {
 		return fmt.Errorf("the state path %s is too long, so set BOSUN_STATE to a shorter one: %w", d.stateDir, err)
 	}
-	if err := d.load(); err != nil {
-		return err
-	}
 	ln, err := listen(d.socket)
 	if err != nil {
 		return err
 	}
 	defer ln.Close()
+	if d.exe, err = linkExe(d.stateDir, exe); err != nil {
+		return err
+	}
+	if err := d.load(); err != nil {
+		return err
+	}
 	go d.serve(ln)
 	if err := d.ensureMaster(); err != nil {
 		return err
@@ -183,6 +186,21 @@ func listen(path string) (net.Listener, error) {
 	return net.Listen("unix", path)
 }
 
+// linkExe points dir/bosun at exe and returns the link, which every session's hooks and MCP server run.
+// A session started by an earlier build so runs this one, and never a path that garbage collection removed.
+func linkExe(dir, exe string) (string, error) {
+	link := filepath.Join(dir, "bosun")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	_ = os.Remove(link + ".new")
+	if err := os.Symlink(exe, link+".new"); err != nil {
+		return "", err
+	}
+	return link, os.Rename(link+".new", link)
+}
+
+// load adopts the sessions of an earlier run, and rewrites their settings for this build, which each reads when its process next starts.
 func (d *daemon) load() error {
 	data, err := os.ReadFile(filepath.Join(d.stateDir, "state.json"))
 	if errors.Is(err, fs.ErrNotExist) {
@@ -198,6 +216,9 @@ func (d *daemon) load() error {
 	d.nextID = st.NextID
 	for _, s := range st.Sessions {
 		d.nodes[s.Node] = s
+		if _, _, err := d.writeConfig(s); err != nil {
+			log.Printf("%s: %v", s.Node, err)
+		}
 	}
 	return nil
 }

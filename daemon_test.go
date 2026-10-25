@@ -378,6 +378,38 @@ func TestWorkerExitTellsMaster(t *testing.T) {
 	}
 }
 
+func TestLoadRewritesSettings(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(dir, "claude"))
+	old := newDaemon("/old/bosun", "sock", dir, "/master", &fakeClaude{})
+	old.nodes[masterNode] = &Session{Node: masterNode, Dir: "/master"}
+	if _, _, err := old.writeConfig(old.nodes[masterNode]); err != nil {
+		t.Fatal(err)
+	}
+	old.saveLocked()
+
+	link, err := linkExe(dir, "/new/bosun")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := newDaemon(link, "sock", dir, "/master", &fakeClaude{})
+	if err := d.load(); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"settings.json", "mcp.json"} {
+		data, err := os.ReadFile(filepath.Join(dir, "nodes", masterNode, name))
+		if err != nil || !strings.Contains(string(data), link) || strings.Contains(string(data), "/old/bosun") {
+			t.Fatalf("%s: %v\n%s", name, err, data)
+		}
+	}
+	if _, err := linkExe(dir, "/newer/bosun"); err != nil {
+		t.Fatal(err)
+	}
+	if target, err := os.Readlink(link); target != "/newer/bosun" {
+		t.Fatalf("the link points at %q: %v", target, err)
+	}
+}
+
 func TestPollDue(t *testing.T) {
 	d, fc := testDaemon(t)
 	fc.mu.Lock()
