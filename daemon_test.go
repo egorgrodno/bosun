@@ -1074,9 +1074,16 @@ func TestSwitchModelFailureResumesMaster(t *testing.T) {
 	}
 }
 
+// gitEnv is the environment without the GIT_CONFIG_* settings of a bosun session the tests may run in, whose excludesFile hides the files they look for.
+func gitEnv() []string {
+	return slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "GIT_CONFIG_") })
+}
+
 func git(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	out, err := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@t"}, args...)...).CombinedOutput()
+	cmd := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@t"}, args...)...)
+	cmd.Env = gitEnv()
+	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("git %v: %v: %s", args, err, out)
 	}
@@ -1117,7 +1124,7 @@ func TestSessionStartStandsInGitmodules(t *testing.T) {
 	data, _ := os.ReadFile(settingsPath)
 	_ = json.Unmarshal(data, &settings)
 	cmd := exec.Command("git", "-C", wt, "status", "--porcelain")
-	cmd.Env = os.Environ()
+	cmd.Env = gitEnv()
 	for k, v := range settings.Env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
