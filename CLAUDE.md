@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-bosun orchestrates Claude Code background sessions: one master and a tree of workers. [README.md](README.md) holds the scope. This file holds the design, of which the TUI, the panel, the systemd service and cleanup are not built yet. Its Claude Code behaviour and timings were measured against 2.1.310.
+bosun orchestrates Claude Code background sessions: one master and a tree of workers. [README.md](README.md) holds the scope. This file holds the design, of which the TUI, the panel and cleanup are not built yet. Its Claude Code behaviour and timings were measured against 2.1.310.
 
 ## Shape
 
@@ -16,7 +16,7 @@ One binary carries every part:
 
 | Command | Runs as |
 |---|---|
-| `bosun daemon` | a systemd user service, which starts the master |
+| `bosun daemon` | a systemd user service in the NixOS configuration's `modules/claude/`, which starts the master |
 | `bosun mcp` | the stdio MCP server each session starts, relaying to the daemon |
 | `bosun hook` | every hook each session runs |
 | `bosun tui` | the terminal frontend |
@@ -29,6 +29,8 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 **Spawning.** `spawn` runs `claude --bg -n <node> -w <node>` with `--settings` and `--mcp-config`. The settings carry the hooks and `worktree.baseRef: head`. Sessions started outside bosun load nothing from it.
 
 **Resuming.** A stopped `--bg` session keeps its options, model included. `claude --bg --resume <session-id>` without flags continues it under the same id. A prompt after `--` starts its next turn. With any flag, the command starts a copy of the conversation under a new id.
+
+**Supervisor.** A `claude --bg` that finds no supervisor starts Claude Code's supervisor in its own cgroup. The supervisor runs every background session and exits after the last one. Each session takes the supervisor's cgroup and environment, not those of its own `claude --bg`. So when the daemon starts the supervisor, every session runs in the daemon's cgroup.
 
 **Models.** The daemon's `-master-model` and `-worker-model` pick the models, and `spawn` can pick one for a worker. `bosun model` switches the master by resuming it with `--model`, and the daemon follows the new id. Workers block on the daemon, not on the master, so they keep running through the switch.
 
