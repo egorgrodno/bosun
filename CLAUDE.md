@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-bosun orchestrates Claude Code background sessions: one master and a tree of workers. [README.md](README.md) holds the scope. This file holds the design, of which the TUI and the panel are not built yet. Its Claude Code behaviour and timings were measured against 2.1.310.
+bosun orchestrates Claude Code background sessions: one master and a tree of workers. [README.md](README.md) holds the scope. This file holds the design, of which the TUI is not built yet. Its Claude Code behaviour and timings were measured against 2.1.310.
 
 ## Shape
 
@@ -105,7 +105,7 @@ Every frontend is a thin client of one protocol on the daemon's socket. A fronte
 
 Each leads with the queue of decisions waiting on you, above the tree.
 
-- **Quickshell panel.** It lives in the NixOS configuration's `modules/quickshell/`. Opening a session runs `claude attach <id>` in a new kitty window.
+- **Quickshell panel.** It lives in the NixOS configuration's `modules/quickshell/`, as the `Agents` bar module and `BosunPanel`, and reads the protocol through `bosun watch`. Opening a session runs `claude attach <id>` in a new kitty window. `quickshell ipc call bosun toggle` opens it.
 - **`bosun tui`.** Opening a session runs `claude attach` in the TUI's terminal. `Ctrl+Z` exits `claude attach` with status 0, leaving the session running.
 
 ## Open questions

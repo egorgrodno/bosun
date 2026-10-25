@@ -2,7 +2,7 @@
 
 A master Claude Code session that runs a tree of worker sessions. It answers their routine questions and brings you the rest. A Quickshell panel drives it on the NixOS desktops, and a TUI drives it everywhere else.
 
-[CLAUDE.md](CLAUDE.md) holds the design. The daemon and a command-line frontend work. The TUI and the panel are not built.
+[CLAUDE.md](CLAUDE.md) holds the design. The daemon, a command-line frontend and the Quickshell panel work. The TUI is not built.
 
 ## Scope
 
