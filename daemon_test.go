@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -85,7 +86,12 @@ const worktree = "/repo/.claude/worktrees/a"
 // testDaemon serves a daemon with a master and a worker "a" on a socket the hook and call reach through BOSUN_SOCKET.
 func testDaemon(t *testing.T) (*daemon, *fakeClaude) {
 	dir := t.TempDir()
-	sock := filepath.Join(dir, "sock")
+	// t.TempDir() runs deep inside a worker's sandbox, so the daemon listens on an abstract socket, whose name no folder lengthens.
+	// No fake session creates the sandbox's sockets, so a node's TMPDIR may run past their room.
+	sock := fmt.Sprintf("@bosun-%d-%s", os.Getpid(), t.Name())
+	room := tempDirRoom
+	tempDirRoom = math.MaxInt
+	t.Cleanup(func() { tempDirRoom = room })
 	t.Setenv("BOSUN_SOCKET", sock)
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(dir, "claude"))
 	fc := &fakeClaude{}

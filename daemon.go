@@ -232,12 +232,14 @@ func (d *daemon) tempDir(node string) string {
 	return filepath.Join(d.stateDir, "nodes", node, "tmp")
 }
 
-// fitsSockets fails when node's TMPDIR is too long for the sockets Claude Code's sandbox creates in it, without which every Bash call fails.
+// tempDirRoom is the most bytes a TMPDIR may hold beside the sockets Claude Code's sandbox creates in it.
 // The longest is claude-socks-<16 hex>.sock, and Linux binds a unix socket path of at most 108 bytes.
+var tempDirRoom = 108 - len("/claude-socks-0123456789abcdef.sock")
+
+// fitsSockets fails when node's TMPDIR is too long for the sandbox's sockets, without which every Bash call fails.
 func (d *daemon) fitsSockets(node string) error {
-	dir := d.tempDir(node)
-	if room := 108 - len("/claude-socks-0123456789abcdef.sock"); len(dir) > room {
-		return fmt.Errorf("%s runs to %d bytes, and the sandbox's sockets need it at most %d", dir, len(dir), room)
+	if dir := d.tempDir(node); len(dir) > tempDirRoom {
+		return fmt.Errorf("%s runs to %d bytes, and the sandbox's sockets need it at most %d", dir, len(dir), tempDirRoom)
 	}
 	return nil
 }
