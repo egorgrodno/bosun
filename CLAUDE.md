@@ -84,11 +84,11 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 
 **The master loops on `next_event`.** It calls `next_event`, handles the event, and calls it again. A `Stop` hook reports a worker's turn end, and `claude agents --json` reports an exit.
 
-**The daemon keeps the master's turn going.** It blocks the master's `Stop`, which sends the master back to `next_event`. A `Stop` that comes before the master has called `next_event` since the last block gets through, and the daemon queues a notice for you. While the daemon is stopped, the master's calls fail and its `Stop` hook cannot block, so its turn ends. A daemon that starts and adopts an idle master resumes it.
+**An idle master sleeps.** Once `next_event` returns empty, the master ends its turn, and the next event resumes it. So an idle master spends no turns. The daemon blocks a `Stop` that comes while events wait, which sends the master back to `next_event`. If the master stops again before calling `next_event`, the daemon lets it, queues a notice for you, and the next event resumes it. While the daemon is stopped, the master's calls fail and its turn ends. On start, the daemon adopts an idle master as asleep.
 
 **Blocking tools send progress.** Claude Code aborts a stdio tool call that sends nothing for 30 seconds. While `next_event` or `ask` blocks, it sends `notifications/progress` on the call's `progressToken` every 10 seconds. Claude Code also moves a call still running after 120 seconds to the background, unless the settings' `env` sets `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` to `0`.
 
-**Typing to the master.** Text typed into the master's session waits until the current tool call returns. So `next_event` must return empty within five minutes. A frontend's `tell` reaches the master as an event straight away.
+**Typing to the master.** Text typed into a sleeping master starts its turn. Text typed while a tool call runs waits until the call returns, so `next_event` must return empty within five minutes. A frontend's `tell` reaches the master as an event straight away.
 
 ## Frontends
 

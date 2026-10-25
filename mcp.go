@@ -53,7 +53,7 @@ func tools(master bool) []tool {
 			"prompt": str("The worker's task. It sees nothing else, so say everything it needs."),
 			"model":  str(modelHelp),
 		})},
-		{"next_event", "Wait up to four minutes for events from the workers and the user. Returns them as JSON, or says there were none. Call it again either way.", object([]string{}, map[string]any{})},
+		{"next_event", "Wait up to four minutes for events from the workers and the user. Returns them as JSON, or says there were none. Call it again after handling them, and end your turn when there were none: the next event starts a new one.", object([]string{}, map[string]any{})},
 		{"reply", "Answer a worker's question. The worker gets the answer as the result of its ask.", object([]string{"id", "answer"}, map[string]any{
 			"id":     str("The decision's id."),
 			"answer": str("The answer."),
@@ -282,7 +282,7 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		return resp.Text, nil
 	case "next_event":
 		if len(resp.Events) == 0 {
-			return "No events.", nil
+			return "No events. End your turn: the next event starts a new one.", nil
 		}
 		data, err := json.MarshalIndent(resp.Events, "", "  ")
 		return string(data), err

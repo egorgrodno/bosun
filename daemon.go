@@ -44,6 +44,11 @@ const (
 // idleWait bounds how long resume waits for a worker to be listed idle, which it is not until its Stop hook returns.
 var idleWait = 30 * time.Second
 
+var errInTurn = errors.New("still in its turn")
+
+// eventsWaiting is the prompt that wakes the master, and the reason a block of its Stop gives.
+const eventsWaiting = "Events are waiting: call next_event."
+
 var nodeName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
 
 type daemon struct {
@@ -67,6 +72,8 @@ type daemon struct {
 	// stopBlocked holds from a block of the master's Stop until its next call to next_event.
 	// Claude Code's stop_hook_active cannot stand in: it stays true for the rest of the turn a block continued.
 	stopBlocked bool
+	// asleep holds from a Stop that ends the master's turn with no events waiting until the next event resumes it.
+	asleep bool
 }
 
 type watcher struct {
@@ -426,13 +433,16 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 		switch {
 		case node != masterNode:
 			d.pushLocked(Event{Kind: "turn_end", Node: node, Text: in.LastMessage})
+		case len(d.pendingLocked()) == 0:
+			d.asleep = true
+			log.Print("the master sleeps until the next event")
 		case !d.stopBlocked:
-			// A master whose turn ended would read no events.
-			resp.Behavior, resp.Text = "block", "You are the bosun master, and your turn never ends: call next_event."
+			resp.Behavior, resp.Text = "block", eventsWaiting
 			d.stopBlocked = true
 		default:
 			// The block did not send the master back to next_event, and blocking it again might never end.
-			d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("The master ended its turn twice in a row, so it reads no events. claude attach %s shows why, and restarting the daemon resumes it.", n.ID)})
+			d.asleep = true
+			d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("The master ended its turn twice in a row while events waited, so it has not read them. claude attach %s shows why, and the next event resumes it.", n.ID)})
 		}
 	}
 	if dec != nil {
@@ -667,26 +677,49 @@ func (d *daemon) pushLocked(ev Event) {
 	d.events = append(d.events, ev)
 	close(d.wake)
 	d.wake = make(chan struct{})
+	if d.asleep {
+		d.asleep = false
+		go d.wakeMaster()
+	}
 }
 
-// nextEvent waits for the master's events and returns them all, leaving out decisions settled or escalated since.
+// wakeMaster resumes the master asleep. A master found in a turn, as one is once the user types into it, needs no waking: its Stop finds the events waiting.
+func (d *daemon) wakeMaster() {
+	err := d.carryOn(context.Background(), masterNode, eventsWaiting)
+	if err == nil || errors.Is(err, errInTurn) {
+		return
+	}
+	log.Printf("waking the master: %v", err)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.asleep = true
+	d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("Waking the master failed, so its events wait unread: %v. The next event tries again, and restarting the daemon starts a master that exited.", err)})
+}
+
+// pendingLocked returns the master's events, leaving out decisions settled or escalated since.
+func (d *daemon) pendingLocked() []Event {
+	var evs []Event
+	for _, ev := range d.events {
+		if ev.Decision != nil {
+			if cur := d.decisions[ev.Decision.ID]; cur == nil || cur.Holder != "master" {
+				continue
+			}
+		}
+		evs = append(evs, ev)
+	}
+	return evs
+}
+
+// nextEvent waits for the master's events and returns them all.
 func (d *daemon) nextEvent(ctx context.Context) []Event {
 	timer := time.NewTimer(idleReturn)
 	defer timer.Stop()
 	d.mu.Lock()
-	d.stopBlocked = false
+	d.stopBlocked, d.asleep = false, false
 	d.mu.Unlock()
 	for {
 		d.mu.Lock()
-		var evs []Event
-		for _, ev := range d.events {
-			if ev.Decision != nil {
-				if cur := d.decisions[ev.Decision.ID]; cur == nil || cur.Holder != "master" {
-					continue
-				}
-			}
-			evs = append(evs, ev)
-		}
+		evs := d.pendingLocked()
 		d.events = nil
 		wake := d.wake
 		d.mu.Unlock()
@@ -1079,7 +1112,7 @@ func (d *daemon) awaitIdle(ctx context.Context, name, id string) (agent, error) 
 			if i < 0 {
 				return agent{}, fmt.Errorf("%s has exited", name)
 			}
-			return agent{}, fmt.Errorf("%s is still in its turn", name)
+			return agent{}, fmt.Errorf("%s is %w", name, errInTurn)
 		}
 		select {
 		case <-ctx.Done():
@@ -1090,7 +1123,7 @@ func (d *daemon) awaitIdle(ctx context.Context, name, id string) (agent, error) 
 }
 
 // ensureMaster adopts the master of an earlier run while Claude Code still lists it, and starts one otherwise.
-// An adopted master that ended its turn, as one does once its calls to a stopped daemon fail, is resumed.
+// An adopted master that ended its turn, as one does once its calls to a stopped daemon fail, sleeps until the next event.
 func (d *daemon) ensureMaster() error {
 	agents, err := d.claude.Agents()
 	if err != nil {
@@ -1099,12 +1132,8 @@ func (d *daemon) ensureMaster() error {
 	d.mu.Lock()
 	if m := d.nodes[masterNode]; m != nil {
 		if i := slices.IndexFunc(agents, func(a agent) bool { return a.ID == m.ID }); i >= 0 {
+			d.asleep = agents[i].Status == "idle"
 			d.mu.Unlock()
-			if agents[i].Status == "idle" {
-				if err := d.carryOn(context.Background(), masterNode, "The bosun daemon restarted, so your last calls to it failed. Carry on: call next_event."); err != nil {
-					return fmt.Errorf("resuming the master: %w", err)
-				}
-			}
 			return nil
 		}
 	}
@@ -1160,6 +1189,7 @@ func (d *daemon) switchModel(model string) error {
 	d.mu.Lock()
 	m.ID, m.SessionID, m.Model = id, "", model
 	m.Status, m.State, m.pre = "starting", "", nil
+	d.asleep = false
 	d.started[masterNode] = time.Now()
 	// The old master may have taken decisions it never answered.
 	queued := map[string]bool{}

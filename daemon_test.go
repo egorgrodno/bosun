@@ -420,43 +420,58 @@ func TestResume(t *testing.T) {
 }
 
 // A daemon that stopped left the master's calls failing, so the master may have ended its turn.
-func TestRestartResumesIdleMaster(t *testing.T) {
+func TestRestartLeavesIdleMasterAsleep(t *testing.T) {
 	d, fc := testDaemon(t)
 	idleWait = 0
 	t.Cleanup(func() { idleWait = 30 * time.Second })
-	if err := d.ensureMaster(); err != nil || len(fc.starts) != 1 {
-		t.Fatalf("adopting a busy master: %v, %d starts", err, len(fc.starts))
-	}
 	fc.mu.Lock()
 	fc.agents[0].SessionID, fc.agents[0].Status = "s-m", "idle"
 	fc.mu.Unlock()
-	if err := d.ensureMaster(); err != nil {
-		t.Fatal(err)
+	if err := d.ensureMaster(); err != nil || len(fc.starts) != 1 {
+		t.Fatalf("adopting an idle master: %v, %d starts", err, len(fc.starts))
+	}
+
+	mustCall(t, Request{Op: "tell", Text: "x"})
+	for i := 0; ; i++ {
+		d.mu.Lock()
+		id := d.nodes[masterNode].ID
+		d.mu.Unlock()
+		if id == "00000002" {
+			break
+		}
+		if i == 500 {
+			t.Fatalf("the master's id is %q, want the resumed session's", id)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	fc.mu.Lock()
 	stopped := !slices.ContainsFunc(fc.agents, func(a agent) bool { return a.ID == "00000001" })
 	fc.mu.Unlock()
-	if args := fc.lastStart(); len(args) != 5 || !slices.Equal(args[:4], []string{"--bg", "--resume", "s-m", "--"}) || !stopped {
+	if args := fc.lastStart(); !slices.Equal(args, []string{"--bg", "--resume", "s-m", "--", eventsWaiting}) || !stopped {
 		t.Fatalf("claude ran with %q, the old master stopped: %v", args, stopped)
 	}
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if id := d.nodes[masterNode].ID; id != "00000002" {
-		t.Fatalf("the master's id is %q, want the resumed session's", id)
+	if events := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events; len(events) != 1 || events[0].Kind != "tell" {
+		t.Fatalf("events = %+v", events)
 	}
 }
 
-func TestMasterStopBlocks(t *testing.T) {
-	testDaemon(t)
+func TestMasterStop(t *testing.T) {
+	d, _ := testDaemon(t)
 	stop := func() string { return receive(t, runHookAsync(masterNode, hookEvent("Stop", "", "", nil))) }
-	block := `{"decision":"block","reason":`
-	if out := stop(); !strings.HasPrefix(out, block) {
-		t.Fatalf("the master's Stop printed %s", out)
+	if out := stop(); out != "null" {
+		t.Fatalf("the master's Stop with no events waiting printed %s", out)
 	}
+	d.mu.Lock()
+	asleep := d.asleep
+	d.asleep = false
+	d.mu.Unlock()
+	if !asleep {
+		t.Fatal("the master ended its turn without sleeping")
+	}
+
 	mustCall(t, Request{Op: "tell", Text: "x"})
-	mustCall(t, Request{Op: "next_event", Node: masterNode})
-	if out := stop(); !strings.HasPrefix(out, block) {
-		t.Fatalf("a Stop after next_event printed %s", out)
+	if out := stop(); !strings.HasPrefix(out, `{"decision":"block","reason":`) {
+		t.Fatalf("the master's Stop with an event waiting printed %s", out)
 	}
 	if n := len(mustCall(t, Request{Op: "status"}).Decisions); n != 0 {
 		t.Fatalf("%d decisions open", n)
@@ -467,6 +482,37 @@ func TestMasterStopBlocks(t *testing.T) {
 	}
 	if dec := openDecision(t, 1); dec.Kind != "notice" {
 		t.Fatalf("decision = %+v", dec)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.asleep {
+		t.Fatal("the master that ignored the block sleeps through the next event")
+	}
+}
+
+func TestWakeMasterFails(t *testing.T) {
+	d, fc := testDaemon(t)
+	idleWait = 0
+	t.Cleanup(func() { idleWait = 30 * time.Second })
+	d.poll()
+	// A master in a turn, as one the user typed into is, finds the events at its Stop.
+	d.wakeMaster()
+	if n := len(mustCall(t, Request{Op: "status"}).Decisions); n != 0 || len(fc.starts) != 1 {
+		t.Fatalf("waking a master in its turn: %d decisions, %d starts", n, len(fc.starts))
+	}
+
+	fc.mu.Lock()
+	fc.agents = nil
+	fc.mu.Unlock()
+	d.poll()
+	d.wakeMaster()
+	if dec := openDecision(t, 1); dec.Kind != "notice" {
+		t.Fatalf("decision = %+v", dec)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if !d.asleep {
+		t.Fatal("a master that could not be woken is not tried again")
 	}
 }
 

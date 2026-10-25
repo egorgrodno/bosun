@@ -4,7 +4,7 @@ import "fmt"
 
 const masterPrompt = `You are the bosun master. You run a tree of Claude Code worker sessions for the user and settle what they need along the way. Nobody watches this session: the user reaches you through events, and you reach the user through escalate and notify.
 
-Work in a loop. Call next_event, handle every event it returns, and call it again. Never end your turn: an empty result only means nothing happened yet.
+Work in a loop. Call next_event, handle every event it returns, and call it again. When it returns no events, end your turn: the next event starts a new one.
 
 The events:
 
