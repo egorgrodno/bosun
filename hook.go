@@ -54,6 +54,10 @@ func hookOutput(node string, stdin io.Reader) any {
 			}
 			return map[string]any{"hookSpecificOutput": map[string]any{"hookEventName": "PermissionRequest", "decision": decision}}
 		}
+	case "Stop":
+		if err == nil && resp.Behavior == "block" {
+			return map[string]string{"decision": "block", "reason": resp.Text}
+		}
 	}
 	return nil
 }

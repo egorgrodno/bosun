@@ -64,6 +64,9 @@ type daemon struct {
 	events    []Event
 	wake      chan struct{}
 	watchers  map[*watcher]bool
+	// stopBlocked holds from a block of the master's Stop until its next call to next_event.
+	// Claude Code's stop_hook_active cannot stand in: it stays true for the rest of the turn a block continued.
+	stopBlocked bool
 }
 
 type watcher struct {
@@ -420,8 +423,16 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 	case "Stop":
 		n.pre = nil
 		d.withdrawLocked(node, func(*Decision) bool { return true })
-		if node != masterNode {
+		switch {
+		case node != masterNode:
 			d.pushLocked(Event{Kind: "turn_end", Node: node, Text: in.LastMessage})
+		case !d.stopBlocked:
+			// A master whose turn ended would read no events.
+			resp.Behavior, resp.Text = "block", "You are the bosun master, and your turn never ends: call next_event."
+			d.stopBlocked = true
+		default:
+			// The block did not send the master back to next_event, and blocking it again might never end.
+			d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("The master ended its turn twice in a row, so it reads no events. claude attach %s shows why, and restarting the daemon resumes it.", n.ID)})
 		}
 	}
 	if dec != nil {
@@ -662,6 +673,9 @@ func (d *daemon) pushLocked(ev Event) {
 func (d *daemon) nextEvent(ctx context.Context) []Event {
 	timer := time.NewTimer(idleReturn)
 	defer timer.Stop()
+	d.mu.Lock()
+	d.stopBlocked = false
+	d.mu.Unlock()
 	for {
 		d.mu.Lock()
 		var evs []Event
@@ -985,7 +999,7 @@ func (d *daemon) kill(name string) error {
 	return d.claude.Stop(id)
 }
 
-// resume gives a worker that ended its turn a new prompt, which continues its conversation under the same id with its saved options.
+// resume gives a worker that ended its turn a new prompt.
 func (d *daemon) resume(ctx context.Context, caller, name, prompt string) error {
 	if caller != masterNode {
 		return errors.New("only the master resumes a worker")
@@ -993,6 +1007,14 @@ func (d *daemon) resume(ctx context.Context, caller, name, prompt string) error 
 	if prompt == "" {
 		return errors.New("the prompt is empty")
 	}
+	if name == masterNode {
+		return fmt.Errorf("no worker %q", name)
+	}
+	return d.carryOn(ctx, name, prompt)
+}
+
+// carryOn gives a session that ended its turn a new prompt, which continues its conversation under the same id with its saved options.
+func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	d.mu.Lock()
 	n := d.nodes[name]
 	var id, dir, status string
@@ -1001,8 +1023,8 @@ func (d *daemon) resume(ctx context.Context, caller, name, prompt string) error 
 	}
 	d.mu.Unlock()
 	switch {
-	case n == nil || name == masterNode:
-		return fmt.Errorf("no worker %q", name)
+	case n == nil:
+		return fmt.Errorf("no node %q", name)
 	case id == "":
 		return fmt.Errorf("%s is still starting", name)
 	case status == "exited":
@@ -1013,7 +1035,7 @@ func (d *daemon) resume(ctx context.Context, caller, name, prompt string) error 
 		return err
 	}
 
-	// Claude Code resumes a running session into a copy under a new id, so the worker stops first.
+	// Claude Code resumes a running session into a copy under a new id, so the session stops first.
 	// Meanwhile the empty ID keeps poll from reporting it exited, and refuses a second resume.
 	d.mu.Lock()
 	if n.ID != id {
@@ -1068,15 +1090,23 @@ func (d *daemon) awaitIdle(ctx context.Context, name, id string) (agent, error) 
 }
 
 // ensureMaster adopts the master of an earlier run while Claude Code still lists it, and starts one otherwise.
+// An adopted master that ended its turn, as one does once its calls to a stopped daemon fail, is resumed.
 func (d *daemon) ensureMaster() error {
 	agents, err := d.claude.Agents()
 	if err != nil {
 		return err
 	}
 	d.mu.Lock()
-	if m := d.nodes[masterNode]; m != nil && slices.ContainsFunc(agents, func(a agent) bool { return a.ID == m.ID }) {
-		d.mu.Unlock()
-		return nil
+	if m := d.nodes[masterNode]; m != nil {
+		if i := slices.IndexFunc(agents, func(a agent) bool { return a.ID == m.ID }); i >= 0 {
+			d.mu.Unlock()
+			if agents[i].Status == "idle" {
+				if err := d.carryOn(context.Background(), masterNode, "The bosun daemon restarted, so your last calls to it failed. Carry on: call next_event."); err != nil {
+					return fmt.Errorf("resuming the master: %w", err)
+				}
+			}
+			return nil
+		}
 	}
 	m := &Session{Node: masterNode, Dir: d.masterDir, Model: d.masterModel, Status: "starting"}
 	d.nodes[masterNode] = m

@@ -82,7 +82,9 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 | `escalate` | master | queues a question or a permission for you |
 | `notify` | master | queues a notice for you, about a problem that is not a decision |
 
-**The master loops on `next_event`.** It calls `next_event`, handles the event, and calls it again. A `Stop` hook reports a turn's end, and `claude agents --json` reports an exit.
+**The master loops on `next_event`.** It calls `next_event`, handles the event, and calls it again. A `Stop` hook reports a worker's turn end, and `claude agents --json` reports an exit.
+
+**The daemon keeps the master's turn going.** It blocks the master's `Stop`, which sends the master back to `next_event`. A `Stop` that comes before the master has called `next_event` since the last block gets through, and the daemon queues a notice for you. While the daemon is stopped, the master's calls fail and its `Stop` hook cannot block, so its turn ends. A daemon that starts and adopts an idle master resumes it.
 
 **Blocking tools send progress.** Claude Code aborts a stdio tool call that sends nothing for 30 seconds. While `next_event` or `ask` blocks, it sends `notifications/progress` on the call's `progressToken` every 10 seconds. Claude Code also moves a call still running after 120 seconds to the background, unless the settings' `env` sets `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` to `0`.
 

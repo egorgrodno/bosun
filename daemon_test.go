@@ -419,6 +419,57 @@ func TestResume(t *testing.T) {
 	}
 }
 
+// A daemon that stopped left the master's calls failing, so the master may have ended its turn.
+func TestRestartResumesIdleMaster(t *testing.T) {
+	d, fc := testDaemon(t)
+	idleWait = 0
+	t.Cleanup(func() { idleWait = 30 * time.Second })
+	if err := d.ensureMaster(); err != nil || len(fc.starts) != 1 {
+		t.Fatalf("adopting a busy master: %v, %d starts", err, len(fc.starts))
+	}
+	fc.mu.Lock()
+	fc.agents[0].SessionID, fc.agents[0].Status = "s-m", "idle"
+	fc.mu.Unlock()
+	if err := d.ensureMaster(); err != nil {
+		t.Fatal(err)
+	}
+	fc.mu.Lock()
+	stopped := !slices.ContainsFunc(fc.agents, func(a agent) bool { return a.ID == "00000001" })
+	fc.mu.Unlock()
+	if args := fc.lastStart(); len(args) != 5 || !slices.Equal(args[:4], []string{"--bg", "--resume", "s-m", "--"}) || !stopped {
+		t.Fatalf("claude ran with %q, the old master stopped: %v", args, stopped)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if id := d.nodes[masterNode].ID; id != "00000002" {
+		t.Fatalf("the master's id is %q, want the resumed session's", id)
+	}
+}
+
+func TestMasterStopBlocks(t *testing.T) {
+	testDaemon(t)
+	stop := func() string { return receive(t, runHookAsync(masterNode, hookEvent("Stop", "", "", nil))) }
+	block := `{"decision":"block","reason":`
+	if out := stop(); !strings.HasPrefix(out, block) {
+		t.Fatalf("the master's Stop printed %s", out)
+	}
+	mustCall(t, Request{Op: "tell", Text: "x"})
+	mustCall(t, Request{Op: "next_event", Node: masterNode})
+	if out := stop(); !strings.HasPrefix(out, block) {
+		t.Fatalf("a Stop after next_event printed %s", out)
+	}
+	if n := len(mustCall(t, Request{Op: "status"}).Decisions); n != 0 {
+		t.Fatalf("%d decisions open", n)
+	}
+	// A Stop that the block did not send back to next_event lets the turn end rather than loop, and the user hears of it.
+	if out := stop(); out != "null" {
+		t.Fatalf("the master's second Stop in a row printed %s", out)
+	}
+	if dec := openDecision(t, 1); dec.Kind != "notice" {
+		t.Fatalf("decision = %+v", dec)
+	}
+}
+
 func TestSpawn(t *testing.T) {
 	d, fc := testDaemon(t)
 	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1234")
