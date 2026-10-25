@@ -68,7 +68,7 @@ type daemon struct {
 	workerModel string
 	claude      claudeCLI
 
-	// masterLock is held while the master is woken or switched, so that neither resumes it beside the other.
+	// masterLock is held while the master is woken, switched or readied for an attach, so that no two of them resume it at once.
 	masterLock sync.Mutex
 	mu         sync.Mutex
 	nodes      map[string]*Session
@@ -400,6 +400,8 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 		resp.Session, err = d.spawn(r.Node, r.Name, r.Repo, r.Model, r.Text)
 	case "resume":
 		err = d.resume(ctx, r.Node, r.Name, r.Text)
+	case "attach":
+		err = d.attach(r.ID)
 	case "kill":
 		err = d.kill(r.Name)
 	case "merge":
@@ -1437,10 +1439,72 @@ func (d *daemon) release(n *Session) {
 	n.held = false
 }
 
-// resumeStopped continues the stopped session id, whose Claude Code session id is sid, with prompt.
+// attach readies session id for a frontend about to run `claude attach` on it, by resuming it idle if it stopped.
+// claude attach would resume it itself, and with no supervisor running, start Claude Code's supervisor in the frontend's terminal.
+func (d *daemon) attach(id string) error {
+	node, a, err := d.listed(id)
+	if err != nil || a.Status != "" {
+		return err
+	}
+	if node == masterNode {
+		d.masterLock.Lock()
+		defer d.masterLock.Unlock()
+		if node, a, err = d.listed(id); err != nil || a.Status != "" {
+			return err
+		}
+	}
+	d.mu.Lock()
+	n := d.nodes[node]
+	if n == nil || n.ID != id || n.held {
+		d.mu.Unlock()
+		return fmt.Errorf("%s is %w", node, errStarting)
+	}
+	n.held = true
+	dir := n.Dir
+	d.mu.Unlock()
+	err = d.resumeStopped(dir, id, a.SessionID, "")
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n.held = false
+	d.stirred = true
+	if err == nil {
+		log.Printf("resumed %s (%s) for an attach", node, id)
+	}
+	return err
+}
+
+// listed returns the node of session id and Claude Code's listing of it.
+func (d *daemon) listed(id string) (string, agent, error) {
+	d.mu.Lock()
+	node := ""
+	for _, n := range d.nodes {
+		if n.ID == id {
+			node = n.Node
+		}
+	}
+	d.mu.Unlock()
+	if node == "" {
+		return "", agent{}, fmt.Errorf("no session %s", id)
+	}
+	agents, err := d.claude.Agents()
+	if err != nil {
+		return "", agent{}, err
+	}
+	i := slices.IndexFunc(agents, func(a agent) bool { return a.ID == id })
+	if i < 0 {
+		return "", agent{}, fmt.Errorf("%s has exited", node)
+	}
+	return node, agents[i], nil
+}
+
+// resumeStopped continues the stopped session id, whose Claude Code session id is sid, with prompt, or idle without one.
 // Claude Code resumes a session still running into a copy under a new id, without the session's options, so a copy is stopped and reported.
 func (d *daemon) resumeStopped(dir, id, sid, prompt string) error {
-	next, err := d.claude.Start(dir, []string{"--bg", "--resume", sid, "--", prompt})
+	args := []string{"--bg", "--resume", sid}
+	if prompt != "" {
+		args = append(args, "--", prompt)
+	}
+	next, err := d.claude.Start(dir, args)
 	if err != nil || next == id {
 		return err
 	}

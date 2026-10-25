@@ -10,8 +10,34 @@ import (
 	"io"
 	"net"
 	"os"
+	"os/exec"
 	"strings"
+	"syscall"
+	"time"
 )
+
+// runAttach runs claude attach on a session once the daemon has readied it, and without that when the daemon cannot.
+func runAttach(args []string) error {
+	if len(args) != 1 {
+		return errors.New(usage)
+	}
+	if err := readyAttach(args[0]); err != nil {
+		fmt.Fprintln(os.Stderr, "bosun:", err)
+	}
+	claude, err := exec.LookPath("claude")
+	if err != nil {
+		return err
+	}
+	return syscall.Exec(claude, []string{"claude", "attach", args[0]}, os.Environ())
+}
+
+// readyAttach has the daemon resume session id if it stopped, which claude attach would otherwise do itself, starting Claude Code's supervisor in this terminal.
+func readyAttach(id string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	_, err := call(ctx, Request{Op: "attach", ID: id})
+	return err
+}
 
 func runCommand(cmd string, args []string) error {
 	req := Request{Op: cmd}

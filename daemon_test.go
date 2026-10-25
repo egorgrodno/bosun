@@ -88,6 +88,7 @@ func (f *fakeClaude) Start(dir string, args []string) (string, error) {
 	}
 	id := fmt.Sprintf("%08x", len(f.starts))
 	// A resume without flags continues a stopped session under its own id, once its process exits, and makes a copy otherwise.
+	// Without a prompt, the session it continues waits idle.
 	if sid := argAfter(args, "--resume"); sid != "" {
 		i := slices.IndexFunc(f.agents, func(a agent) bool { return a.SessionID == sid })
 		flagless := len(args) == 3 || args[3] == "--"
@@ -97,6 +98,9 @@ func (f *fakeClaude) Start(dir string, args []string) (string, error) {
 			} else if flagless {
 				a := &f.agents[i]
 				a.PID, a.Status = f.spawnLocked(a.ID), "busy"
+				if len(args) == 3 {
+					a.Status = "idle"
+				}
 				return a.ID, nil
 			}
 		}
@@ -526,6 +530,39 @@ func TestRetiredWorkerResumes(t *testing.T) {
 	defer d.mu.Unlock()
 	if a := d.nodes["a"]; a.ID != "aaaaaaaa" || a.Status != "busy" {
 		t.Fatalf("a = %+v", a)
+	}
+}
+
+// claude attach resumes a stopped session itself, which starts Claude Code's supervisor in the frontend's terminal when none runs.
+func TestAttachResumesStopped(t *testing.T) {
+	d, fc := testDaemon(t)
+	fc.add(agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a"})
+	fc.setStatus("aaaaaaaa", "")
+	mustCall(t, Request{Op: "attach", ID: "aaaaaaaa"})
+	if args := fc.lastStart(); !slices.Equal(args, []string{"--bg", "--resume", "s-a"}) {
+		t.Fatalf("claude ran with %q", args)
+	}
+	mustCall(t, Request{Op: "attach", ID: "aaaaaaaa"})
+	fc.mu.Lock()
+	starts, copies := len(fc.starts), len(fc.copies)
+	fc.mu.Unlock()
+	if starts != 2 || copies != 0 {
+		t.Fatalf("%d starts and %d copies for one stopped session", starts, copies)
+	}
+
+	d.mu.Lock()
+	master := d.nodes[masterNode].ID
+	d.mu.Unlock()
+	fc.mu.Lock()
+	fc.agents[0].SessionID = "s-m"
+	fc.mu.Unlock()
+	fc.setStatus(master, "")
+	mustCall(t, Request{Op: "attach", ID: master})
+	if args := fc.lastStart(); !slices.Equal(args, []string{"--bg", "--resume", "s-m"}) {
+		t.Fatalf("claude ran with %q", args)
+	}
+	if _, err := call(context.Background(), Request{Op: "attach", ID: "ffffffff"}); err == nil {
+		t.Fatal("attached to a session bosun does not run")
 	}
 }
 

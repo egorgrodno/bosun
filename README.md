@@ -20,7 +20,7 @@ bosun tell 'Fix the flaky test in ~/Projects/app'
 bosun status      # the decisions waiting, then the tree
 bosun tui         # the same, live, to answer them and attach to a session
 bosun approve 3
-claude attach <id>
+bosun attach <id>
 ```
 
 `bosun` alone lists every command.
