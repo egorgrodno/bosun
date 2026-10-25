@@ -12,13 +12,14 @@ import (
 
 // Request is a line a client sends the daemon. Node names the calling session, and is empty for a frontend.
 type Request struct {
-	Op   string          `json:"op"`
-	Node string          `json:"node,omitempty"`
-	ID   string          `json:"id,omitempty"`
-	Name string          `json:"name,omitempty"`
-	Repo string          `json:"repo,omitempty"`
-	Text string          `json:"text,omitempty"`
-	Hook json.RawMessage `json:"hook,omitempty"`
+	Op    string          `json:"op"`
+	Node  string          `json:"node,omitempty"`
+	ID    string          `json:"id,omitempty"`
+	Name  string          `json:"name,omitempty"`
+	Repo  string          `json:"repo,omitempty"`
+	Model string          `json:"model,omitempty"`
+	Text  string          `json:"text,omitempty"`
+	Hook  json.RawMessage `json:"hook,omitempty"`
 }
 
 // Response is a line the daemon sends: a "result" for each request, and on a watch a "snapshot" followed by "event"s.
@@ -66,7 +67,7 @@ type answer struct {
 	withdrawn bool
 }
 
-// Session is a node of the tree. Status and State come from `claude agents --json`, with Status "exited" once it stops listing the session.
+// Session is a node of the tree. Status and State come from `claude agents --json`, with Status "exited" once it stops listing the session. An empty Model is the user's default.
 type Session struct {
 	Node      string `json:"node"`
 	Parent    string `json:"parent,omitempty"`
@@ -74,6 +75,7 @@ type Session struct {
 	Dir       string `json:"dir"`
 	ID        string `json:"id,omitempty"`
 	SessionID string `json:"sessionId,omitempty"`
+	Model     string `json:"model,omitempty"`
 	Depth     int    `json:"depth"`
 	Status    string `json:"status"`
 	State     string `json:"state,omitempty"`

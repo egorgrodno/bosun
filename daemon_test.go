@@ -18,20 +18,53 @@ import (
 )
 
 type fakeClaude struct {
-	mu     sync.Mutex
-	agents []agent
-	starts [][]string
-	dirs   []string
+	mu      sync.Mutex
+	agents  []agent
+	starts  [][]string
+	dirs    []string
+	removed []string
+	fail    func(args []string) error
 }
 
 func (f *fakeClaude) Start(dir string, args []string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	id := fmt.Sprintf("%08x", len(f.starts)+1)
 	f.starts = append(f.starts, args)
 	f.dirs = append(f.dirs, dir)
-	f.agents = append(f.agents, agent{ID: id, Name: args[slices.Index(args, "-n")+1], Status: "busy"})
+	if f.fail != nil {
+		if err := f.fail(args); err != nil {
+			return "", err
+		}
+	}
+	id := fmt.Sprintf("%08x", len(f.starts))
+	name := ""
+	if i := slices.Index(args, "-n"); i >= 0 {
+		name = args[i+1]
+	}
+	f.agents = append(f.agents, agent{ID: id, Name: name, Status: "busy"})
 	return id, nil
+}
+
+func (f *fakeClaude) lastStart() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.starts[len(f.starts)-1]
+}
+
+func (f *fakeClaude) Remove(id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.removed = append(f.removed, id)
+	f.agents = slices.DeleteFunc(f.agents, func(a agent) bool { return a.ID == id })
+	return nil
+}
+
+// argAfter returns the value after name in args, or "" when args lack it.
+func argAfter(args []string, name string) string {
+	if i := slices.Index(args, name); i >= 0 && i+1 < len(args) {
+		return args[i+1]
+	}
+	return ""
 }
 
 func (f *fakeClaude) Agents() ([]agent, error) {
@@ -310,7 +343,7 @@ func TestSpawn(t *testing.T) {
 	fc.mu.Lock()
 	args, dir := fc.starts[len(fc.starts)-1], fc.dirs[len(fc.dirs)-1]
 	fc.mu.Unlock()
-	if dir != repo || !slices.Contains(args, "-w") || args[len(args)-1] != "fix the bug" {
+	if dir != repo || !slices.Contains(args, "-w") || args[len(args)-1] != "fix the bug" || slices.Contains(args, "--model") {
 		t.Fatalf("claude ran in %s with %q", dir, args)
 	}
 
@@ -359,6 +392,101 @@ func TestSpawn(t *testing.T) {
 	d.mu.Unlock()
 	if child != 1 {
 		t.Fatalf("b at depth %d", child)
+	}
+}
+
+func TestModels(t *testing.T) {
+	d, fc := testDaemon(t)
+	d.masterModel, d.workerModel = "fable", "sonnet"
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	for _, tc := range []struct{ name, model, want string }{
+		{"b", "", "sonnet"},
+		{"c", "haiku", "haiku"},
+	} {
+		s := mustCall(t, Request{Op: "spawn", Name: tc.name, Repo: repo, Model: tc.model, Text: "x"}).Session
+		if got := argAfter(fc.lastStart(), "--model"); s.Model != tc.want || got != tc.want {
+			t.Errorf("spawn %s with model %q: session model %q, --model %q, want %q", tc.name, tc.model, s.Model, got, tc.want)
+		}
+	}
+
+	fc.mu.Lock()
+	fc.agents = nil
+	fc.mu.Unlock()
+	if err := d.ensureMaster(); err != nil {
+		t.Fatal(err)
+	}
+	if got := argAfter(fc.lastStart(), "--model"); got != "fable" {
+		t.Errorf("a new master runs --model %q, want fable", got)
+	}
+}
+
+// The workers block on the daemon, not on the master, so a switch leaves them running.
+func TestSwitchModel(t *testing.T) {
+	d, fc := testDaemon(t)
+	d.mu.Lock()
+	old := d.nodes[masterNode].ID
+	d.nodes[masterNode].SessionID = "s-master"
+	d.mu.Unlock()
+	hook := runHookAsync("a", hookEvent("PermissionRequest", "", "Bash", bashTest))
+	// The old master takes the decision and stops before it answers.
+	if events := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events; len(events) != 1 {
+		t.Fatalf("events = %+v", events)
+	}
+
+	mustCall(t, Request{Op: "model", Model: "opus"})
+	args := fc.lastStart()
+	if argAfter(args, "--resume") != "s-master" || argAfter(args, "--model") != "opus" || argAfter(args, "--settings") == "" {
+		t.Fatalf("claude ran with %q", args)
+	}
+	d.mu.Lock()
+	m := *d.nodes[masterNode]
+	d.mu.Unlock()
+	if m.ID == old || m.SessionID != "" || m.Model != "opus" {
+		t.Fatalf("master = %+v", m)
+	}
+	fc.mu.Lock()
+	removed := slices.Clone(fc.removed)
+	fc.mu.Unlock()
+	if !slices.Equal(removed, []string{old}) {
+		t.Fatalf("removed %v, want the old master %s", removed, old)
+	}
+
+	events := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events
+	if len(events) != 1 || events[0].Decision == nil {
+		t.Fatalf("the new master got %+v, want the open decision", events)
+	}
+	mustCall(t, Request{Op: "approve", Node: masterNode, ID: events[0].Decision.ID})
+	if out := receive(t, hook); !strings.Contains(out, `"behavior":"allow"`) {
+		t.Fatalf("hook printed %s", out)
+	}
+}
+
+func TestSwitchModelFailureResumesMaster(t *testing.T) {
+	d, fc := testDaemon(t)
+	d.mu.Lock()
+	d.nodes[masterNode].SessionID = "s-master"
+	d.mu.Unlock()
+	fc.mu.Lock()
+	fc.fail = func(args []string) error {
+		if slices.Contains(args, "--model") {
+			return fmt.Errorf("unknown model")
+		}
+		return nil
+	}
+	fc.mu.Unlock()
+
+	if _, err := call(context.Background(), Request{Op: "model", Model: "nope"}); err == nil {
+		t.Fatal("the switch to a failing model succeeded")
+	}
+	if args := fc.lastStart(); !slices.Equal(args, []string{"--bg", "--resume", "s-master"}) {
+		t.Fatalf("after the failure claude ran with %q, want the old master resumed", args)
+	}
+	d.mu.Lock()
+	model := d.nodes[masterNode].Model
+	d.mu.Unlock()
+	if model != "" {
+		t.Fatalf("master model = %q", model)
 	}
 }
 

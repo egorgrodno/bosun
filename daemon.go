@@ -44,12 +44,15 @@ const (
 var nodeName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
 
 type daemon struct {
-	exe       string
-	socket    string
-	stateDir  string
-	masterDir string
-	claude    claudeCLI
+	exe         string
+	socket      string
+	stateDir    string
+	masterDir   string
+	masterModel string
+	workerModel string
+	claude      claudeCLI
 
+	switching sync.Mutex
 	mu        sync.Mutex
 	nodes     map[string]*Session
 	started   map[string]time.Time
@@ -113,12 +116,15 @@ func claudeDir() string {
 func runDaemon(args []string) error {
 	flags := flag.NewFlagSet("daemon", flag.ExitOnError)
 	masterDir := flags.String("master-dir", filepath.Join(stateDir(), "master"), "directory the master runs in, which Claude Code must trust")
+	masterModel := flags.String("master-model", "", "model of a master the daemon starts, such as fable, opus or sonnet; the user's default when empty")
+	workerModel := flags.String("worker-model", "", "model of a worker started without one; the user's default when empty")
 	_ = flags.Parse(args)
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
 	d := newDaemon(exe, socketPath(), stateDir(), *masterDir, claudeExec{})
+	d.masterModel, d.workerModel = *masterModel, *workerModel
 	if err := d.load(); err != nil {
 		return err
 	}
@@ -306,9 +312,11 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	case "tell":
 		err = d.tell(r.Text)
 	case "spawn":
-		resp.Session, err = d.spawn(r.Node, r.Name, r.Repo, r.Text)
+		resp.Session, err = d.spawn(r.Node, r.Name, r.Repo, r.Model, r.Text)
 	case "kill":
 		err = d.kill(r.Name)
+	case "model":
+		err = d.switchModel(r.Model)
 	case "status":
 		d.mu.Lock()
 		resp = d.snapshotLocked()
@@ -690,7 +698,7 @@ func (d *daemon) snapshotLocked() Response {
 }
 
 // spawn starts a child of caller, or of the master when a frontend asks. A child of the master needs repo; a deeper one branches from its parent's worktree.
-func (d *daemon) spawn(caller, name, repo, prompt string) (*Session, error) {
+func (d *daemon) spawn(caller, name, repo, model, prompt string) (*Session, error) {
 	caller = cmp.Or(caller, masterNode)
 	if !nodeName.MatchString(name) || name == masterNode {
 		return nil, fmt.Errorf("invalid node name %q: use lowercase letters, digits and hyphens", name)
@@ -726,7 +734,7 @@ func (d *daemon) spawn(caller, name, repo, prompt string) (*Session, error) {
 	d.mu.Lock()
 	err := d.admitLocked(caller, name)
 	if err == nil {
-		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Depth: d.nodes[caller].Depth + 1, Status: "starting"}
+		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Model: cmp.Or(model, d.workerModel), Depth: d.nodes[caller].Depth + 1, Status: "starting"}
 		d.started[name] = time.Now()
 	}
 	n := d.nodes[name]
@@ -785,6 +793,9 @@ func (d *daemon) start(n *Session, dir string, extra []string, system, prompt st
 		return "", err
 	}
 	args := append([]string{"--bg", "-n", n.Node}, extra...)
+	if n.Model != "" {
+		args = append(args, "--model", n.Model)
+	}
 	args = append(args, "--settings", settings, "--mcp-config", mcp, "--append-system-prompt", system, "--", prompt)
 	return d.claude.Start(dir, args)
 }
@@ -906,7 +917,7 @@ func (d *daemon) ensureMaster() error {
 		d.mu.Unlock()
 		return nil
 	}
-	m := &Session{Node: masterNode, Dir: d.masterDir, Status: "starting"}
+	m := &Session{Node: masterNode, Dir: d.masterDir, Model: d.masterModel, Status: "starting"}
 	d.nodes[masterNode] = m
 	d.started[masterNode] = time.Now()
 	d.mu.Unlock()
@@ -923,6 +934,61 @@ func (d *daemon) ensureMaster() error {
 	d.saveLocked()
 	d.broadcastSessionsLocked()
 	log.Printf("started the master (%s) in %s", id, d.masterDir)
+	return nil
+}
+
+// switchModel moves the master to model, in a copy of its conversation under a new id.
+func (d *daemon) switchModel(model string) error {
+	if model == "" {
+		return errors.New("name a model")
+	}
+	if !d.switching.TryLock() {
+		return errors.New("the master is already switching")
+	}
+	defer d.switching.Unlock()
+	d.mu.Lock()
+	m := d.nodes[masterNode]
+	old, sid := m.ID, m.SessionID
+	next := &Session{Node: masterNode, Dir: m.Dir, Model: model}
+	d.mu.Unlock()
+	if old == "" || sid == "" {
+		return errors.New("the master is still starting")
+	}
+	if err := d.claude.Stop(old); err != nil {
+		return err
+	}
+	id, err := d.start(next, next.Dir, []string{"--resume", sid}, masterPrompt, fmt.Sprintf("The user switched your model to %s. Carry on: call next_event.", model))
+	if err != nil {
+		// Without flags, the resume continues the old master under its own id.
+		if _, rerr := d.claude.Start(next.Dir, []string{"--bg", "--resume", sid}); rerr != nil {
+			log.Printf("resuming the master: %v", rerr)
+		}
+		return err
+	}
+
+	d.mu.Lock()
+	m.ID, m.SessionID, m.Model = id, "", model
+	m.Status, m.State, m.pre = "starting", "", nil
+	d.started[masterNode] = time.Now()
+	// The old master may have taken decisions it never answered.
+	queued := map[string]bool{}
+	for _, ev := range d.events {
+		if ev.Decision != nil {
+			queued[ev.Decision.ID] = true
+		}
+	}
+	for _, dec := range d.snapshotLocked().Decisions {
+		if dec.Holder == "master" && !queued[dec.ID] {
+			d.pushLocked(Event{Kind: "decision", Decision: &dec})
+		}
+	}
+	d.saveLocked()
+	d.broadcastSessionsLocked()
+	d.mu.Unlock()
+	log.Printf("switched the master to %s (%s)", model, id)
+	if err := d.claude.Remove(old); err != nil {
+		log.Print(err)
+	}
 	return nil
 }
 
@@ -949,7 +1015,8 @@ func (d *daemon) poll() {
 		switch {
 		case listed:
 			status, state = a.Status, a.State
-			n.SessionID = cmp.Or(n.SessionID, a.SessionID)
+			// The listing outranks a hook, which a stopped session may still send after a switch.
+			n.SessionID = cmp.Or(a.SessionID, n.SessionID)
 		case n.Status == "starting" && time.Since(d.started[n.Node]) < startGrace:
 			continue
 		}

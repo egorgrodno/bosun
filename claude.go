@@ -25,6 +25,7 @@ type claudeCLI interface {
 	Start(dir string, args []string) (string, error)
 	Agents() ([]agent, error)
 	Stop(id string) error
+	Remove(id string) error
 }
 
 type claudeExec struct{}
@@ -62,9 +63,17 @@ func (claudeExec) Agents() ([]agent, error) {
 }
 
 func (claudeExec) Stop(id string) error {
-	out, err := exec.Command("claude", "stop", id).CombinedOutput()
+	return run("stop", id)
+}
+
+func (claudeExec) Remove(id string) error {
+	return run("rm", id)
+}
+
+func run(cmd, id string) error {
+	out, err := exec.Command("claude", cmd, id).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("claude stop %s: %w: %s", id, err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("claude %s %s: %w: %s", cmd, id, err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }

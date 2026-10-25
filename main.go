@@ -7,7 +7,8 @@ import (
 )
 
 const usage = `usage:
-  bosun daemon [-master-dir DIR]   run the daemon, which starts the master
+  bosun daemon [-master-dir DIR] [-master-model M] [-worker-model M]
+                                   run the daemon, which starts the master
   bosun mcp                        the MCP server each session starts
   bosun hook                       every hook each session runs
 
@@ -17,8 +18,12 @@ const usage = `usage:
   bosun deny ID [MESSAGE]          deny a permission
   bosun reply ID ANSWER            answer a question
   bosun tell TEXT                  send the master a message
-  bosun spawn NAME REPO PROMPT     start a worker under the master
-  bosun kill NAME                  stop a session`
+  bosun spawn [-model M] NAME REPO PROMPT
+                                   start a worker under the master
+  bosun kill NAME                  stop a session
+  bosun model M                    switch the master to model M, keeping its conversation
+
+A model is an alias such as fable, opus, sonnet or haiku, or a full model name.`
 
 func main() {
 	if len(os.Args) < 2 {
@@ -38,7 +43,7 @@ func main() {
 		err = runStatus(args)
 	case "watch":
 		err = runWatch()
-	case "approve", "deny", "reply", "tell", "spawn", "kill":
+	case "approve", "deny", "reply", "tell", "spawn", "kill", "model":
 		err = runCommand(cmd, args)
 	default:
 		fmt.Fprintln(os.Stderr, usage)

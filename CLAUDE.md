@@ -20,13 +20,15 @@ One binary carries every part:
 | `bosun mcp` | the stdio MCP server each session starts, relaying to the daemon |
 | `bosun hook` | every hook each session runs |
 | `bosun tui` | the terminal frontend |
-| `bosun status`, `approve`, `deny`, `reply`, `tell`, `spawn`, `kill`, `watch` | the command-line frontend |
+| `bosun status`, `approve`, `deny`, `reply`, `tell`, `spawn`, `kill`, `model`, `watch` | the command-line frontend |
 
 The daemon holds each session's parent and the queue of decisions waiting on an answer. It reads which of its sessions run from `claude agents --json`, which also lists sessions bosun did not start.
 
 ## Sessions
 
 **Spawning.** `spawn` runs `claude --bg -n <node> -w <node>` with `--settings` and `--mcp-config`. The settings carry the hooks and `worktree.baseRef: head`. Sessions started outside bosun load nothing from it.
+
+**Models.** The daemon's `-master-model` and `-worker-model` pick the models, and `spawn` can pick one for a worker. A stopped `--bg` session keeps its options, model included. `claude --bg --resume <session-id>` without flags continues it under the same id. With any flag, it starts a copy of the conversation under a new id. `bosun model` switches the master that way, and the daemon follows the new id. Workers block on the daemon, not on the master, so they keep running through the switch.
 
 **Identity.** `--bg` ignores `--session-id` and picks its own. bosun knows a session by its node name, set in the environment of its hook commands and its MCP server. Each hook event carries Claude Code's `session_id`, which `claude agents --json` reports as `sessionId`, beside a short `id`.
 
@@ -83,7 +85,7 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 
 ## Frontends
 
-Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `tell`, `spawn`, `kill`. Every rule lives in the daemon.
+Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `tell`, `spawn`, `kill`, `model`. Every rule lives in the daemon.
 
 Each leads with the queue of decisions waiting on you, above the tree.
 

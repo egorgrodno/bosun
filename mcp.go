@@ -28,7 +28,10 @@ func str(description string) map[string]any {
 	return map[string]any{"type": "string", "description": description}
 }
 
-const nameHelp = "Node name: lowercase letters, digits and hyphens, unique in the repository. It names the session, its worktree and its branch worktree-<name>."
+const (
+	nameHelp  = "Node name: lowercase letters, digits and hyphens, unique in the repository. It names the session, its worktree and its branch worktree-<name>."
+	modelHelp = "The session's model, such as fable, opus, sonnet or haiku. Leave it out unless the user named one for this task: the user sets the default."
+)
 
 func tools(master bool) []tool {
 	if !master {
@@ -36,6 +39,7 @@ func tools(master bool) []tool {
 			{"spawn", "Start a child session in its own git worktree, branched from your HEAD, with prompt as its task.", object([]string{"name", "prompt"}, map[string]any{
 				"name":   str(nameHelp),
 				"prompt": str("The child's task. It sees nothing else, so say everything it needs."),
+				"model":  str(modelHelp),
 			})},
 			{"ask", "Ask the master a question and wait for the answer. Use it for any decision you would otherwise put to the user. The master may pass it on to the user, so the wait can be long.", object([]string{"question"}, map[string]any{
 				"question": str("The question, with what the answer depends on."),
@@ -47,6 +51,7 @@ func tools(master bool) []tool {
 			"name":   str(nameHelp),
 			"repo":   str("Path to a git repository Claude Code trusts."),
 			"prompt": str("The worker's task. It sees nothing else, so say everything it needs."),
+			"model":  str(modelHelp),
 		})},
 		{"next_event", "Wait up to four minutes for events from the workers and the user. Returns them as JSON, or says there were none. Call it again either way.", object([]string{}, map[string]any{})},
 		{"reply", "Answer a worker's question. The worker gets the answer as the result of its ask.", object([]string{"id", "answer"}, map[string]any{
@@ -218,6 +223,7 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	var args struct {
 		Name     string `json:"name"`
 		Repo     string `json:"repo"`
+		Model    string `json:"model"`
 		Prompt   string `json:"prompt"`
 		Question string `json:"question"`
 		ID       string `json:"id"`
@@ -241,7 +247,7 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	req := Request{Op: name, Node: s.node, ID: args.ID}
 	switch name {
 	case "spawn":
-		req.Name, req.Repo, req.Text = args.Name, args.Repo, args.Prompt
+		req.Name, req.Repo, req.Model, req.Text = args.Name, args.Repo, args.Model, args.Prompt
 	case "ask":
 		req.Text = args.Question
 	case "reply":

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -14,7 +15,13 @@ import (
 
 func runCommand(cmd string, args []string) error {
 	req := Request{Op: cmd}
-	need := map[string]int{"approve": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1}[cmd]
+	if cmd == "spawn" {
+		flags := flag.NewFlagSet("spawn", flag.ExitOnError)
+		model := flags.String("model", "", "the worker's model, in place of the daemon's -worker-model")
+		_ = flags.Parse(args)
+		req.Model, args = *model, flags.Args()
+	}
+	need := map[string]int{"approve": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "model": 1}[cmd]
 	if len(args) < need {
 		return errors.New(usage)
 	}
@@ -29,6 +36,8 @@ func runCommand(cmd string, args []string) error {
 		req.Name, req.Repo, req.Text = args[0], args[1], strings.Join(args[2:], " ")
 	case "kill":
 		req.Name = args[0]
+	case "model":
+		req.Model = args[0]
 	}
 	resp, err := call(context.Background(), req)
 	if err != nil {
@@ -95,7 +104,7 @@ func printStatus(w io.Writer, s Response) {
 			if n.State != "" {
 				state += "/" + n.State
 			}
-			fmt.Fprintf(w, "  %s%-*s %-8s %s\n", strings.Repeat("  ", depth), 14-2*depth, n.Node, n.ID, state)
+			fmt.Fprintf(w, "  %s%-*s %-8s %-15s %s\n", strings.Repeat("  ", depth), 14-2*depth, n.Node, n.ID, state, n.Model)
 			walk(n.Node, depth+1)
 		}
 	}
