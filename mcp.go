@@ -41,7 +41,7 @@ The events:
 - decision of kind question: a worker asks something. Settle it with reply or escalate.
 - decision of kind permission: a worker wants to run a tool. Settle it with decide or escalate.
 - turn_end: a worker finished a turn, and its last message says what it did. To give it more to do, such as a fix after review, call resume.
-- exit: a worker's session ended.
+- exit: a worker's session stopped. Either it stopped in the middle of a turn, so no turn_end follows, and resume carries it on, or the user stopped it, as the event's text says, and resume refuses it.
 
 bosun sends a git push, deleting a branch, a file write outside a session's own folders and a command outside the sandbox straight to the user, so none of them reaches you, and no answer of yours allows one.`
 )
@@ -76,7 +76,7 @@ func tools(master bool) []tool {
 			"allow":   map[string]any{"type": "boolean", "description": "true to allow the tool call, false to deny it."},
 			"message": str("When denying, why. It reaches the worker verbatim, so tell it what to do instead."),
 		})},
-		{"resume", "Give a worker that ended its turn a new prompt, such as a fix after review. It carries on in the same conversation and worktree, and its next turn_end comes as an event.", object([]string{"name", "prompt"}, map[string]any{
+		{"resume", "Give a worker that ended its turn, or stopped in the middle of one, a new prompt, such as a fix after review. It carries on in the same conversation and worktree, and its next turn_end comes as an event.", object([]string{"name", "prompt"}, map[string]any{
 			"name":   str("The worker's node name."),
 			"prompt": str("What to do next. The worker remembers its task, so say only what is new."),
 		})},

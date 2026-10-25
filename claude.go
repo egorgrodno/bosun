@@ -25,6 +25,7 @@ type agent struct {
 type claudeCLI interface {
 	// Start runs `claude args...` in dir, where args hold --bg, and returns the short id it prints.
 	Start(dir string, args []string) (string, error)
+	// Agents lists every session, one that stopped included: a session stopped by `claude stop`, or by the supervisor once it sat idle for an hour, stays listed without a PID or Status until `claude rm`.
 	Agents() ([]agent, error)
 	Stop(id string) error
 	Remove(id string) error
@@ -56,13 +57,13 @@ func (claudeExec) Start(dir string, args []string) (string, error) {
 }
 
 func (claudeExec) Agents() ([]agent, error) {
-	out, err := exec.Command("claude", "agents", "--json").Output()
+	out, err := exec.Command("claude", "agents", "--json", "--all").Output()
 	if err != nil {
-		return nil, fmt.Errorf("claude agents --json: %w", err)
+		return nil, fmt.Errorf("claude agents --json --all: %w", err)
 	}
 	var agents []agent
 	if err := json.Unmarshal(out, &agents); err != nil {
-		return nil, fmt.Errorf("claude agents --json: %w", err)
+		return nil, fmt.Errorf("claude agents --json --all: %w", err)
 	}
 	return agents, nil
 }

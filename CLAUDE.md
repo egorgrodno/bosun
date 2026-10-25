@@ -22,13 +22,15 @@ One binary carries every part:
 | `bosun tui` | the terminal frontend |
 | `bosun status`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `model`, `watch` | the command-line frontend |
 
-The daemon holds each session's parent and the queue of decisions waiting on an answer. It reads which of its sessions run from `claude agents --json`, which also lists sessions bosun did not start.
+The daemon holds each session's parent and the queue of decisions waiting on an answer. It reads each session's state from `claude agents --json --all`, which also lists sessions bosun did not start.
 
 ## Sessions
 
 **Spawning.** `spawn` runs `claude --bg -n <node> -w <node>` with `--settings` and `--mcp-config`. The settings carry the hooks and `worktree.baseRef: head`. Sessions started outside bosun load nothing from it.
 
-**Resuming.** A stopped `--bg` session keeps its options, model included. `claude --bg --resume <session-id>` without flags continues it under the same id. A prompt after `--` starts its next turn. With any flag, the command starts a copy of the conversation under a new id. So does a resume of a session still running, which one is for a moment after `claude stop` returns, until `claude agents --json` stops listing it.
+**Resuming.** A stopped `--bg` session keeps its options, model included. `claude --bg --resume <session-id>` without flags continues it under the same id. A prompt after `--` starts its next turn. With any flag, the command starts a copy of the conversation under a new id. So does a resume of a session still running. A session still runs for a moment after `claude stop` returns, until `claude agents --json --all` lists it without a `status`.
+
+**Retiring.** Claude Code's supervisor stops a background session that has sat idle for an hour. `claude agents --json --all` keeps listing it without a `pid` or `status` until `claude rm`, the same as a session that `claude stop` stopped. Either resumes like an idle session, so stopped does not mean done. The listing cannot tell a kill from a retirement, so the daemon marks each worker that `bosun kill` stops, and `resume` refuses it.
 
 **Upgrades.** A session reads its settings and MCP config only when its process starts. Both run bosun through `bosun` in the state directory, a link that each daemon start points at its own binary, and each start rewrites every session's settings. The system prompt is another matter. Claude Code snapshots it into the transcript, and every resume reuses the snapshot, even a resume with new flags. Tool descriptions come from the MCP server, which each process start runs from the current build. So the master's system prompt holds only what never changes, and its tools' descriptions hold its rules.
 
@@ -82,13 +84,13 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 | `next_event` | master | blocks until a worker asks, needs a permission, ends a turn or exits, or a frontend sends `tell` |
 | `reply` | master | answers a question |
 | `decide` | master | allows or denies a permission |
-| `resume` | master | gives a worker that ended its turn a new prompt |
+| `resume` | master | gives a worker that ended its turn, or stopped in it, a new prompt |
 | `escalate` | master | queues a question or a permission for you |
 | `notify` | master | queues a notice for you, about a problem that is not a decision |
 
-**The master loops on `next_event`.** It calls `next_event`, handles the event, and calls it again. A `Stop` hook reports a worker's turn end, and `claude agents --json` reports an exit.
+**The master loops on `next_event`.** It calls `next_event`, handles the event, and calls it again. A `Stop` hook reports a worker's turn end, and the session listing reports a worker that stops in its turn.
 
-**An idle master sleeps.** Once `next_event` returns empty, the master ends its turn, and the next event resumes it. So an idle master spends no turns. The daemon blocks a `Stop` that comes while events wait, which sends the master back to `next_event`. If the master stops again before calling `next_event`, the daemon lets it, queues a notice for you, and the next event resumes it. While the daemon is stopped, the master's calls fail and its turn ends. On start, the daemon adopts an idle master as asleep.
+**An idle master sleeps.** Once `next_event` returns empty, the master ends its turn, and the next event resumes it. So an idle master spends no turns. The daemon blocks a `Stop` that comes while events wait, which sends the master back to `next_event`. If the master stops again before calling `next_event`, the daemon lets it, queues a notice for you, and the next event resumes it. While the daemon is stopped, the master's calls fail and its turn ends. On start, the daemon adopts an idle or stopped master as asleep.
 
 **Blocking tools send progress.** Claude Code aborts a stdio tool call that sends nothing for 30 seconds. While `next_event` or `ask` blocks, it sends `notifications/progress` on the call's `progressToken` every 10 seconds. Claude Code also moves a call still running after 120 seconds to the background, unless the settings' `env` sets `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` to `0`.
 

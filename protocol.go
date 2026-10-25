@@ -67,7 +67,8 @@ type answer struct {
 	withdrawn bool
 }
 
-// Session is a node of the tree. Status and State come from `claude agents --json`, with Status "exited" once it stops listing the session. An empty Model is the user's default.
+// Session is a node of the tree. Status and State come from `claude agents --json --all`, with Status "stopped" while it lists the session without a process, and "exited" once it lists the session no more.
+// An empty Model is the user's default. Killed marks a worker the user stopped, which the master may not resume.
 type Session struct {
 	Node      string `json:"node"`
 	Parent    string `json:"parent,omitempty"`
@@ -79,6 +80,7 @@ type Session struct {
 	Depth     int    `json:"depth"`
 	Status    string `json:"status"`
 	State     string `json:"state,omitempty"`
+	Killed    bool   `json:"killed,omitempty"`
 
 	pre map[string]preCall
 }

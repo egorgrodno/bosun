@@ -46,10 +46,13 @@ const (
 // idleWait bounds how long resume waits for a worker to be listed idle, which it is not until its Stop hook returns.
 var idleWait = 30 * time.Second
 
-// stopWait bounds how long a resume waits for the session it stopped to leave the listing.
+// stopWait bounds how long a resume waits for the session it stopped to be listed as stopped.
 const stopWait = 10 * time.Second
 
-var errInTurn = errors.New("still in its turn")
+var (
+	errInTurn   = errors.New("still in its turn")
+	errStarting = errors.New("still starting")
+)
 
 // eventsWaiting is the prompt that wakes the master, and the reason a block of its Stop gives.
 const eventsWaiting = "Events are waiting: call next_event."
@@ -65,15 +68,16 @@ type daemon struct {
 	workerModel string
 	claude      claudeCLI
 
-	switching sync.Mutex
-	mu        sync.Mutex
-	nodes     map[string]*Session
-	started   map[string]time.Time
-	decisions map[string]*Decision
-	nextID    int
-	events    []Event
-	wake      chan struct{}
-	watchers  map[*watcher]bool
+	// masterLock is held while the master is woken or switched, so that neither resumes it beside the other.
+	masterLock sync.Mutex
+	mu         sync.Mutex
+	nodes      map[string]*Session
+	started    map[string]time.Time
+	decisions  map[string]*Decision
+	nextID     int
+	events     []Event
+	wake       chan struct{}
+	watchers   map[*watcher]bool
 	// stopBlocked holds from a block of the master's Stop until its next call to next_event.
 	// Claude Code's stop_hook_active cannot stand in: it stays true for the rest of the turn a block continued.
 	stopBlocked bool
@@ -718,17 +722,28 @@ func (d *daemon) pushLocked(ev Event) {
 	}
 }
 
-// wakeMaster resumes the master asleep. A master found in a turn, as one is once the user types into it, needs no waking: its Stop finds the events waiting.
+// wakeMaster resumes the master asleep. A master found in a turn, as one is once the user types into it, or starting needs no waking: it reads the events before its turn ends.
 func (d *daemon) wakeMaster() {
+	d.masterLock.Lock()
+	defer d.masterLock.Unlock()
 	err := d.carryOn(context.Background(), masterNode, eventsWaiting)
-	if err == nil || errors.Is(err, errInTurn) {
+	if err == nil || errors.Is(err, errInTurn) || errors.Is(err, errStarting) {
 		return
 	}
 	log.Printf("waking the master: %v", err)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.asleep = true
-	d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("Waking the master failed, so its events wait unread: %v. The next event tries again, and restarting the daemon starts a master that exited.", err)})
+	id := d.nodes[masterNode].ID
+	d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("Waking the master failed, so its events wait unread: %v. The next event tries again. If it keeps failing, `claude rm %s` and a restart of the daemon start a new master, without the old one's conversation.", err, id)})
+}
+
+// sleepLocked lets the master sleep until the next event, or wakes it now when events already wait, since only a new event wakes it.
+func (d *daemon) sleepLocked() {
+	d.asleep = len(d.pendingLocked()) == 0
+	if !d.asleep {
+		go d.wakeMaster()
+	}
 }
 
 // pendingLocked returns the master's events, leaving out decisions settled or escalated since.
@@ -905,7 +920,7 @@ func (d *daemon) admitLocked(parent, name string) error {
 	}
 	live := 0
 	for _, n := range d.nodes {
-		if n.Parent == parent && n.Status != "exited" {
+		if n.Parent == parent && n.Status != "exited" && !n.Killed {
 			live++
 		}
 	}
@@ -1051,12 +1066,17 @@ func shellQuote(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
+// kill stops a session. Claude Code lists a stopped worker just as it lists one it retired, so the daemon marks it, and the master may not resume it.
+// The master stays stopped only until it has events to read, as poll finds.
 func (d *daemon) kill(name string) error {
 	d.mu.Lock()
 	n := d.nodes[name]
 	var id string
+	var killed bool
 	if n != nil {
-		id = n.ID
+		id, killed = n.ID, n.Killed
+		// Marked first, so that a poll that sees the worker stopped tells the master nothing of its own.
+		n.Killed = killed || (id != "" && name != masterNode)
 	}
 	d.stirred = true
 	d.mu.Unlock()
@@ -1066,7 +1086,18 @@ func (d *daemon) kill(name string) error {
 	case id == "":
 		return fmt.Errorf("%s is still starting", name)
 	}
-	return d.claude.Stop(id)
+	err := d.claude.Stop(id)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	switch {
+	case err != nil:
+		n.Killed = killed
+	case n.Killed && !killed:
+		d.pushLocked(Event{Kind: "exit", Node: name, Text: "The user stopped it."})
+		d.saveLocked()
+		d.broadcastSessionsLocked()
+	}
+	return err
 }
 
 // resume gives a worker that ended its turn a new prompt.
@@ -1083,41 +1114,51 @@ func (d *daemon) resume(ctx context.Context, caller, name, prompt string) error 
 	return d.carryOn(ctx, name, prompt)
 }
 
-// carryOn gives a session that ended its turn a new prompt, which continues its conversation under the same id with its saved options.
+// carryOn gives a session that ended its turn, or stopped, a new prompt, which continues its conversation under the same id with its saved options.
 func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	d.mu.Lock()
 	n := d.nodes[name]
 	var id, dir, status string
+	var killed bool
 	if n != nil {
-		id, dir, status = n.ID, n.Dir, n.Status
+		id, dir, status, killed = n.ID, n.Dir, n.Status, n.Killed
 	}
 	d.mu.Unlock()
 	switch {
 	case n == nil:
 		return fmt.Errorf("no node %q", name)
-	case id == "":
-		return fmt.Errorf("%s is still starting", name)
+	case id == "" || status == "starting":
+		// The listing may still show a session it just started as stopped, and a second resume would start a copy.
+		return fmt.Errorf("%s is %w", name, errStarting)
 	case status == "exited":
 		return fmt.Errorf("%s has exited", name)
+	case killed:
+		return fmt.Errorf("the user stopped %s", name)
 	}
 	a, err := d.awaitIdle(ctx, name, id)
 	if err != nil {
 		return err
 	}
 
-	// Claude Code resumes a running session into a copy under a new id, so the session stops first.
-	// Meanwhile the empty ID keeps poll from reporting it exited, and refuses a second resume.
+	// Claude Code resumes a running session into a copy under a new id, so a running session stops first.
+	// Meanwhile the empty ID keeps poll from reporting it stopped, and refuses a second resume.
 	d.mu.Lock()
-	if n.ID != id {
+	switch {
+	case n.ID != id:
 		d.mu.Unlock()
-		return fmt.Errorf("%s is still starting", name)
+		return fmt.Errorf("%s is %w", name, errStarting)
+	case n.Killed:
+		d.mu.Unlock()
+		return fmt.Errorf("the user stopped %s", name)
 	}
 	n.ID = ""
 	d.mu.Unlock()
 	next := id
-	err = d.claude.Stop(id)
-	if err == nil {
-		err = d.awaitGone(ctx, name, id)
+	if a.Status != "" {
+		err = d.claude.Stop(id)
+		if err == nil {
+			err = d.awaitStopped(ctx, name, id)
+		}
 	}
 	if err == nil {
 		next, err = d.claude.Start(dir, []string{"--bg", "--resume", a.SessionID, "--", prompt})
@@ -1136,16 +1177,16 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	return nil
 }
 
-// awaitGone waits until Claude Code no longer lists the session id.
+// awaitStopped waits until Claude Code lists the session id as stopped, or no more.
 // claude stop may return before the supervisor settles the session, and a resume before then starts a copy without the session's options.
-func (d *daemon) awaitGone(ctx context.Context, name, id string) error {
+func (d *daemon) awaitStopped(ctx context.Context, name, id string) error {
 	deadline := time.Now().Add(stopWait)
 	for {
 		agents, err := d.claude.Agents()
 		if err != nil {
 			return err
 		}
-		if !slices.ContainsFunc(agents, func(a agent) bool { return a.ID == id }) {
+		if !slices.ContainsFunc(agents, func(a agent) bool { return a.ID == id && a.Status != "" }) {
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -1159,7 +1200,7 @@ func (d *daemon) awaitGone(ctx context.Context, name, id string) error {
 	}
 }
 
-// awaitIdle waits until Claude Code lists the session id as idle, and returns its listing.
+// awaitIdle waits until Claude Code lists the session id as idle or stopped, and returns its listing.
 func (d *daemon) awaitIdle(ctx context.Context, name, id string) (agent, error) {
 	deadline := time.Now().Add(idleWait)
 	for {
@@ -1168,7 +1209,7 @@ func (d *daemon) awaitIdle(ctx context.Context, name, id string) (agent, error) 
 			return agent{}, err
 		}
 		i := slices.IndexFunc(agents, func(a agent) bool { return a.ID == id })
-		if i >= 0 && agents[i].Status == "idle" {
+		if i >= 0 && (agents[i].Status == "idle" || agents[i].Status == "") {
 			return agents[i], nil
 		}
 		if time.Now().After(deadline) {
@@ -1186,7 +1227,7 @@ func (d *daemon) awaitIdle(ctx context.Context, name, id string) (agent, error) 
 }
 
 // ensureMaster adopts the master of an earlier run while Claude Code still lists it, and starts one otherwise.
-// An adopted master that ended its turn, as one does once its calls to a stopped daemon fail, sleeps until the next event.
+// An adopted master that ended its turn, as one does once its calls to a stopped daemon fail, or that stopped, sleeps until the next event.
 func (d *daemon) ensureMaster() error {
 	agents, err := d.claude.Agents()
 	if err != nil {
@@ -1195,7 +1236,9 @@ func (d *daemon) ensureMaster() error {
 	d.mu.Lock()
 	if m := d.nodes[masterNode]; m != nil {
 		if i := slices.IndexFunc(agents, func(a agent) bool { return a.ID == m.ID }); i >= 0 {
-			d.asleep = agents[i].Status == "idle"
+			d.asleep = agents[i].Status == "idle" || agents[i].Status == ""
+			// A saved "starting" would keep wakeMaster from resuming it until the first poll.
+			m.Status, m.State = cmp.Or(agents[i].Status, "stopped"), agents[i].State
 			d.mu.Unlock()
 			return nil
 		}
@@ -1225,10 +1268,10 @@ func (d *daemon) switchModel(model string) error {
 	if model == "" {
 		return errors.New("name a model")
 	}
-	if !d.switching.TryLock() {
-		return errors.New("the master is already switching")
+	if !d.masterLock.TryLock() {
+		return errors.New("the master is being woken or switched, so try again in a moment")
 	}
-	defer d.switching.Unlock()
+	defer d.masterLock.Unlock()
 	d.mu.Lock()
 	m := d.nodes[masterNode]
 	old, sid := m.ID, m.SessionID
@@ -1242,10 +1285,7 @@ func (d *daemon) switchModel(model string) error {
 	}
 	id, err := d.start(next, next.Dir, []string{"--resume", sid}, masterPrompt, fmt.Sprintf("The user switched your model to %s. Carry on: call next_event.", model))
 	if err != nil {
-		// Without flags, the resume continues the old master under its own id.
-		if _, rerr := d.claude.Start(next.Dir, []string{"--bg", "--resume", sid}); rerr != nil {
-			log.Printf("resuming the master: %v", rerr)
-		}
+		d.restoreMaster(old, sid, fmt.Sprintf("Switching your model to %s failed, so you keep the old one. Carry on: call next_event.", model))
 		return err
 	}
 
@@ -1276,6 +1316,30 @@ func (d *daemon) switchModel(model string) error {
 	return nil
 }
 
+// restoreMaster resumes the old master, stopped by a switch that failed, under its own id.
+func (d *daemon) restoreMaster(id, sid, prompt string) {
+	d.mu.Lock()
+	m := d.nodes[masterNode]
+	dir := m.Dir
+	d.mu.Unlock()
+	err := d.awaitStopped(context.Background(), masterNode, id)
+	if err == nil {
+		id, err = d.claude.Start(dir, []string{"--bg", "--resume", sid, "--", prompt})
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err != nil {
+		log.Printf("resuming the master: %v", err)
+		d.sleepLocked()
+		return
+	}
+	m.ID, m.Status, m.State, m.pre = id, "starting", "", nil
+	d.asleep = false
+	d.started[masterNode] = time.Now()
+	d.saveLocked()
+	d.broadcastSessionsLocked()
+}
+
 // pollDue reports whether a poll could find a change: a session is in its turn or starting, something stirred since the last poll, or the last poll is quietPollEvery old.
 func (d *daemon) pollDue(now time.Time) bool {
 	d.mu.Lock()
@@ -1284,14 +1348,19 @@ func (d *daemon) pollDue(now time.Time) bool {
 		return true
 	}
 	for _, n := range d.nodes {
-		if n.ID == "" || (n.Status != "idle" && n.Status != "exited") {
+		if n.ID == "" || !betweenTurns(n.Status) {
 			return true
 		}
 	}
 	return false
 }
 
-// poll refreshes each session from `claude agents --json`, and tells the master of a worker that stopped being listed.
+// betweenTurns reports whether a session with status runs no turn: it is idle, stopped or gone.
+func betweenTurns(status string) bool {
+	return status == "idle" || status == "stopped" || status == "exited"
+}
+
+// poll refreshes each session from Claude Code's listing, and tells the master of a worker that stopped in its turn.
 func (d *daemon) poll() {
 	// A hook during the listing may begin a turn the listing misses, so it stirs the next poll.
 	d.mu.Lock()
@@ -1326,20 +1395,28 @@ func (d *daemon) refresh(byID map[string]agent) (masterMoved bool) {
 		}
 		status, state := "exited", ""
 		a, listed := byID[n.ID]
-		switch {
-		case listed:
-			status, state = a.Status, a.State
+		if listed {
 			// The listing outranks a hook, which a stopped session may still send after a switch.
 			n.SessionID = cmp.Or(a.SessionID, n.SessionID)
+		}
+		switch {
+		case listed && a.Status != "":
+			status, state = a.Status, a.State
 		case n.Status == "starting" && time.Since(d.started[n.Node]) < startGrace:
 			continue
+		case listed:
+			status = "stopped"
 		}
 		if status == n.Status && state == n.State {
 			continue
 		}
-		if status == "exited" && n.Node != masterNode {
+		switch {
+		case n.Node == masterNode && status == "stopped" && !d.asleep:
+			d.sleepLocked()
+		// Claude Code stops a worker idle for an hour, which has sent its turn_end and still resumes, so only a worker stopped in its turn is news.
+		case (status == "stopped" || status == "exited") && !betweenTurns(n.Status) && n.Node != masterNode && !n.Killed:
 			d.pushLocked(Event{Kind: "exit", Node: n.Node})
-			log.Printf("%s exited", n.Node)
+			log.Printf("%s %s in its turn", n.Node, status)
 		}
 		n.Status, n.State = status, state
 		changed = true

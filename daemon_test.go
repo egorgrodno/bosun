@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,15 +19,17 @@ import (
 	"time"
 )
 
+// fakeClaude lists a stopped session without a Status, as `claude agents --json --all` does, until Remove.
 type fakeClaude struct {
 	mu         sync.Mutex
 	agents     []agent
 	starts     [][]string
 	dirs       []string
+	stops      []string
 	removed    []string
 	fail       func(args []string) error
 	supervisor int
-	// linger keeps a stopped session listed for that many more listings, as Claude Code does until its supervisor settles it.
+	// linger keeps a stopped session running for that many more listings, as Claude Code does until its supervisor settles it.
 	linger       int
 	stopping     map[string]int
 	resumedEarly bool
@@ -43,12 +46,21 @@ func (f *fakeClaude) Start(dir string, args []string) (string, error) {
 	defer f.mu.Unlock()
 	f.starts = append(f.starts, args)
 	f.dirs = append(f.dirs, dir)
-	if slices.Contains(args, "--resume") && len(f.stopping) > 0 {
-		f.resumedEarly = true
-	}
 	if f.fail != nil {
 		if err := f.fail(args); err != nil {
 			return "", err
+		}
+	}
+	// A resume without flags continues a stopped session under its own id, and makes a copy of any other.
+	if sid := argAfter(args, "--resume"); sid != "" {
+		i := slices.IndexFunc(f.agents, func(a agent) bool { return a.SessionID == sid })
+		flagless := len(args) == 3 || args[3] == "--"
+		switch {
+		case i >= 0 && f.agents[i].Status != "":
+			f.resumedEarly = true
+		case i >= 0 && flagless:
+			f.agents[i].Status = "busy"
+			return f.agents[i].ID, nil
 		}
 	}
 	id := fmt.Sprintf("%08x", len(f.starts))
@@ -91,7 +103,7 @@ func (f *fakeClaude) Agents() ([]agent, error) {
 			continue
 		}
 		delete(f.stopping, id)
-		f.agents = slices.DeleteFunc(f.agents, func(a agent) bool { return a.ID == id })
+		f.stopLocked(id)
 	}
 	return slices.Clone(f.agents), nil
 }
@@ -99,6 +111,7 @@ func (f *fakeClaude) Agents() ([]agent, error) {
 func (f *fakeClaude) Stop(id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.stops = append(f.stops, id)
 	if f.linger > 0 {
 		if f.stopping == nil {
 			f.stopping = map[string]int{}
@@ -106,8 +119,21 @@ func (f *fakeClaude) Stop(id string) error {
 		f.stopping[id] = f.linger
 		return nil
 	}
-	f.agents = slices.DeleteFunc(f.agents, func(a agent) bool { return a.ID == id })
+	f.stopLocked(id)
 	return nil
+}
+
+func (f *fakeClaude) stopLocked(id string) {
+	if i := slices.IndexFunc(f.agents, func(a agent) bool { return a.ID == id }); i >= 0 {
+		f.agents[i].PID, f.agents[i].Status = 0, ""
+	}
+}
+
+// setStatus sets the status Claude Code lists for session id.
+func (f *fakeClaude) setStatus(id, status string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.agents[slices.IndexFunc(f.agents, func(a agent) bool { return a.ID == id })].Status = status
 }
 
 const worktree = "/repo/.claude/worktrees/a"
@@ -399,12 +425,144 @@ func TestWorkerExitTellsMaster(t *testing.T) {
 	fc.agents = append(fc.agents, agent{ID: "aaaaaaaa", Name: "a", Status: "busy"})
 	fc.mu.Unlock()
 	d.poll()
+	fc.setStatus("aaaaaaaa", "")
+	d.poll()
+	events := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events
+	if len(events) != 1 || events[0].Kind != "exit" || events[0].Node != "a" || events[0].Text != "" {
+		t.Fatalf("events = %+v", events)
+	}
+}
+
+// Claude Code stops a session idle for an hour, and lists it as it lists one `claude stop` stopped.
+func TestRetiredWorkerResumes(t *testing.T) {
+	d, fc := testDaemon(t)
+	fc.mu.Lock()
+	fc.agents = append(fc.agents, agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a", Status: "idle"})
+	fc.mu.Unlock()
+	d.poll()
+	fc.setStatus("aaaaaaaa", "")
+	d.poll()
+	d.mu.Lock()
+	status, events := d.nodes["a"].Status, len(d.events)
+	d.mu.Unlock()
+	if status != "stopped" || events != 0 {
+		t.Fatalf("the retired worker is %q, and the master got %d events", status, events)
+	}
+
+	mustCall(t, Request{Op: "resume", Node: masterNode, Name: "a", Text: "fix the review"})
+	fc.mu.Lock()
+	stops := len(fc.stops)
+	fc.mu.Unlock()
+	if args := fc.lastStart(); !slices.Equal(args, []string{"--bg", "--resume", "s-a", "--", "fix the review"}) || stops != 0 {
+		t.Fatalf("claude ran with %q after %d stops", args, stops)
+	}
+	d.poll()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if a := d.nodes["a"]; a.ID != "aaaaaaaa" || a.Status != "busy" {
+		t.Fatalf("a = %+v", a)
+	}
+}
+
+func TestKill(t *testing.T) {
+	d, fc := testDaemon(t)
+	fc.mu.Lock()
+	fc.agents = append(fc.agents, agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a", Status: "busy"})
+	fc.mu.Unlock()
+	d.poll()
 	mustCall(t, Request{Op: "kill", Name: "a"})
 	d.poll()
 	events := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events
-	if len(events) != 1 || events[0].Kind != "exit" || events[0].Node != "a" {
+	if len(events) != 1 || events[0].Kind != "exit" || events[0].Node != "a" || events[0].Text == "" {
 		t.Fatalf("events = %+v", events)
 	}
+	if _, err := call(context.Background(), Request{Op: "resume", Node: masterNode, Name: "a", Text: "x"}); err == nil {
+		t.Fatal("the master resumed a worker the user stopped")
+	}
+}
+
+func TestKillMaster(t *testing.T) {
+	d, fc := testDaemon(t)
+	fc.mu.Lock()
+	fc.agents[0].SessionID = "s-m"
+	fc.mu.Unlock()
+	d.poll()
+	// The poll found a, which Claude Code does not list, gone.
+	mustCall(t, Request{Op: "next_event", Node: masterNode})
+	mustCall(t, Request{Op: "kill", Name: masterNode})
+	d.poll()
+	mustCall(t, Request{Op: "tell", Text: "x"})
+	awaitWoken(t, d, fc, 2)
+
+	// Events that wait when the master stops would otherwise wait for one more.
+	d.poll()
+	mustCall(t, Request{Op: "next_event", Node: masterNode})
+	mustCall(t, Request{Op: "tell", Text: "y"})
+	mustCall(t, Request{Op: "kill", Name: masterNode})
+	d.poll()
+	awaitWoken(t, d, fc, 3)
+}
+
+func TestKillDuringResume(t *testing.T) {
+	d, fc := testDaemon(t)
+	fc.mu.Lock()
+	fc.agents = append(fc.agents, agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a", Status: "busy"})
+	fc.mu.Unlock()
+	d.poll()
+	done := make(chan error, 1)
+	go func() {
+		_, err := call(context.Background(), Request{Op: "resume", Node: masterNode, Name: "a", Text: "x"})
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	mustCall(t, Request{Op: "kill", Name: "a"})
+	if err := <-done; err == nil {
+		t.Fatal("a resume that waited for the worker to go idle revived it after the user stopped it")
+	}
+}
+
+func TestResumeWhileStarting(t *testing.T) {
+	d, fc := testDaemon(t)
+	fc.mu.Lock()
+	fc.agents = append(fc.agents, agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a"})
+	fc.mu.Unlock()
+	d.poll()
+	mustCall(t, Request{Op: "resume", Node: masterNode, Name: "a", Text: "one"})
+	// The listing may still show the session stopped.
+	fc.setStatus("aaaaaaaa", "")
+	if _, err := call(context.Background(), Request{Op: "resume", Node: masterNode, Name: "a", Text: "two"}); err == nil {
+		t.Fatal("resumed a worker still starting from the last resume")
+	}
+}
+
+// A switch and a wake would each resume the master, and the old master would run beside the new one.
+func TestWakeAndSwitchExclude(t *testing.T) {
+	d, fc := testDaemon(t)
+	fc.mu.Lock()
+	fc.agents[0].SessionID = "s-m"
+	fc.mu.Unlock()
+	d.mu.Lock()
+	d.nodes[masterNode].SessionID = "s-m"
+	d.mu.Unlock()
+	d.poll()
+	mustCall(t, Request{Op: "next_event", Node: masterNode})
+	mustCall(t, Request{Op: "kill", Name: masterNode})
+	d.poll()
+
+	d.masterLock.Lock()
+	if err := d.switchModel("opus"); err == nil {
+		t.Fatal("switched the master while it was being woken")
+	}
+	mustCall(t, Request{Op: "tell", Text: "x"})
+	time.Sleep(50 * time.Millisecond)
+	fc.mu.Lock()
+	starts := len(fc.starts)
+	fc.mu.Unlock()
+	if starts != 1 {
+		t.Fatalf("woke the master while it was being switched: %d starts", starts)
+	}
+	d.masterLock.Unlock()
+	awaitWoken(t, d, fc, 2)
 }
 
 func TestLoadRewritesSettings(t *testing.T) {
@@ -518,60 +676,76 @@ func TestResume(t *testing.T) {
 	mustCall(t, resume)
 	fc.mu.Lock()
 	dir := fc.dirs[len(fc.dirs)-1]
-	stopped := !slices.ContainsFunc(fc.agents, func(a agent) bool { return a.ID == "aaaaaaaa" })
+	stops := slices.Clone(fc.stops)
 	early := fc.resumedEarly
 	fc.mu.Unlock()
 	if args := fc.lastStart(); dir != worktree || !slices.Equal(args, []string{"--bg", "--resume", "s-a", "--", "fix the review"}) {
 		t.Fatalf("claude ran in %s with %q", dir, args)
 	}
-	if !stopped || early {
-		t.Fatalf("the worker was resumed while still listed, which starts a copy: stopped %v, resumed early %v", stopped, early)
+	if !slices.Equal(stops, []string{"aaaaaaaa"}) || early {
+		t.Fatalf("the worker was resumed while still running, which starts a copy: stops %v, resumed early %v", stops, early)
 	}
 	d.poll()
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if a := d.nodes["a"]; a.ID == "aaaaaaaa" || a.ID == "" {
-		t.Fatalf("a = %+v, want the id claude printed", a)
+	if a := d.nodes["a"]; a.ID != "aaaaaaaa" || a.Status != "busy" {
+		t.Fatalf("a = %+v", a)
 	}
 	if len(d.events) != 0 {
 		t.Fatalf("the master got %+v", d.events)
 	}
 }
 
-// A daemon that stopped left the master's calls failing, so the master may have ended its turn.
+// A daemon that stopped left the master's calls failing, so the master may have ended its turn, and Claude Code may have stopped it since.
 func TestRestartLeavesIdleMasterAsleep(t *testing.T) {
-	d, fc := testDaemon(t)
-	idleWait = 0
-	t.Cleanup(func() { idleWait = 30 * time.Second })
-	fc.mu.Lock()
-	fc.agents[0].SessionID, fc.agents[0].Status = "s-m", "idle"
-	fc.mu.Unlock()
-	if err := d.ensureMaster(); err != nil || len(fc.starts) != 1 {
-		t.Fatalf("adopting an idle master: %v, %d starts", err, len(fc.starts))
-	}
+	for _, status := range []string{"idle", ""} {
+		t.Run(cmp.Or(status, "stopped"), func(t *testing.T) {
+			d, fc := testDaemon(t)
+			idleWait = 0
+			t.Cleanup(func() { idleWait = 30 * time.Second })
+			fc.mu.Lock()
+			fc.agents[0].SessionID, fc.agents[0].Status = "s-m", status
+			fc.mu.Unlock()
+			if err := d.ensureMaster(); err != nil || len(fc.starts) != 1 {
+				t.Fatalf("adopting the master: %v, %d starts", err, len(fc.starts))
+			}
 
-	mustCall(t, Request{Op: "tell", Text: "x"})
-	for i := 0; ; i++ {
+			mustCall(t, Request{Op: "tell", Text: "x"})
+			awaitWoken(t, d, fc, 2)
+			fc.mu.Lock()
+			stops := slices.Clone(fc.stops)
+			fc.mu.Unlock()
+			want := []string{"00000001"}
+			if status == "" {
+				want = nil
+			}
+			if args := fc.lastStart(); !slices.Equal(args, []string{"--bg", "--resume", "s-m", "--", eventsWaiting}) || !slices.Equal(stops, want) {
+				t.Fatalf("claude ran with %q after stopping %v", args, stops)
+			}
+			if events := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events; len(events) != 1 || events[0].Kind != "tell" {
+				t.Fatalf("events = %+v", events)
+			}
+		})
+	}
+}
+
+// awaitWoken waits until the daemon has resumed the master with claude's start number starts.
+func awaitWoken(t *testing.T, d *daemon, fc *fakeClaude, starts int) {
+	t.Helper()
+	for range 500 {
+		// The master's id is empty from before the resume's start until the resume ends.
+		fc.mu.Lock()
+		n := len(fc.starts)
+		fc.mu.Unlock()
 		d.mu.Lock()
 		id := d.nodes[masterNode].ID
 		d.mu.Unlock()
-		if id == "00000002" {
-			break
-		}
-		if i == 500 {
-			t.Fatalf("the master's id is %q, want the resumed session's", id)
+		if n == starts && id != "" {
+			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	fc.mu.Lock()
-	stopped := !slices.ContainsFunc(fc.agents, func(a agent) bool { return a.ID == "00000001" })
-	fc.mu.Unlock()
-	if args := fc.lastStart(); !slices.Equal(args, []string{"--bg", "--resume", "s-m", "--", eventsWaiting}) || !stopped {
-		t.Fatalf("claude ran with %q, the old master stopped: %v", args, stopped)
-	}
-	if events := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events; len(events) != 1 || events[0].Kind != "tell" {
-		t.Fatalf("events = %+v", events)
-	}
+	t.Fatalf("the master was not resumed")
 }
 
 func TestMasterStop(t *testing.T) {
@@ -710,6 +884,27 @@ func TestSpawn(t *testing.T) {
 	}
 }
 
+// A stopped worker still resumes, so it holds its place under the cap until the user stops it.
+func TestCapCountsStoppedWorkers(t *testing.T) {
+	d, fc := testDaemon(t)
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	fc.mu.Lock()
+	fc.agents = append(fc.agents, agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a"})
+	fc.mu.Unlock()
+	d.poll()
+	for _, name := range []string{"b", "c", "d"} {
+		mustCall(t, Request{Op: "spawn", Node: masterNode, Name: name, Repo: repo, Text: "x"})
+	}
+	if _, err := call(context.Background(), Request{Op: "spawn", Node: masterNode, Name: "e", Repo: repo, Text: "x"}); err == nil {
+		t.Fatal("spawned a fifth child beside a stopped one")
+	}
+	mustCall(t, Request{Op: "kill", Name: "a"})
+	mustCall(t, Request{Op: "spawn", Node: masterNode, Name: "e", Repo: repo, Text: "x"})
+}
+
 func TestSpawnLeavesRoomForSandboxSockets(t *testing.T) {
 	// A 29-byte state path gives a node a TMPDIR of 40 bytes plus its name.
 	d := newDaemon("/bin/bosun", "sock", "/home/egor/.local/state/bosun", "/master", &fakeClaude{})
@@ -810,14 +1005,14 @@ func TestSwitchModelFailureResumesMaster(t *testing.T) {
 	if _, err := call(context.Background(), Request{Op: "model", Model: "nope"}); err == nil {
 		t.Fatal("the switch to a failing model succeeded")
 	}
-	if args := fc.lastStart(); !slices.Equal(args, []string{"--bg", "--resume", "s-master"}) {
+	if args := fc.lastStart(); len(args) != 5 || !slices.Equal(args[:4], []string{"--bg", "--resume", "s-master", "--"}) {
 		t.Fatalf("after the failure claude ran with %q, want the old master resumed", args)
 	}
 	d.mu.Lock()
-	model := d.nodes[masterNode].Model
+	m := *d.nodes[masterNode]
 	d.mu.Unlock()
-	if model != "" {
-		t.Fatalf("master model = %q", model)
+	if m.Model != "" || m.Status != "starting" {
+		t.Fatalf("master = %+v", m)
 	}
 }
 
