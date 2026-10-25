@@ -128,6 +128,9 @@ func runDaemon(args []string) error {
 	}
 	d := newDaemon(exe, socketPath(), stateDir(), *masterDir, claudeExec{})
 	d.masterModel, d.workerModel = *masterModel, *workerModel
+	if err := d.fitsSockets(masterNode); err != nil {
+		return fmt.Errorf("the state path %s is too long, so set BOSUN_STATE to a shorter one: %w", d.stateDir, err)
+	}
 	if err := d.load(); err != nil {
 		return err
 	}
@@ -227,6 +230,16 @@ func (s *Session) memoryDir() string {
 // tempDir is the node's TMPDIR.
 func (d *daemon) tempDir(node string) string {
 	return filepath.Join(d.stateDir, "nodes", node, "tmp")
+}
+
+// fitsSockets fails when node's TMPDIR is too long for the sockets Claude Code's sandbox creates in it, without which every Bash call fails.
+// The longest is claude-socks-<16 hex>.sock, and Linux binds a unix socket path of at most 108 bytes.
+func (d *daemon) fitsSockets(node string) error {
+	dir := d.tempDir(node)
+	if room := 108 - len("/claude-socks-0123456789abcdef.sock"); len(dir) > room {
+		return fmt.Errorf("%s runs to %d bytes, and the sandbox's sockets need it at most %d", dir, len(dir), room)
+	}
+	return nil
 }
 
 // scratchDir is the folder within tempDir that Claude Code makes the sandbox's TMPDIR.
@@ -718,6 +731,9 @@ func (d *daemon) spawn(caller, name, repo, model, prompt string) (*Session, erro
 	caller = cmp.Or(caller, masterNode)
 	if !nodeName.MatchString(name) || name == masterNode {
 		return nil, fmt.Errorf("invalid node name %q: use lowercase letters, digits and hyphens", name)
+	}
+	if err := d.fitsSockets(name); err != nil {
+		return nil, fmt.Errorf("node name %q is too long: %w", name, err)
 	}
 	if prompt == "" {
 		return nil, errors.New("the prompt is empty")

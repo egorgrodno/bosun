@@ -447,6 +447,22 @@ func TestSpawn(t *testing.T) {
 	}
 }
 
+func TestSpawnLeavesRoomForSandboxSockets(t *testing.T) {
+	// A 29-byte state path gives a node a TMPDIR of 40 bytes plus its name.
+	d := newDaemon("/bin/bosun", "sock", "/home/egor/.local/state/bosun", "/master", &fakeClaude{})
+	d.nodes[masterNode] = &Session{Node: masterNode}
+	for _, tc := range []struct {
+		length  int
+		refused bool
+	}{{33, false}, {34, true}} {
+		// No repo, so a name the check lets through fails on that instead, before anything is written.
+		_, err := d.spawn("", strings.Repeat("n", tc.length), "", "", "x")
+		if refused := err != nil && strings.Contains(err.Error(), "sockets"); refused != tc.refused {
+			t.Errorf("spawn of a %d-character name: %v", tc.length, err)
+		}
+	}
+}
+
 func TestModels(t *testing.T) {
 	d, fc := testDaemon(t)
 	d.masterModel, d.workerModel = "fable", "sonnet"
