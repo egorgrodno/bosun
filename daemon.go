@@ -846,11 +846,11 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 			"failIfUnavailable": true,
 			// The sandbox confines where a command writes, not what it does to the worktree, so auto mode and the master still judge it.
 			"autoAllowBashIfSandboxed": false,
-			// Linux cannot open a single socket path, and nix needs its daemon's. Hiding bosun's own keeps a worker from answering its own decisions.
+			// Linux cannot open a single socket path, and nix needs its daemon's, so the sockets a command could act through are hidden instead.
 			"network": map[string]any{"allowAllUnixSockets": true},
 			"filesystem": map[string]any{
 				"allowWrite": []string{"~/.cache/go-build", "~/.cache/nix"},
-				"denyRead":   []string{d.socket},
+				"denyRead":   d.hiddenSockets(),
 			},
 		},
 		"hooks": map[string]any{
@@ -875,6 +875,27 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 		return "", "", err
 	}
 	return settingsPath, mcpPath, writeJSON(mcpPath, mcp)
+}
+
+// hiddenSockets lists the sockets, and folders of them, through which a sandboxed command could act outside the sandbox.
+func (d *daemon) hiddenSockets() []string {
+	uid := os.Getuid()
+	return []string{
+		// A worker would answer its own decisions.
+		d.socket,
+		// The user's services: systemd, the session bus, the compositor, the ssh agent, and each Claude Code session's peer socket.
+		cmp.Or(os.Getenv("XDG_RUNTIME_DIR"), fmt.Sprintf("/run/user/%d", uid)),
+		// Claude Code's daemon, which starts sessions, and the terminals of the sessions it runs.
+		filepath.Join(os.TempDir(), fmt.Sprintf("cc-daemon-%d", uid)),
+		"/tmp/.X11-unix",
+		// The system bus, whose services act for the user wherever polkit allows it.
+		"/run/dbus",
+		// systemd's local sshd.
+		"/run/ssh-unix-local",
+		// The singletons of Chromium-based browsers, which open what they are sent. Claude Code expands the glob.
+		"/tmp/.com.*",
+		"/tmp/.org.*",
+	}
 }
 
 func writeJSON(path string, v any) error {

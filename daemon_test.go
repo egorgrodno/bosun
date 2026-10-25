@@ -332,6 +332,7 @@ func TestWorkerExitTellsMaster(t *testing.T) {
 
 func TestSpawn(t *testing.T) {
 	d, fc := testDaemon(t)
+	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1234")
 	repo := t.TempDir()
 	if out, err := exec.Command("git", "init", "-q", repo).CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v: %s", err, out)
@@ -370,8 +371,8 @@ func TestSpawn(t *testing.T) {
 	if want := (&Session{Repo: repo}).memoryDir(); settings.Memory != want {
 		t.Fatalf("autoMemoryDirectory = %q, want %q", settings.Memory, want)
 	}
-	if !settings.Sandbox.Enabled || !slices.Contains(settings.Sandbox.Filesystem["denyRead"], d.socket) {
-		t.Fatalf("sandbox = %+v, want it on with the socket hidden", settings.Sandbox)
+	if deny := settings.Sandbox.Filesystem["denyRead"]; !settings.Sandbox.Enabled || !slices.Contains(deny, d.socket) || !slices.Contains(deny, "/run/user/1234") {
+		t.Fatalf("sandbox = %+v, want it on with the socket and the runtime folder hidden", settings.Sandbox)
 	}
 	if cmd := settings.Hooks["PreToolUse"][0].Hooks[0].Command; !strings.Contains(cmd, "BOSUN_NODE=b ") || !strings.HasSuffix(cmd, "'/bin/bosun' hook") {
 		t.Fatalf("hook command = %s", cmd)
