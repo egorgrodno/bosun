@@ -31,6 +31,19 @@ func str(description string) map[string]any {
 const (
 	nameHelp  = "Node name: lowercase letters, digits and hyphens, unique in the repository. It names the session, its worktree and its branch worktree-<name>."
 	modelHelp = "The session's model, such as fable, opus, sonnet or haiku. Leave it out unless the user named one for this task: the user sets the default."
+
+	nextEventHelp = `Wait up to four minutes for events from the workers and the user. Returns them as JSON, or says there were none.
+
+Work in a loop: call next_event, handle every event it returns, and call it again. When it returns no events, end your turn: the next event starts a new one.
+
+The events:
+- tell: a message from the user. Act on it, usually by starting workers with spawn.
+- decision of kind question: a worker asks something. Settle it with reply or escalate.
+- decision of kind permission: a worker wants to run a tool. Settle it with decide or escalate.
+- turn_end: a worker finished a turn, and its last message says what it did. To give it more to do, such as a fix after review, call resume.
+- exit: a worker's session ended.
+
+bosun sends a git push, deleting a branch, a file write outside a session's own folders and a command outside the sandbox straight to the user, so none of them reaches you, and no answer of yours allows one.`
 )
 
 func tools(master bool) []tool {
@@ -53,12 +66,12 @@ func tools(master bool) []tool {
 			"prompt": str("The worker's task. It sees nothing else, so say everything it needs."),
 			"model":  str(modelHelp),
 		})},
-		{"next_event", "Wait up to four minutes for events from the workers and the user. Returns them as JSON, or says there were none. Call it again after handling them, and end your turn when there were none: the next event starts a new one.", object([]string{}, map[string]any{})},
-		{"reply", "Answer a worker's question. The worker gets the answer as the result of its ask.", object([]string{"id", "answer"}, map[string]any{
+		{"next_event", nextEventHelp, object([]string{}, map[string]any{})},
+		{"reply", "Answer a worker's question. The worker gets the answer as the result of its ask. Answer when the user's instructions or the worker's task settle the question, and escalate it otherwise.", object([]string{"id", "answer"}, map[string]any{
 			"id":     str("The decision's id."),
 			"answer": str("The answer."),
 		})},
-		{"decide", "Allow or deny a worker's permission request.", object([]string{"id", "allow"}, map[string]any{
+		{"decide", "Allow or deny a worker's permission request: a tool call that its permission rules and auto mode did not approve. Allow it when the worker's task needs it and it can be undone. Deny it with a message that tells the worker what to do instead. Escalate what the user should judge, such as a call the task needs that cannot be undone.", object([]string{"id", "allow"}, map[string]any{
 			"id":      str("The decision's id."),
 			"allow":   map[string]any{"type": "boolean", "description": "true to allow the tool call, false to deny it."},
 			"message": str("When denying, why. It reaches the worker verbatim, so tell it what to do instead."),
@@ -67,11 +80,11 @@ func tools(master bool) []tool {
 			"name":   str("The worker's node name."),
 			"prompt": str("What to do next. The worker remembers its task, so say only what is new."),
 		})},
-		{"escalate", "Hand a question or permission request to the user, who answers it from bosun. Its worker keeps waiting.", object([]string{"id"}, map[string]any{
+		{"escalate", "Hand a question or permission request to the user, who answers it from bosun. Its worker keeps waiting, and the decision needs nothing more from you.", object([]string{"id"}, map[string]any{
 			"id":   str("The decision's id."),
 			"note": str("What the user should know, such as why you did not decide it yourself."),
 		})},
-		{"notify", "Tell the user about a problem that is not a decision, such as a spawn that failed. It waits in bosun until the user dismisses it, and nobody waits on it.", object([]string{"message"}, map[string]any{
+		{"notify", "Tell the user about a problem that is not a decision. Call it whenever something fails that you cannot fix, such as a spawn that Claude Code refuses: the user hears of it no other way. It waits in bosun until the user dismisses it, and nobody waits on it.", object([]string{"message"}, map[string]any{
 			"message": str("What happened, and what the user can do about it."),
 		})},
 	}
