@@ -1004,7 +1004,7 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 			// Linux cannot open a single socket path, and nix needs its daemon's, so the sockets a command could act through are hidden instead.
 			"network": map[string]any{"allowAllUnixSockets": true},
 			"filesystem": map[string]any{
-				"allowWrite": []string{"~/.cache/go-build", "~/.cache/nix"},
+				"allowWrite": []string{"~/.cache/go-build", "~/.cache/nix", "~/.cache/treefmt"},
 				"denyRead":   d.hiddenSockets(),
 			},
 		},
