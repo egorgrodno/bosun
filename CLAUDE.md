@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-bosun orchestrates Claude Code background sessions: one master and a tree of workers. [README.md](README.md) holds the scope. This file holds the design, of which the TUI is not built yet. Its Claude Code behaviour and timings were measured against 2.1.310.
+bosun orchestrates Claude Code background sessions: one master and a tree of workers. [README.md](README.md) holds the scope. This file holds the design. Its Claude Code behaviour and timings were measured against 2.1.310.
 
 ## Shape
 

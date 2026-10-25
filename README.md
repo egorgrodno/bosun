@@ -2,7 +2,7 @@
 
 A master Claude Code session that runs a tree of worker sessions. It answers their routine questions and brings you the rest. A Quickshell panel drives it on the NixOS desktops, and a TUI drives it everywhere else.
 
-[CLAUDE.md](CLAUDE.md) holds the design. The daemon, a command-line frontend and the Quickshell panel work. The TUI is not built.
+[CLAUDE.md](CLAUDE.md) holds the design. The daemon and its frontends work: the command line, `bosun tui` and the Quickshell panel.
 
 ## Scope
 
@@ -18,6 +18,7 @@ By default the daemon runs the master in `~/.local/state/bosun/master`. Claude C
 bosun daemon &
 bosun tell 'Fix the flaky test in ~/Projects/app'
 bosun status      # the decisions waiting, then the tree
+bosun tui         # the same, live, to answer them and attach to a session
 bosun approve 3
 claude attach <id>
 ```

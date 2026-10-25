@@ -12,6 +12,7 @@ const usage = `usage:
   bosun mcp                        the MCP server each session starts
   bosun hook                       every hook each session runs
 
+  bosun tui                        the decisions waiting and the tree, in the terminal
   bosun status [--json]            the decisions waiting, and the tree
   bosun watch                      stream the daemon's snapshot and events
   bosun approve ID                 allow a permission
@@ -44,6 +45,8 @@ func main() {
 		err = runStatus(args)
 	case "watch":
 		err = runWatch()
+	case "tui":
+		err = runTUI()
 	case "approve", "deny", "reply", "dismiss", "tell", "spawn", "kill", "model":
 		err = runCommand(cmd, args)
 	default:
