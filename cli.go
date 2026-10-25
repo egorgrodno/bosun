@@ -21,12 +21,12 @@ func runCommand(cmd string, args []string) error {
 		_ = flags.Parse(args)
 		req.Model, args = *model, flags.Args()
 	}
-	need := map[string]int{"approve": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "model": 1}[cmd]
+	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "model": 1}[cmd]
 	if len(args) < need {
 		return errors.New(usage)
 	}
 	switch cmd {
-	case "approve":
+	case "approve", "dismiss":
 		req.ID = args[0]
 	case "deny", "reply":
 		req.ID, req.Text = args[0], strings.Join(args[1:], " ")
@@ -112,8 +112,11 @@ func printStatus(w io.Writer, s Response) {
 }
 
 func describe(dec Decision) string {
-	if dec.Kind == "question" {
+	switch dec.Kind {
+	case "question":
 		return "asks: " + dec.Question
+	case "notice":
+		return "notice"
 	}
 	var in map[string]any
 	_ = json.Unmarshal(dec.Input, &in)

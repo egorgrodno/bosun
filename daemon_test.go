@@ -209,6 +209,47 @@ func TestEscalatedPermissionWaitsOnUser(t *testing.T) {
 	}
 }
 
+func TestMasterNotifiesUser(t *testing.T) {
+	d, _ := testDaemon(t)
+	if _, err := call(context.Background(), Request{Op: "notify", Node: "a", Text: "x"}); err == nil {
+		t.Fatal("a worker notified the user")
+	}
+	mustCall(t, Request{Op: "notify", Node: masterNode, Text: "/src/app is not trusted, so b did not start"})
+	dec := openDecision(t, 1)
+	if dec.Kind != "notice" || dec.Holder != "user" || dec.Note != "/src/app is not trusted, so b did not start" {
+		t.Fatalf("decision = %+v", dec)
+	}
+	d.mu.Lock()
+	events := len(d.events)
+	d.mu.Unlock()
+	if events != 0 {
+		t.Fatalf("the master got %d events", events)
+	}
+	for _, r := range []Request{{Op: "dismiss", Node: masterNode, ID: dec.ID}, {Op: "approve", ID: dec.ID}} {
+		if _, err := call(context.Background(), r); err == nil {
+			t.Fatalf("%s by %q settled a notice", r.Op, r.Node)
+		}
+	}
+	mustCall(t, Request{Op: "dismiss", ID: dec.ID})
+	if n := len(mustCall(t, Request{Op: "status"}).Decisions); n != 0 {
+		t.Fatalf("%d decisions open after the dismiss", n)
+	}
+}
+
+func TestMCPNotify(t *testing.T) {
+	testDaemon(t)
+	args := json.RawMessage(`{"message":"b failed"}`)
+	if _, err := newMCPServer("a", io.Discard).run(context.Background(), "notify", args); err == nil {
+		t.Fatal("a worker has notify")
+	}
+	if _, err := newMCPServer(masterNode, io.Discard).run(context.Background(), "notify", args); err != nil {
+		t.Fatal(err)
+	}
+	if dec := openDecision(t, 1); dec.Kind != "notice" || dec.Note != "b failed" {
+		t.Fatalf("decision = %+v", dec)
+	}
+}
+
 func TestMasterAnswersQuestion(t *testing.T) {
 	testDaemon(t)
 	answer := make(chan string, 1)

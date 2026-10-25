@@ -20,7 +20,7 @@ One binary carries every part:
 | `bosun mcp` | the stdio MCP server each session starts, relaying to the daemon |
 | `bosun hook` | every hook each session runs |
 | `bosun tui` | the terminal frontend |
-| `bosun status`, `approve`, `deny`, `reply`, `tell`, `spawn`, `kill`, `model`, `watch` | the command-line frontend |
+| `bosun status`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `model`, `watch` | the command-line frontend |
 
 The daemon holds each session's parent and the queue of decisions waiting on an answer. It reads which of its sessions run from `claude agents --json`, which also lists sessions bosun did not start.
 
@@ -50,6 +50,7 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 |---|---|---|
 | Permission | run `npm test`, edit a file | rules, then auto mode, then the master, then you |
 | Question | "X or Y?", "tests fail, keep going?" | the master, then you |
+| Notice | "spawn failed: the repository is not trusted" | you, by dismissing it |
 
 **The permission hook is `PermissionRequest`.** It receives `session_id`, `tool_name` and `tool_input`. It answers with `hookSpecificOutput.decision.behavior` set to `allow` or `deny`, and a deny's `message` reaches the model verbatim. Auto mode approves a call without running the hook, unless an `ask` rule matches the call.
 
@@ -79,6 +80,7 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 | `decide` | master | allows or denies a permission |
 | `resume` | master | gives a worker that ended its turn a new prompt |
 | `escalate` | master | queues a question or a permission for you |
+| `notify` | master | queues a notice for you, about a problem that is not a decision |
 
 **The master loops on `next_event`.** It calls `next_event`, handles the event, and calls it again. A `Stop` hook reports a turn's end, and `claude agents --json` reports an exit.
 
@@ -88,7 +90,7 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 
 ## Frontends
 
-Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `tell`, `spawn`, `kill`, `model`. Every rule lives in the daemon.
+Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `model`. Every rule lives in the daemon.
 
 Each leads with the queue of decisions waiting on you, above the tree.
 

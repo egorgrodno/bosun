@@ -17,6 +17,7 @@ const usage = `usage:
   bosun approve ID                 allow a permission
   bosun deny ID [MESSAGE]          deny a permission
   bosun reply ID ANSWER            answer a question
+  bosun dismiss ID                 clear a notice from the master
   bosun tell TEXT                  send the master a message
   bosun spawn [-model M] NAME REPO PROMPT
                                    start a worker under the master
@@ -43,7 +44,7 @@ func main() {
 		err = runStatus(args)
 	case "watch":
 		err = runWatch()
-	case "approve", "deny", "reply", "tell", "spawn", "kill", "model":
+	case "approve", "deny", "reply", "dismiss", "tell", "spawn", "kill", "model":
 		err = runCommand(cmd, args)
 	default:
 		fmt.Fprintln(os.Stderr, usage)

@@ -71,6 +71,9 @@ func tools(master bool) []tool {
 			"id":   str("The decision's id."),
 			"note": str("What the user should know, such as why you did not decide it yourself."),
 		})},
+		{"notify", "Tell the user about a problem that is not a decision, such as a spawn that failed. It waits in bosun until the user dismisses it, and nobody waits on it.", object([]string{"message"}, map[string]any{
+			"message": str("What happened, and what the user can do about it."),
+		})},
 	}
 }
 
@@ -265,6 +268,8 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		}
 	case "escalate":
 		req.Text = args.Note
+	case "notify":
+		req.Text = args.Message
 	}
 	resp, err := call(ctx, req)
 	if err != nil {
@@ -283,6 +288,8 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		return string(data), err
 	case "escalate":
 		return "Escalated to the user.", nil
+	case "notify":
+		return "The user will see it.", nil
 	}
 	return "Done.", nil
 }

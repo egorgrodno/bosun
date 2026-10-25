@@ -338,6 +338,10 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 		err = d.answer(r.Node, r.ID, "question", answer{text: r.Text})
 	case "escalate":
 		err = d.escalate(r.Node, r.ID, r.Text)
+	case "notify":
+		err = d.notify(r.Node, r.Text)
+	case "dismiss":
+		err = d.answer(r.Node, r.ID, "notice", answer{})
 	case "tell":
 		err = d.tell(r.Text)
 	case "spawn":
@@ -556,9 +560,12 @@ func (d *daemon) settleLocked(dec *Decision, a answer) {
 	delete(d.decisions, dec.ID)
 	dec.answer <- a
 	d.broadcastLocked(Event{Kind: "settled", ID: dec.ID})
-	if a.withdrawn {
+	switch {
+	case a.withdrawn:
 		log.Printf("decision %s: withdrawn", dec.ID)
-	} else {
+	case dec.Kind == "notice":
+		log.Printf("decision %s: dismissed", dec.ID)
+	default:
 		log.Printf("decision %s: answered %s", dec.ID, cmp.Or(a.behavior, "with text"))
 	}
 }
@@ -618,6 +625,20 @@ func (d *daemon) escalate(caller, id, note string) error {
 	c := *dec
 	d.broadcastLocked(Event{Kind: "decision", Decision: &c})
 	log.Printf("decision %s: escalated", id)
+	return nil
+}
+
+// notify queues a notice from the master, which waits for the user to dismiss it and holds up no session.
+func (d *daemon) notify(caller, text string) error {
+	if caller != masterNode {
+		return errors.New("only the master notifies the user")
+	}
+	if text == "" {
+		return errors.New("the notice is empty")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: text})
 	return nil
 }
 

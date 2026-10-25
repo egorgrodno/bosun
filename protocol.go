@@ -45,7 +45,7 @@ type Event struct {
 	Sessions []Session `json:"sessions,omitempty"`
 }
 
-// Decision is a permission or a question waiting on its holder, the master or the user.
+// Decision is a permission or a question waiting on its holder, the master or the user, or a notice from the master waiting on the user. A notice's text is its Note.
 type Decision struct {
 	ID       string          `json:"id"`
 	Kind     string          `json:"kind"`
