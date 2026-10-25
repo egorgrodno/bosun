@@ -19,7 +19,7 @@ import (
 	"time"
 )
 
-// fakeClaude lists a stopped session without a Status, as `claude agents --json --all` does, until Remove.
+// fakeClaude lists a stopped session without a PID or Status, as `claude agents --json --all` does, until Remove.
 type fakeClaude struct {
 	mu         sync.Mutex
 	agents     []agent
@@ -27,12 +27,45 @@ type fakeClaude struct {
 	dirs       []string
 	stops      []string
 	removed    []string
+	copies     []string
 	fail       func(args []string) error
 	supervisor int
-	// linger keeps a stopped session running for that many more listings, as Claude Code does until its supervisor settles it.
-	linger       int
-	stopping     map[string]int
-	resumedEarly bool
+	// linger keeps a stopped session's process alive for that many more looks at it, as Claude Code lists the session stopped before its process exits.
+	linger int
+	// procs holds each session's latest process, and live each live process with the looks left before it exits, or -1 while it runs.
+	procs   map[string]int
+	live    map[int]int
+	nextPID int
+}
+
+func (f *fakeClaude) spawnLocked(id string) int {
+	if f.procs == nil {
+		f.procs, f.live = map[string]int{}, map[int]int{}
+	}
+	f.nextPID++
+	pid := 1000 + f.nextPID
+	f.procs[id], f.live[pid] = pid, -1
+	return pid
+}
+
+// tickLocked counts down the processes of stopped sessions.
+func (f *fakeClaude) tickLocked() {
+	for pid, n := range f.live {
+		switch {
+		case n > 0:
+			f.live[pid] = n - 1
+		case n == 0:
+			delete(f.live, pid)
+		}
+	}
+}
+
+func (f *fakeClaude) alive(pid int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.tickLocked()
+	_, ok := f.live[pid]
+	return ok
 }
 
 func (f *fakeClaude) Supervisor() (int, error) {
@@ -51,24 +84,26 @@ func (f *fakeClaude) Start(dir string, args []string) (string, error) {
 			return "", err
 		}
 	}
-	// A resume without flags continues a stopped session under its own id, and makes a copy of any other.
+	id := fmt.Sprintf("%08x", len(f.starts))
+	// A resume without flags continues a stopped session under its own id, once its process exits, and makes a copy otherwise.
 	if sid := argAfter(args, "--resume"); sid != "" {
 		i := slices.IndexFunc(f.agents, func(a agent) bool { return a.SessionID == sid })
 		flagless := len(args) == 3 || args[3] == "--"
-		switch {
-		case i >= 0 && f.agents[i].Status != "":
-			f.resumedEarly = true
-		case i >= 0 && flagless:
-			f.agents[i].Status = "busy"
-			return f.agents[i].ID, nil
+		if i >= 0 {
+			if _, running := f.live[f.procs[f.agents[i].ID]]; running || f.agents[i].Status != "" {
+				f.copies = append(f.copies, id)
+			} else if flagless {
+				a := &f.agents[i]
+				a.PID, a.Status = f.spawnLocked(a.ID), "busy"
+				return a.ID, nil
+			}
 		}
 	}
-	id := fmt.Sprintf("%08x", len(f.starts))
 	name := ""
 	if i := slices.Index(args, "-n"); i >= 0 {
 		name = args[i+1]
 	}
-	f.agents = append(f.agents, agent{ID: id, Name: name, Status: "busy"})
+	f.agents = append(f.agents, agent{ID: id, Name: name, PID: f.spawnLocked(id), Status: "busy"})
 	return id, nil
 }
 
@@ -97,14 +132,7 @@ func argAfter(args []string, name string) string {
 func (f *fakeClaude) Agents() ([]agent, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for id, n := range f.stopping {
-		if n > 0 {
-			f.stopping[id] = n - 1
-			continue
-		}
-		delete(f.stopping, id)
-		f.stopLocked(id)
-	}
+	f.tickLocked()
 	return slices.Clone(f.agents), nil
 }
 
@@ -112,28 +140,31 @@ func (f *fakeClaude) Stop(id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.stops = append(f.stops, id)
-	if f.linger > 0 {
-		if f.stopping == nil {
-			f.stopping = map[string]int{}
-		}
-		f.stopping[id] = f.linger
-		return nil
-	}
-	f.stopLocked(id)
-	return nil
-}
-
-func (f *fakeClaude) stopLocked(id string) {
 	if i := slices.IndexFunc(f.agents, func(a agent) bool { return a.ID == id }); i >= 0 {
 		f.agents[i].PID, f.agents[i].Status = 0, ""
 	}
+	if pid, ok := f.procs[id]; ok && f.live[pid] == -1 {
+		f.live[pid] = f.linger
+	}
+	return nil
 }
 
-// setStatus sets the status Claude Code lists for session id.
+// add lists a, running in a process of its own.
+func (f *fakeClaude) add(a agent) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	a.PID = f.spawnLocked(a.ID)
+	f.agents = append(f.agents, a)
+}
+
+// setStatus sets the status Claude Code lists for session id. A session with none has no process, as one that stopped long ago.
 func (f *fakeClaude) setStatus(id, status string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.agents[slices.IndexFunc(f.agents, func(a agent) bool { return a.ID == id })].Status = status
+	if status == "" {
+		delete(f.live, f.procs[id])
+	}
 }
 
 const worktree = "/repo/.claude/worktrees/a"
@@ -150,6 +181,9 @@ func testDaemon(t *testing.T) (*daemon, *fakeClaude) {
 	t.Setenv("BOSUN_SOCKET", sock)
 	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(dir, "claude"))
 	fc := &fakeClaude{}
+	alive := processAlive
+	processAlive = fc.alive
+	t.Cleanup(func() { processAlive = alive })
 	d := newDaemon("/bin/bosun", sock, filepath.Join(dir, "state"), filepath.Join(dir, "master"), fc)
 	ln, err := listen(sock)
 	if err != nil {
@@ -433,6 +467,32 @@ func TestWorkerExitTellsMaster(t *testing.T) {
 	}
 }
 
+// A copy lacks the session's options, bosun's hooks and sandbox among them, so it must not stand in for the worker.
+func TestResumeIntoCopy(t *testing.T) {
+	d, fc := testDaemon(t)
+	fc.add(agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a", Status: "idle"})
+	fc.mu.Lock()
+	// The daemon cannot wait for a process the listing does not name.
+	fc.agents[len(fc.agents)-1].PID = 0
+	fc.linger = 1000
+	fc.mu.Unlock()
+	d.poll()
+	if _, err := call(context.Background(), Request{Op: "resume", Node: masterNode, Name: "a", Text: "x"}); err == nil {
+		t.Fatal("a resume into a copy succeeded")
+	}
+	fc.mu.Lock()
+	copies, stops := slices.Clone(fc.copies), slices.Clone(fc.stops)
+	fc.mu.Unlock()
+	if len(copies) != 1 || !slices.Contains(stops, copies[0]) {
+		t.Fatalf("copies %v, stops %v: the copy runs on", copies, stops)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if a := d.nodes["a"]; a.ID != "aaaaaaaa" {
+		t.Fatalf("a = %+v, want the session it was", a)
+	}
+}
+
 // Claude Code stops a session idle for an hour, and lists it as it lists one `claude stop` stopped.
 func TestRetiredWorkerResumes(t *testing.T) {
 	d, fc := testDaemon(t)
@@ -657,9 +717,7 @@ func TestResume(t *testing.T) {
 	d, fc := testDaemon(t)
 	idleWait = 0
 	t.Cleanup(func() { idleWait = 30 * time.Second })
-	fc.mu.Lock()
-	fc.agents = append(fc.agents, agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a", Status: "busy"})
-	fc.mu.Unlock()
+	fc.add(agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a", Status: "busy"})
 	d.poll()
 	resume := Request{Op: "resume", Node: masterNode, Name: "a", Text: "fix the review"}
 	if _, err := call(context.Background(), resume); err == nil {
@@ -676,14 +734,13 @@ func TestResume(t *testing.T) {
 	mustCall(t, resume)
 	fc.mu.Lock()
 	dir := fc.dirs[len(fc.dirs)-1]
-	stops := slices.Clone(fc.stops)
-	early := fc.resumedEarly
+	stops, copies := slices.Clone(fc.stops), slices.Clone(fc.copies)
 	fc.mu.Unlock()
 	if args := fc.lastStart(); dir != worktree || !slices.Equal(args, []string{"--bg", "--resume", "s-a", "--", "fix the review"}) {
 		t.Fatalf("claude ran in %s with %q", dir, args)
 	}
-	if !slices.Equal(stops, []string{"aaaaaaaa"}) || early {
-		t.Fatalf("the worker was resumed while still running, which starts a copy: stops %v, resumed early %v", stops, early)
+	if !slices.Equal(stops, []string{"aaaaaaaa"}) || len(copies) != 0 {
+		t.Fatalf("the worker was resumed while its process ran, which starts a copy: stops %v, copies %v", stops, copies)
 	}
 	d.poll()
 	d.mu.Lock()
@@ -704,8 +761,9 @@ func TestRestartLeavesIdleMasterAsleep(t *testing.T) {
 			idleWait = 0
 			t.Cleanup(func() { idleWait = 30 * time.Second })
 			fc.mu.Lock()
-			fc.agents[0].SessionID, fc.agents[0].Status = "s-m", status
+			fc.agents[0].SessionID = "s-m"
 			fc.mu.Unlock()
+			fc.setStatus("00000001", status)
 			if err := d.ensureMaster(); err != nil || len(fc.starts) != 1 {
 				t.Fatalf("adopting the master: %v, %d starts", err, len(fc.starts))
 			}

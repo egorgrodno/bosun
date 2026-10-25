@@ -46,7 +46,7 @@ const (
 // idleWait bounds how long resume waits for a worker to be listed idle, which it is not until its Stop hook returns.
 var idleWait = 30 * time.Second
 
-// stopWait bounds how long a resume waits for the session it stopped to be listed as stopped.
+// stopWait bounds how long a resume waits for the process of the session it stopped to exit.
 const stopWait = 10 * time.Second
 
 var (
@@ -1153,51 +1153,66 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	}
 	n.ID = ""
 	d.mu.Unlock()
-	next := id
 	if a.Status != "" {
 		err = d.claude.Stop(id)
 		if err == nil {
-			err = d.awaitStopped(ctx, name, id)
+			err = d.awaitExit(ctx, name, a.PID)
 		}
 	}
 	if err == nil {
-		next, err = d.claude.Start(dir, []string{"--bg", "--resume", a.SessionID, "--", prompt})
+		err = d.resumeStopped(dir, id, a.SessionID, prompt)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	n.ID = id
 	if err != nil {
-		n.ID = id
 		return err
 	}
-	n.ID, n.Status, n.State, n.pre = next, "starting", "", nil
+	n.Status, n.State, n.pre = "starting", "", nil
 	d.started[name] = time.Now()
 	d.saveLocked()
 	d.broadcastSessionsLocked()
-	log.Printf("resumed %s (%s)", name, next)
+	log.Printf("resumed %s (%s)", name, id)
 	return nil
 }
 
-// awaitStopped waits until Claude Code lists the session id as stopped, or no more.
-// claude stop may return before the supervisor settles the session, and a resume before then starts a copy without the session's options.
-func (d *daemon) awaitStopped(ctx context.Context, name, id string) error {
+// resumeStopped continues the stopped session id, whose Claude Code session id is sid, with prompt.
+// Claude Code resumes a session still running into a copy under a new id, without the session's options, so a copy is stopped and reported.
+func (d *daemon) resumeStopped(dir, id, sid, prompt string) error {
+	next, err := d.claude.Start(dir, []string{"--bg", "--resume", sid, "--", prompt})
+	if err != nil || next == id {
+		return err
+	}
+	if err := d.claude.Stop(next); err != nil {
+		log.Print(err)
+	}
+	return fmt.Errorf("Claude Code resumed %s into a copy, %s, which bosun stopped, since %s still ran", id, next, id)
+}
+
+// awaitExit waits until process pid, a session claude stop stopped, exits.
+// claude stop returns, and Claude Code lists the session as stopped, before the session's process exits, and a resume before then starts a copy.
+func (d *daemon) awaitExit(ctx context.Context, name string, pid int) error {
 	deadline := time.Now().Add(stopWait)
-	for {
-		agents, err := d.claude.Agents()
-		if err != nil {
-			return err
-		}
-		if !slices.ContainsFunc(agents, func(a agent) bool { return a.ID == id && a.Status != "" }) {
-			return nil
-		}
+	for processAlive(pid) {
 		if time.Now().After(deadline) {
-			return fmt.Errorf("%s is still listed %v after claude stop", name, stopWait)
+			return fmt.Errorf("%s still runs %v after claude stop", name, stopWait)
 		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(200 * time.Millisecond):
+		case <-time.After(100 * time.Millisecond):
 		}
 	}
+	return nil
+}
+
+// processAlive reports whether process pid runs. A pid of 0 is unknown, and taken for gone.
+var processAlive = func(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 // awaitIdle waits until Claude Code lists the session id as idle or stopped, and returns its listing.
@@ -1280,12 +1295,13 @@ func (d *daemon) switchModel(model string) error {
 	if old == "" || sid == "" {
 		return errors.New("the master is still starting")
 	}
+	pid := d.pidOf(old)
 	if err := d.claude.Stop(old); err != nil {
 		return err
 	}
 	id, err := d.start(next, next.Dir, []string{"--resume", sid}, masterPrompt, fmt.Sprintf("The user switched your model to %s. Carry on: call next_event.", model))
 	if err != nil {
-		d.restoreMaster(old, sid, fmt.Sprintf("Switching your model to %s failed, so you keep the old one. Carry on: call next_event.", model))
+		d.restoreMaster(old, sid, pid, fmt.Sprintf("Switching your model to %s failed, so you keep the old one. Carry on: call next_event.", model))
 		return err
 	}
 
@@ -1316,15 +1332,29 @@ func (d *daemon) switchModel(model string) error {
 	return nil
 }
 
-// restoreMaster resumes the old master, stopped by a switch that failed, under its own id.
-func (d *daemon) restoreMaster(id, sid, prompt string) {
+// pidOf returns the process of session id, or 0 when Claude Code lists none.
+func (d *daemon) pidOf(id string) int {
+	agents, err := d.claude.Agents()
+	if err != nil {
+		log.Print(err)
+	}
+	for _, a := range agents {
+		if a.ID == id {
+			return a.PID
+		}
+	}
+	return 0
+}
+
+// restoreMaster resumes the old master, whose process was pid until a switch that failed stopped it, under its own id.
+func (d *daemon) restoreMaster(id, sid string, pid int, prompt string) {
 	d.mu.Lock()
 	m := d.nodes[masterNode]
 	dir := m.Dir
 	d.mu.Unlock()
-	err := d.awaitStopped(context.Background(), masterNode, id)
+	err := d.awaitExit(context.Background(), masterNode, pid)
 	if err == nil {
-		id, err = d.claude.Start(dir, []string{"--bg", "--resume", sid, "--", prompt})
+		err = d.resumeStopped(dir, id, sid, prompt)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1333,7 +1363,7 @@ func (d *daemon) restoreMaster(id, sid, prompt string) {
 		d.sleepLocked()
 		return
 	}
-	m.ID, m.Status, m.State, m.pre = id, "starting", "", nil
+	m.Status, m.State, m.pre = "starting", "", nil
 	d.asleep = false
 	d.started[masterNode] = time.Now()
 	d.saveLocked()
