@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 // Request is a line a client sends the daemon. Node names the calling session, and is empty for a frontend.
@@ -82,6 +83,8 @@ type Session struct {
 	Status    string `json:"status"`
 	State     string `json:"state,omitempty"`
 	Killed    bool   `json:"killed,omitempty"`
+	// LimitedUntil is when the usage limit that stopped the session resets, and the daemon resumes it.
+	LimitedUntil *time.Time `json:"limitedUntil,omitempty"`
 
 	Base       string `json:"base,omitempty"`
 	BaseBranch string `json:"baseBranch,omitempty"`

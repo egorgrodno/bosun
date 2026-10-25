@@ -104,6 +104,8 @@ func printStatus(w io.Writer, s Response) {
 			switch {
 			case n.Killed:
 				state = "killed"
+			case n.LimitedUntil != nil:
+				state = "limited until " + n.LimitedUntil.Local().Format("15:04")
 			case n.State != "":
 				state += "/" + n.State
 			}

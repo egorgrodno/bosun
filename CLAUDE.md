@@ -32,6 +32,8 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Retiring.** Claude Code's supervisor stops a background session that has sat idle for an hour. `claude agents --json --all` keeps listing it without a `pid` or `status` until `claude rm`, the same as a session that `claude stop` stopped. Either resumes like an idle session, so stopped does not mean done. The listing cannot tell a kill from a retirement, so the daemon marks each worker that `bosun kill` stops, and `resume` refuses it.
 
+**Usage limits.** A turn that ends on an API error runs the `StopFailure` hook instead of `Stop`. Its `error` names the kind, such as `rate_limit`, `overloaded` or `server_error`, and its `last_assistant_message` holds Claude Code's message. For a usage limit that message says when the limit resets, as `resets 3pm (Europe/Berlin)`, or past a day `resets Oct 27, 3pm (Europe/Berlin)`. The daemon resumes each session a limit stopped at that time, the master first. Every session shares one account, so a limit usually stops them all, though a limit on one model stops only its sessions. A worker's other errors reach the master as its `turn_end`.
+
 **Upgrades.** A session reads its settings and MCP config only when its process starts. Both run bosun through `bosun` in the state directory, a link that each daemon start points at its own binary, and each start rewrites every session's settings. The system prompt is another matter. Claude Code snapshots it into the transcript, and every resume reuses the snapshot, even a resume with new flags. Tool descriptions come from the MCP server, which each process start runs from the current build. So the master's system prompt holds only what never changes, and its tools' descriptions hold its rules.
 
 **Supervisor.** A `claude --bg` that finds no supervisor starts Claude Code's supervisor in its own cgroup. The supervisor runs every background session and exits after the last one. Each session takes the supervisor's cgroup and environment, not those of its own `claude --bg`. So when the daemon starts the supervisor, every session runs in the daemon's cgroup. When a terminal started it, every session takes the terminal's environment, and the daemon queues a notice for you.
@@ -109,4 +111,5 @@ Each leads with the queue of decisions waiting on you, above the tree.
 ## Open questions
 
 - **Auto mode refusals.** It is untested whether an action the classifier refuses in a `--bg` session reaches `PermissionRequest`, or only `PermissionDenied` (#5).
+- **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
 - **Turn ends below the master.** Only the master gets `turn_end`, so a worker cannot tell when its own child is ready to merge, and the master merges it instead.

@@ -40,8 +40,10 @@ The events:
 - tell: a message from the user. Act on it, usually by starting workers with spawn.
 - decision of kind question: a worker asks something. Settle it with reply or escalate.
 - decision of kind permission: a worker wants to run a tool. Settle it with decide or escalate.
-- turn_end: a worker finished a turn, and its last message says what it did. To give it more to do, such as a fix after review, call resume. Once its work is right, call merge.
+- turn_end: a worker finished a turn, and its last message says what it did, or that the turn failed on an API error. To give it more to do, such as a fix after review or another try, call resume. Once its work is right, call merge.
 - exit: a worker's session stopped. Either it stopped in the middle of a turn, so no turn_end follows, and resume carries it on, or the user stopped it, as the event's text says, and resume refuses it.
+
+A usage limit stops a worker without a turn_end, and bosun resumes it once the limit resets.
 
 bosun sends a git push, deleting a branch, a file write outside a session's own folders and a command outside the sandbox straight to the user, so none of them reaches you, and no answer of yours allows one.`
 )

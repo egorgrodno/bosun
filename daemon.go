@@ -83,6 +83,9 @@ type daemon struct {
 	stopBlocked bool
 	// asleep holds from a Stop that ends the master's turn with no events waiting until the next event resumes it.
 	asleep bool
+	// recovering holds while the daemon resumes the sessions that a usage limit stopped, and limitNotice is the last notice of a limit.
+	recovering  bool
+	limitNotice string
 	// lastPoll and stirred decide whether the next tick polls: stirred holds from a hook or a kill until the poll after it.
 	lastPoll time.Time
 	stirred  bool
@@ -183,6 +186,7 @@ func runDaemon(args []string) error {
 			if d.pollDue(time.Now()) {
 				d.poll()
 			}
+			d.recoverLimited(time.Now())
 		}
 	}
 }
@@ -423,6 +427,7 @@ type hookInput struct {
 	ToolInput   json.RawMessage `json:"tool_input"`
 	ToolUseID   string          `json:"tool_use_id"`
 	LastMessage string          `json:"last_assistant_message"`
+	Error       string          `json:"error"`
 }
 
 // hook handles one hook event of a session. It blocks while a decision it opened waits, and answers with no behavior when the decision is withdrawn.
@@ -468,8 +473,26 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 	case "PostToolUse", "PostToolUseFailure":
 		delete(n.pre, in.ToolUseID)
 		d.withdrawLocked(node, func(dec *Decision) bool { return dec.toolUseID == in.ToolUseID })
+	case "StopFailure":
+		// The turn ended on an API error, and Stop does not run.
+		n.pre = nil
+		d.withdrawLocked(node, func(*Decision) bool { return true })
+		switch {
+		case in.Error == "rate_limit":
+			d.limitLocked(n, in.LastMessage)
+			if node == masterNode {
+				d.asleep = true
+			}
+		case node != masterNode:
+			d.pushLocked(Event{Kind: "turn_end", Node: node, Text: fmt.Sprintf("Its turn failed on an API error, %s: %s", in.Error, in.LastMessage)})
+		default:
+			// Waking it at once could fail the same way without end, so the next event retries it.
+			d.asleep = true
+			d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("The master's turn failed on an API error, %s: %s. The next event resumes it.", in.Error, in.LastMessage)})
+		}
 	case "Stop":
 		n.pre = nil
+		n.LimitedUntil = nil
 		d.withdrawLocked(node, func(*Decision) bool { return true })
 		switch {
 		case node != masterNode:
@@ -718,7 +741,8 @@ func (d *daemon) pushLocked(ev Event) {
 	d.events = append(d.events, ev)
 	close(d.wake)
 	d.wake = make(chan struct{})
-	if d.asleep {
+	// A master that a usage limit stopped wakes once the limit resets.
+	if m := d.nodes[masterNode]; d.asleep && (m == nil || m.LimitedUntil == nil) {
 		d.asleep = false
 		go d.wakeMaster()
 	}
@@ -768,6 +792,9 @@ func (d *daemon) nextEvent(ctx context.Context) []Event {
 	defer timer.Stop()
 	d.mu.Lock()
 	d.stopBlocked, d.asleep = false, false
+	if m := d.nodes[masterNode]; m != nil {
+		m.LimitedUntil = nil
+	}
 	d.mu.Unlock()
 	for {
 		d.mu.Lock()
@@ -1021,6 +1048,7 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 			"PostToolUse":        quick,
 			"PostToolUseFailure": quick,
 			"Stop":               quick,
+			"StopFailure":        quick,
 		},
 	}
 	mcp := map[string]any{"mcpServers": map[string]any{"bosun": map[string]any{
