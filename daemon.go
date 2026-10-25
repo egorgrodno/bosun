@@ -1258,13 +1258,18 @@ func (d *daemon) land(n *Session, id string) (string, error) {
 	if cur, err := gitOut(n.Base, "symbolic-ref", "--short", "HEAD"); err != nil || cur != n.BaseBranch {
 		return "", fmt.Errorf("%s began from %s in %s, which now has %q checked out, so the user must switch it back before %s merges", n.Node, n.BaseBranch, n.Base, cur, n.Node)
 	}
-	var exit *exec.ExitError
-	if _, err := gitOut(n.Base, "merge-base", "--is-ancestor", "HEAD", tip); errors.As(err, &exit) && exit.ExitCode() == 1 {
-		return "", fmt.Errorf("%s has fallen behind %s, so it must rebase onto %s before it merges", branch, n.BaseBranch, n.BaseBranch)
+	merged, err := isAncestor(n.Base, tip, "HEAD")
+	if err != nil {
+		return "", err
 	}
-	// Git would otherwise overwrite the user's ignored files, or stash the user's changes and leave conflicts in them.
-	if _, err := gitOut(n.Base, "-c", "merge.autostash=false", "merge", "--ff-only", "--no-overwrite-ignore", tip); err != nil {
-		return "", fmt.Errorf("the checkout %s refuses the merge, which only the user can clear: %w", n.Base, err)
+	if !merged {
+		if ahead, err := isAncestor(n.Base, "HEAD", tip); err != nil || !ahead {
+			return "", fmt.Errorf("%s has fallen behind %s, so it must rebase onto %s before it merges: %v", branch, n.BaseBranch, n.BaseBranch, err)
+		}
+		// Git would otherwise overwrite the user's ignored files, or stash the user's changes and leave conflicts in them.
+		if _, err := gitOut(n.Base, "-c", "merge.autostash=false", "merge", "--ff-only", "--no-overwrite-ignore", tip); err != nil {
+			return "", fmt.Errorf("the checkout %s refuses the merge, which only the user can clear: %w", n.Base, err)
+		}
 	}
 	if err := d.remove(id, tip); err != nil {
 		return "", fmt.Errorf("merged %s into %s, but removing %s failed: %w", branch, n.BaseBranch, n.Node, err)
@@ -1295,6 +1300,16 @@ func (d *daemon) remove(id, tip string) error {
 		return err
 	}
 	return d.claude.Remove(id, m[1]+"@"+m[2])
+}
+
+// isAncestor reports whether commit a is an ancestor of commit b in dir's repository.
+func isAncestor(dir, a, b string) (bool, error) {
+	_, err := gitOut(dir, "merge-base", "--is-ancestor", a, b)
+	var exit *exec.ExitError
+	if errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // gitOut runs git in dir with hooks and fsmonitor off, since a worker's commits or worktree could otherwise make the daemon run its code.

@@ -1275,6 +1275,23 @@ func TestMergeKeepsIgnoredFiles(t *testing.T) {
 	}
 }
 
+// A worker whose work is on its base branch already, which has moved on since, needs no rebase.
+func TestMergeAlreadyMerged(t *testing.T) {
+	d, fc := testDaemon(t)
+	_, repo, tip := mergeable(t, d, fc)
+	git(t, repo, "merge", "-q", "--ff-only", "worktree-b")
+	later := commit(t, repo, "later")
+	mustCall(t, Request{Op: "merge", Node: masterNode, Name: "b"})
+	if head := strings.TrimSpace(git(t, repo, "rev-parse", "main")); head != later {
+		t.Fatalf("main is at %s, want %s, past b's %s", head, later, tip)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.nodes["b"] != nil {
+		t.Fatal("the daemon still holds b")
+	}
+}
+
 // The Stop hook reports a turn's end before Claude Code lists the session idle.
 func TestMergeRightAfterTurnEnd(t *testing.T) {
 	d, fc := testDaemon(t)
