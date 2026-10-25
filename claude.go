@@ -5,11 +5,13 @@ import (
 	"fmt"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
 // agent is one entry of `claude agents --json`.
 type agent struct {
+	PID       int    `json:"pid"`
 	ID        string `json:"id"`
 	SessionID string `json:"sessionId"`
 	Name      string `json:"name"`
@@ -26,13 +28,16 @@ type claudeCLI interface {
 	Agents() ([]agent, error)
 	Stop(id string) error
 	Remove(id string) error
+	// Supervisor returns the pid of Claude Code's supervisor, which runs every background session.
+	Supervisor() (int, error)
 }
 
 type claudeExec struct{}
 
 var (
-	ansi         = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
-	backgrounded = regexp.MustCompile(`backgrounded · ([0-9a-f]+)`)
+	ansi          = regexp.MustCompile(`\x1b\[[0-9;?]*[A-Za-z]`)
+	backgrounded  = regexp.MustCompile(`backgrounded · ([0-9a-f]+)`)
+	supervisorPID = regexp.MustCompile(`(?m)^pid:\s+([0-9]+)`)
 )
 
 func (claudeExec) Start(dir string, args []string) (string, error) {
@@ -60,6 +65,18 @@ func (claudeExec) Agents() ([]agent, error) {
 		return nil, fmt.Errorf("claude agents --json: %w", err)
 	}
 	return agents, nil
+}
+
+func (claudeExec) Supervisor() (int, error) {
+	out, err := exec.Command("claude", "daemon", "status").Output()
+	if err != nil {
+		return 0, fmt.Errorf("claude daemon status: %w", err)
+	}
+	m := supervisorPID.FindSubmatch(out)
+	if m == nil {
+		return 0, fmt.Errorf("claude daemon status printed no pid: %s", strings.TrimSpace(string(out)))
+	}
+	return strconv.Atoi(string(m[1]))
 }
 
 func (claudeExec) Stop(id string) error {

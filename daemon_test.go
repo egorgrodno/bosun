@@ -19,12 +19,19 @@ import (
 )
 
 type fakeClaude struct {
-	mu      sync.Mutex
-	agents  []agent
-	starts  [][]string
-	dirs    []string
-	removed []string
-	fail    func(args []string) error
+	mu         sync.Mutex
+	agents     []agent
+	starts     [][]string
+	dirs       []string
+	removed    []string
+	fail       func(args []string) error
+	supervisor int
+}
+
+func (f *fakeClaude) Supervisor() (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.supervisor, nil
 }
 
 func (f *fakeClaude) Start(dir string, args []string) (string, error) {
@@ -407,6 +414,34 @@ func TestLoadRewritesSettings(t *testing.T) {
 	}
 	if target, err := os.Readlink(link); target != "/newer/bosun" {
 		t.Fatalf("the link points at %q: %v", target, err)
+	}
+}
+
+func TestForeignSupervisor(t *testing.T) {
+	d, fc := testDaemon(t)
+	cgroups := map[int]string{os.Getpid(): "0::/bosun.service", 7: "0::/bosun.service", 8: "0::/kitty-1.scope"}
+	orig := cgroupOf
+	cgroupOf = func(pid int) (string, error) { return cgroups[pid], nil }
+	t.Cleanup(func() { cgroupOf = orig })
+	master := func(pid, supervisor int) {
+		fc.mu.Lock()
+		fc.agents[0].PID, fc.supervisor = pid, supervisor
+		fc.mu.Unlock()
+		d.poll()
+	}
+
+	master(100, 7)
+	if n := len(mustCall(t, Request{Op: "status"}).Decisions); n != 0 {
+		t.Fatalf("%d decisions open for a master under the daemon's supervisor", n)
+	}
+	master(101, 8)
+	if dec := openDecision(t, 1); dec.Kind != "notice" || !strings.Contains(dec.Note, "kitty-1.scope") {
+		t.Fatalf("decision = %+v", dec)
+	}
+	// A master resumed under the same supervisor tells the user nothing new.
+	master(102, 8)
+	if n := len(mustCall(t, Request{Op: "status"}).Decisions); n != 1 {
+		t.Fatalf("%d decisions open", n)
 	}
 }
 

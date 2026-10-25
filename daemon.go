@@ -79,6 +79,9 @@ type daemon struct {
 	// lastPoll and stirred decide whether the next tick polls: stirred holds from a hook or a kill until the poll after it.
 	lastPoll time.Time
 	stirred  bool
+	// masterPID is the master's process when the daemon last checked the supervisor, and foreign the cgroup of a supervisor it last told the user of.
+	masterPID int
+	foreign   string
 }
 
 type watcher struct {
@@ -1277,6 +1280,13 @@ func (d *daemon) poll() {
 	for _, a := range agents {
 		byID[a.ID] = a
 	}
+	if d.refresh(byID) {
+		d.checkSupervisor()
+	}
+}
+
+// refresh updates each session from its listing, and reports whether the master runs in a new process, which a new supervisor may have started.
+func (d *daemon) refresh(byID map[string]agent) (masterMoved bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.lastPoll = time.Now()
@@ -1309,4 +1319,42 @@ func (d *daemon) poll() {
 		d.saveLocked()
 		d.broadcastSessionsLocked()
 	}
+	if m := d.nodes[masterNode]; m != nil {
+		if pid := byID[m.ID].PID; pid != 0 && pid != d.masterPID {
+			d.masterPID = pid
+			return true
+		}
+	}
+	return false
+}
+
+// cgroupOf returns the cgroup of process pid.
+var cgroupOf = func(pid int) (string, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	return strings.TrimSpace(string(data)), err
+}
+
+// checkSupervisor tells the user when Claude Code's supervisor runs outside the daemon's cgroup, as one a terminal started does.
+// Every session takes that supervisor's environment, and the daemon cannot change it.
+func (d *daemon) checkSupervisor() {
+	pid, err := d.claude.Supervisor()
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	theirs, err := cgroupOf(pid)
+	if err != nil {
+		return
+	}
+	ours, err := cgroupOf(os.Getpid())
+	if err != nil || theirs == ours {
+		return
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if theirs == d.foreign {
+		return
+	}
+	d.foreign = theirs
+	d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("Claude Code's supervisor runs outside the bosun daemon, in %s, so every session takes the environment of whatever started it, such as a terminal. `claude daemon stop --any` stops it and every background session, and restarting the daemon then starts a new master under a supervisor of its own.", theirs)})
 }
