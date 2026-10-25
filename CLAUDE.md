@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-bosun orchestrates Claude Code background sessions: one master and a tree of workers. [README.md](README.md) holds the scope. This file holds the design, of which the TUI, the panel and cleanup are not built yet. Its Claude Code behaviour and timings were measured against 2.1.310.
+bosun orchestrates Claude Code background sessions: one master and a tree of workers. [README.md](README.md) holds the scope. This file holds the design, of which the TUI and the panel are not built yet. Its Claude Code behaviour and timings were measured against 2.1.310.
 
 ## Shape
 
@@ -48,7 +48,7 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Worktrees.** `spawn` runs a child from its parent's worktree, so the child's branch `worktree-<node>` begins at the parent's `HEAD`. Every worktree sits directly in the repository's `.claude/worktrees/`, whatever its depth, so a node name must be unique within its repository. The master works in no repository.
 
-**Cleanup.** A parent merges a child's branch once the child is done. The daemon then removes the child with `claude rm`, since a session doing so would trip the reserved check on deleting a branch. `claude rm` refuses a worktree whose branch has unpushed commits, and a branch merged locally still has them, so the daemon passes `--discard-unpushed` with the `<commit>@<worktree-id>` that the refusing `claude rm` printed. `claude rm` also refuses the empty `.gitmodules` the daemon writes on `SessionStart`, so the daemon deletes it first. `claude stop` and `claude rm` take the short `id`, not the `-n` name.
+**Cleanup.** A child's parent, or the master, lands the child with `merge`. The daemon fast-forwards the branch the child began from, and then removes the child, its worktree and its branch with `claude rm`. For the master's children that branch is checked out in a repository the master's sandbox cannot write. A session deleting a branch would also trip the reserved check. `claude rm` refuses a worktree whose branch has unpushed commits, and a branch merged locally still has them, so the daemon passes `--discard-unpushed` with the `<commit>@<worktree-id>` that the refusing `claude rm` printed. That flag also discards uncommitted changes, so `merge` refuses a child whose worktree has any. `claude rm` also refuses the empty `.gitmodules` the daemon writes on `SessionStart`, so the daemon deletes it first. `claude stop` and `claude rm` take the short `id`, not the `-n` name.
 
 ## Decisions
 
@@ -80,6 +80,7 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 | MCP tool | Held by | Does |
 |---|---|---|
 | `spawn` | every session | starts a child session |
+| `merge` | every session | lands a finished worker's branch and removes the worker |
 | `ask` | workers | sends a question to the master and blocks until the answer |
 | `next_event` | master | blocks until a worker asks, needs a permission, ends a turn or exits, or a frontend sends `tell` |
 | `reply` | master | answers a question |
@@ -108,3 +109,4 @@ Each leads with the queue of decisions waiting on you, above the tree.
 ## Open questions
 
 - **Auto mode refusals.** It is untested whether an action the classifier refuses in a `--bg` session reaches `PermissionRequest`, or only `PermissionDenied` (#5).
+- **Turn ends below the master.** Only the master gets `turn_end`, so a worker cannot tell when its own child is ready to merge, and the master merges it instead.

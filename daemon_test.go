@@ -21,13 +21,15 @@ import (
 
 // fakeClaude lists a stopped session without a PID or Status, as `claude agents --json --all` does, until Remove.
 type fakeClaude struct {
-	mu         sync.Mutex
-	agents     []agent
-	starts     [][]string
-	dirs       []string
-	stops      []string
-	removed    []string
-	copies     []string
+	mu      sync.Mutex
+	agents  []agent
+	starts  [][]string
+	dirs    []string
+	stops   []string
+	removed []string
+	copies  []string
+	// discard holds the --discard-unpushed value that claude rm asks for, for a session whose branch has commits on no remote.
+	discard    map[string]string
 	fail       func(args []string) error
 	supervisor int
 	// linger keeps a stopped session's process alive for that many more looks at it, as Claude Code lists the session stopped before its process exits.
@@ -113,9 +115,12 @@ func (f *fakeClaude) lastStart() []string {
 	return f.starts[len(f.starts)-1]
 }
 
-func (f *fakeClaude) Remove(id string) error {
+func (f *fakeClaude) Remove(id, discard string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if want := f.discard[id]; want != "" && discard != want {
+		return fmt.Errorf("claude rm %s: exit status 1: kept %s\n  discard the worktree and its commits: claude rm %s --discard-unpushed %s", id, id, id, want)
+	}
 	f.removed = append(f.removed, id)
 	f.agents = slices.DeleteFunc(f.agents, func(a agent) bool { return a.ID == id })
 	return nil
@@ -1090,6 +1095,286 @@ func git(t *testing.T, dir string, args ...string) string {
 	return string(out)
 }
 
+// mergeable gives the master a child b, idle between its turns, in a repository whose checked-out branch main b's one commit fast-forwards.
+func mergeable(t *testing.T, d *daemon, fc *fakeClaude) (b *Session, repo, tip string) {
+	repo = t.TempDir()
+	git(t, repo, "init", "-q", "-b", "main")
+	git(t, repo, "commit", "-q", "--allow-empty", "-m", "init")
+	wt := filepath.Join(repo, ".claude", "worktrees", "b")
+	git(t, repo, "worktree", "add", "-q", "-b", "worktree-b", wt)
+	tip = commit(t, wt, "work")
+	b = &Session{Node: "b", Parent: masterNode, Repo: repo, Dir: wt, Base: repo, BaseBranch: "main", Depth: 1, ID: "bbbbbbbb", Status: "idle"}
+	if _, _, err := d.writeConfig(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := standInGitmodules(wt); err != nil {
+		t.Fatal(err)
+	}
+	d.mu.Lock()
+	d.nodes["b"] = b
+	d.mu.Unlock()
+	fc.add(agent{ID: "bbbbbbbb", Name: "b", Status: "idle"})
+	fc.mu.Lock()
+	fc.discard = map[string]string{"bbbbbbbb": tip + "@0123abcd"}
+	fc.mu.Unlock()
+	return b, repo, tip
+}
+
+// commit commits what dir holds, files are path and content pairs to write first, and returns the new HEAD.
+func commit(t *testing.T, dir, message string, files ...string) string {
+	t.Helper()
+	for i := 0; i+1 < len(files); i += 2 {
+		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, files[i])), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, files[i]), []byte(files[i+1]), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		git(t, dir, "-c", "core.hooksPath=/dev/null", "add", "-f", files[i])
+	}
+	git(t, dir, "-c", "core.hooksPath=/dev/null", "commit", "-q", "--allow-empty", "-m", message)
+	return strings.TrimSpace(git(t, dir, "rev-parse", "HEAD"))
+}
+
+// rmClaude removes a worktree and its branch on claude rm, and runs onStop on claude stop.
+type rmClaude struct {
+	*fakeClaude
+	repo, wt string
+	onStop   func()
+}
+
+func (r *rmClaude) Stop(id string) error {
+	if r.onStop != nil {
+		r.onStop()
+	}
+	return r.fakeClaude.Stop(id)
+}
+
+func (r *rmClaude) Remove(id, discard string) error {
+	if err := r.fakeClaude.Remove(id, discard); err != nil {
+		return err
+	}
+	exec.Command("git", "-C", r.repo, "worktree", "remove", "--force", r.wt).Run()
+	exec.Command("git", "-C", r.repo, "branch", "-D", "worktree-b").Run()
+	return nil
+}
+
+func TestMerge(t *testing.T) {
+	d, fc := testDaemon(t)
+	b, repo, tip := mergeable(t, d, fc)
+	if _, err := call(context.Background(), Request{Op: "merge", Node: "a", Name: "b"}); err == nil {
+		t.Fatal("a worker merged the master's child")
+	}
+
+	text := mustCall(t, Request{Op: "merge", Node: masterNode, Name: "b"}).Text
+	if head := strings.TrimSpace(git(t, repo, "rev-parse", "main")); head != tip {
+		t.Fatalf("main is at %s, want b's %s: %s", head, tip, text)
+	}
+	fc.mu.Lock()
+	stops, removed := slices.Clone(fc.stops), slices.Clone(fc.removed)
+	fc.mu.Unlock()
+	if !slices.Equal(stops, []string{"bbbbbbbb"}) || !slices.Equal(removed, []string{"bbbbbbbb"}) {
+		t.Fatalf("stopped %v and removed %v, want b", stops, removed)
+	}
+	if _, err := os.Stat(filepath.Join(b.Dir, ".gitmodules")); err == nil {
+		t.Fatal("the stand-in is left for claude rm to refuse")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.nodes["b"] != nil {
+		t.Fatal("the daemon still holds b")
+	}
+}
+
+// The worker stops before its worktree is judged, so a write its last moments make is refused, not discarded with the worktree.
+func TestMergeStopsFirst(t *testing.T) {
+	d, fc := testDaemon(t)
+	b, repo, _ := mergeable(t, d, fc)
+	late := filepath.Join(b.Dir, "late")
+	d.claude = &rmClaude{fakeClaude: fc, repo: repo, wt: b.Dir, onStop: func() { os.WriteFile(late, []byte("work"), 0o644) }}
+	if _, err := call(context.Background(), Request{Op: "merge", Node: masterNode, Name: "b"}); err == nil {
+		t.Fatal("merged a worktree with uncommitted work")
+	}
+	if _, err := os.Stat(late); err != nil {
+		t.Fatalf("the late write is gone: %v", err)
+	}
+}
+
+// The master may start a worker from a linked worktree, whose branch the worker began from.
+func TestMergeIntoBaseBranch(t *testing.T) {
+	d, fc := testDaemon(t)
+	repo := t.TempDir()
+	git(t, repo, "init", "-q", "-b", "main")
+	git(t, repo, "commit", "-q", "--allow-empty", "-m", "init")
+	linked := filepath.Join(t.TempDir(), "feat")
+	git(t, repo, "worktree", "add", "-q", "-b", "feature", linked)
+	commit(t, linked, "feature work")
+	wt := filepath.Join(repo, ".claude", "worktrees", "b")
+	git(t, linked, "worktree", "add", "-q", "-b", "worktree-b", wt, "HEAD")
+	tip := commit(t, wt, "b's work")
+	b := &Session{Node: "b", Parent: masterNode, Repo: repo, Dir: wt, Base: linked, BaseBranch: "feature", Depth: 1, ID: "bbbbbbbb", Status: "idle"}
+	d.mu.Lock()
+	d.nodes["b"] = b
+	d.mu.Unlock()
+	fc.add(agent{ID: "bbbbbbbb", Name: "b", Status: "idle"})
+	mustCall(t, Request{Op: "merge", Node: masterNode, Name: "b"})
+	if head := strings.TrimSpace(git(t, repo, "rev-parse", "feature")); head != tip {
+		t.Fatalf("feature is at %s, want b's %s", head, tip)
+	}
+	if strings.Contains(git(t, repo, "log", "--oneline", "main"), "work") {
+		t.Fatal("main moved")
+	}
+}
+
+// A worker's commits must not reach the daemon's process, as a hook or through a repository its worktree names.
+func TestMergeRunsNoWorkerCode(t *testing.T) {
+	t.Run("hook", func(t *testing.T) {
+		d, fc := testDaemon(t)
+		b, repo, _ := mergeable(t, d, fc)
+		git(t, repo, "config", "core.hooksPath", ".githooks")
+		marker := filepath.Join(t.TempDir(), "ran")
+		tip := commit(t, b.Dir, "hook", ".githooks/post-merge", "#!/bin/sh\ntouch "+marker+"\n")
+		fc.mu.Lock()
+		fc.discard["bbbbbbbb"] = tip + "@0123abcd"
+		fc.mu.Unlock()
+		mustCall(t, Request{Op: "merge", Node: masterNode, Name: "b"})
+		if _, err := os.Stat(marker); err == nil {
+			t.Fatal("the daemon ran the worker's post-merge hook")
+		}
+	})
+	t.Run("fsmonitor", func(t *testing.T) {
+		d, fc := testDaemon(t)
+		b, _, _ := mergeable(t, d, fc)
+		marker := filepath.Join(t.TempDir(), "ran")
+		planted := filepath.Join(b.Dir, "x")
+		git(t, b.Dir, "init", "-q", planted)
+		script := filepath.Join(b.Dir, "mon.sh")
+		os.WriteFile(script, []byte("#!/bin/sh\ntouch "+marker+"\nexit 1\n"), 0o755)
+		git(t, planted, "config", "core.fsmonitor", script)
+		os.WriteFile(filepath.Join(b.Dir, ".git"), []byte("gitdir: "+filepath.Join(planted, ".git")+"\n"), 0o644)
+		if _, err := call(context.Background(), Request{Op: "merge", Node: masterNode, Name: "b"}); err == nil {
+			t.Fatal("merged a worktree of another repository")
+		}
+		if _, err := os.Stat(marker); err == nil {
+			t.Fatal("the daemon ran the worker's fsmonitor")
+		}
+	})
+}
+
+func TestMergeKeepsIgnoredFiles(t *testing.T) {
+	d, fc := testDaemon(t)
+	b, repo, _ := mergeable(t, d, fc)
+	os.WriteFile(filepath.Join(repo, ".git", "info", "exclude"), []byte(".envrc\n"), 0o644)
+	os.WriteFile(filepath.Join(repo, ".envrc"), []byte("mine"), 0o644)
+	commit(t, b.Dir, "envrc", ".envrc", "theirs")
+	if _, err := call(context.Background(), Request{Op: "merge", Node: masterNode, Name: "b"}); err == nil {
+		t.Fatal("merged over the user's ignored file")
+	}
+	if data, _ := os.ReadFile(filepath.Join(repo, ".envrc")); string(data) != "mine" {
+		t.Fatalf("the user's .envrc holds %q", data)
+	}
+}
+
+// The Stop hook reports a turn's end before Claude Code lists the session idle.
+func TestMergeRightAfterTurnEnd(t *testing.T) {
+	d, fc := testDaemon(t)
+	b, _, _ := mergeable(t, d, fc)
+	d.mu.Lock()
+	b.Status = "busy"
+	d.mu.Unlock()
+	mustCall(t, Request{Op: "merge", Node: masterNode, Name: "b"})
+}
+
+func TestMergeGrandchildren(t *testing.T) {
+	d, fc := testDaemon(t)
+	b, _, _ := mergeable(t, d, fc)
+	d.mu.Lock()
+	d.nodes["c"] = &Session{Node: "c", Parent: "b", Base: b.Dir, BaseBranch: "worktree-b", Status: "stopped", ID: "cccccccc", Killed: true}
+	d.mu.Unlock()
+	_, err := call(context.Background(), Request{Op: "merge", Node: masterNode, Name: "b"})
+	if err == nil || !strings.Contains(err.Error(), "claude rm cccccccc") {
+		t.Fatalf("merging b over a child the user stopped: %v", err)
+	}
+	// Once the user removes c, b merges, and c goes with it.
+	d.mu.Lock()
+	d.nodes["c"].Status = "exited"
+	d.mu.Unlock()
+	mustCall(t, Request{Op: "merge", Node: masterNode, Name: "b"})
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.nodes["c"] != nil {
+		t.Fatal("the daemon still holds c")
+	}
+}
+
+// A worker whose session is gone, as one the user removed is, holds up nothing once its work is safe.
+func TestMergeGone(t *testing.T) {
+	d, fc := testDaemon(t)
+	b, repo, _ := mergeable(t, d, fc)
+	d.mu.Lock()
+	b.Status = "exited"
+	d.mu.Unlock()
+	if _, err := call(context.Background(), Request{Op: "merge", Node: masterNode, Name: "b"}); err == nil {
+		t.Fatal("forgot a worker whose branch holds unmerged commits")
+	}
+	git(t, repo, "merge", "-q", "--ff-only", "worktree-b")
+	mustCall(t, Request{Op: "merge", Node: masterNode, Name: "b"})
+	fc.mu.Lock()
+	removed := len(fc.removed)
+	fc.mu.Unlock()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.nodes["b"] != nil || removed != 0 {
+		t.Fatalf("b = %+v, %d claude rm runs", d.nodes["b"], removed)
+	}
+}
+
+func TestMergeRefuses(t *testing.T) {
+	for name, spoil := range map[string]func(t *testing.T, d *daemon, b *Session, repo string){
+		"behind": func(t *testing.T, d *daemon, b *Session, repo string) {
+			commit(t, repo, "elsewhere")
+		},
+		"dirty": func(t *testing.T, d *daemon, b *Session, repo string) {
+			if err := os.WriteFile(filepath.Join(b.Dir, "notes"), nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+		},
+		"switched": func(t *testing.T, d *daemon, b *Session, repo string) {
+			git(t, repo, "switch", "-q", "-c", "other")
+		},
+		"in its turn": func(t *testing.T, d *daemon, b *Session, repo string) {
+			idleWait = 0
+			t.Cleanup(func() { idleWait = 30 * time.Second })
+			d.claude.(*fakeClaude).setStatus("bbbbbbbb", "busy")
+		},
+		"with a child": func(t *testing.T, d *daemon, b *Session, repo string) {
+			d.mu.Lock()
+			d.nodes["c"] = &Session{Node: "c", Parent: "b", Status: "idle", ID: "cccccccc"}
+			d.mu.Unlock()
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			d, fc := testDaemon(t)
+			b, repo, tip := mergeable(t, d, fc)
+			spoil(t, d, b, repo)
+			if _, err := call(context.Background(), Request{Op: "merge", Node: masterNode, Name: "b"}); err == nil {
+				t.Fatal("merged")
+			}
+			if head := strings.TrimSpace(git(t, repo, "rev-parse", "main")); head == tip {
+				t.Fatal("main moved to b's branch")
+			}
+			fc.mu.Lock()
+			removed := len(fc.removed)
+			fc.mu.Unlock()
+			d.mu.Lock()
+			defer d.mu.Unlock()
+			if removed != 0 || d.nodes["b"] == nil || d.nodes["b"].held {
+				t.Fatalf("removed %d, b = %+v", removed, d.nodes["b"])
+			}
+		})
+	}
+}
+
 func TestSessionStartStandsInGitmodules(t *testing.T) {
 	d, _ := testDaemon(t)
 	repo := t.TempDir()
@@ -1166,7 +1451,7 @@ func TestMCPAskSendsProgress(t *testing.T) {
 	for _, tl := range read()["result"].(map[string]any)["tools"].([]any) {
 		names = append(names, tl.(map[string]any)["name"].(string))
 	}
-	if !slices.Equal(names, []string{"spawn", "ask"}) {
+	if !slices.Equal(names, []string{"spawn", "ask", "merge"}) {
 		t.Fatalf("a worker lists %v", names)
 	}
 

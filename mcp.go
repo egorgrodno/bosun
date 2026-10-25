@@ -40,7 +40,7 @@ The events:
 - tell: a message from the user. Act on it, usually by starting workers with spawn.
 - decision of kind question: a worker asks something. Settle it with reply or escalate.
 - decision of kind permission: a worker wants to run a tool. Settle it with decide or escalate.
-- turn_end: a worker finished a turn, and its last message says what it did. To give it more to do, such as a fix after review, call resume.
+- turn_end: a worker finished a turn, and its last message says what it did. To give it more to do, such as a fix after review, call resume. Once its work is right, call merge.
 - exit: a worker's session stopped. Either it stopped in the middle of a turn, so no turn_end follows, and resume carries it on, or the user stopped it, as the event's text says, and resume refuses it.
 
 bosun sends a git push, deleting a branch, a file write outside a session's own folders and a command outside the sandbox straight to the user, so none of them reaches you, and no answer of yours allows one.`
@@ -56,6 +56,9 @@ func tools(master bool) []tool {
 			})},
 			{"ask", "Ask the master a question and wait for the answer. Use it for any decision you would otherwise put to the user. The master may pass it on to the user, so the wait can be long.", object([]string{"question"}, map[string]any{
 				"question": str("The question, with what the answer depends on."),
+			})},
+			{"merge", "Merge a child's branch into yours once its work is right, then remove the child with its worktree and branch. It only fast-forwards, so a child whose branch has fallen behind yours must rebase onto it first.", object([]string{"name"}, map[string]any{
+				"name": str("The child's node name."),
 			})},
 		}
 	}
@@ -75,6 +78,9 @@ func tools(master bool) []tool {
 			"id":      str("The decision's id."),
 			"allow":   map[string]any{"type": "boolean", "description": "true to allow the tool call, false to deny it."},
 			"message": str("When denying, why. It reaches the worker verbatim, so tell it what to do instead."),
+		})},
+		{"merge", "Merge a worker's branch into the branch it began from once you have reviewed it, then remove the worker with its worktree and branch. It only fast-forwards: when the worker's branch has fallen behind, resume the worker to rebase onto it first. When the merge needs the user, as when they switched the checkout to another branch, tell them with notify. Merge with this tool, never with git: your sandbox cannot write to a repository, so git would wait on the user.", object([]string{"name"}, map[string]any{
+			"name": str("The worker's node name."),
 		})},
 		{"resume", "Give a worker that ended its turn, or stopped in the middle of one, a new prompt, such as a fix after review. It carries on in the same conversation and worktree, and its next turn_end comes as an event.", object([]string{"name", "prompt"}, map[string]any{
 			"name":   str("The worker's node name."),
@@ -270,6 +276,8 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		req.Name, req.Repo, req.Model, req.Text = args.Name, args.Repo, args.Model, args.Prompt
 	case "resume":
 		req.Name, req.Text = args.Name, args.Prompt
+	case "merge":
+		req.Name = args.Name
 	case "ask":
 		req.Text = args.Question
 	case "reply":
@@ -291,7 +299,7 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	switch name {
 	case "spawn":
 		return fmt.Sprintf("Started %s, session %s, in %s.", resp.Session.Node, resp.Session.ID, resp.Session.Dir), nil
-	case "ask":
+	case "ask", "merge":
 		return resp.Text, nil
 	case "next_event":
 		if len(resp.Events) == 0 {

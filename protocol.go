@@ -69,6 +69,7 @@ type answer struct {
 
 // Session is a node of the tree. Status and State come from `claude agents --json --all`, with Status "stopped" while it lists the session without a process, and "exited" once it lists the session no more.
 // An empty Model is the user's default. Killed marks a worker the user stopped, which the master may not resume.
+// A worker's branch began at the HEAD of BaseBranch, checked out in Base, which merge fast-forwards.
 type Session struct {
 	Node      string `json:"node"`
 	Parent    string `json:"parent,omitempty"`
@@ -82,7 +83,12 @@ type Session struct {
 	State     string `json:"state,omitempty"`
 	Killed    bool   `json:"killed,omitempty"`
 
+	Base       string `json:"base,omitempty"`
+	BaseBranch string `json:"baseBranch,omitempty"`
+
 	pre map[string]preCall
+	// held keeps poll, resume, merge and kill off the session while one of them stops or resumes it.
+	held bool
 }
 
 func socketPath() string {

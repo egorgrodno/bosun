@@ -398,6 +398,8 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 		err = d.resume(ctx, r.Node, r.Name, r.Text)
 	case "kill":
 		err = d.kill(r.Name)
+	case "merge":
+		resp.Text, err = d.merge(ctx, r.Node, r.Name)
 	case "model":
 		err = d.switchModel(r.Model)
 	case "status":
@@ -883,10 +885,13 @@ func (d *daemon) spawn(caller, name, repo, model, prompt string) (*Session, erro
 		return nil, fmt.Errorf("%s already exists", worktree)
 	}
 
+	// An empty branch, for a detached HEAD, leaves the worker nothing to merge into.
+	branch, _ := gitOut(dir, "symbolic-ref", "--short", "-q", "HEAD")
+
 	d.mu.Lock()
 	err := d.admitLocked(caller, name)
 	if err == nil {
-		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Model: cmp.Or(model, d.workerModel), Depth: d.nodes[caller].Depth + 1, Status: "starting"}
+		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Base: dir, BaseBranch: branch, Model: cmp.Or(model, d.workerModel), Depth: d.nodes[caller].Depth + 1, Status: "starting"}
 		d.started[name] = time.Now()
 	}
 	n := d.nodes[name]
@@ -1072,19 +1077,19 @@ func (d *daemon) kill(name string) error {
 	d.mu.Lock()
 	n := d.nodes[name]
 	var id string
-	var killed bool
+	var killed, held bool
 	if n != nil {
-		id, killed = n.ID, n.Killed
+		id, killed, held = n.ID, n.Killed, n.held
 		// Marked first, so that a poll that sees the worker stopped tells the master nothing of its own.
-		n.Killed = killed || (id != "" && name != masterNode)
+		n.Killed = killed || (id != "" && !held && name != masterNode)
 	}
 	d.stirred = true
 	d.mu.Unlock()
 	switch {
 	case n == nil:
 		return fmt.Errorf("unknown node %q", name)
-	case id == "":
-		return fmt.Errorf("%s is still starting", name)
+	case id == "" || held:
+		return fmt.Errorf("%s is %w", name, errStarting)
 	}
 	err := d.claude.Stop(id)
 	d.mu.Lock()
@@ -1098,6 +1103,208 @@ func (d *daemon) kill(name string) error {
 		d.broadcastSessionsLocked()
 	}
 	return err
+}
+
+// merge fast-forwards the branch that worker name began from to the worker's branch, then removes the worker: its session, worktree and branch.
+// Its parent or the master may merge it, since the master hears every worker's turn end.
+func (d *daemon) merge(ctx context.Context, caller, name string) (string, error) {
+	d.mu.Lock()
+	n := d.nodes[name]
+	var id string
+	err := d.mergeableLocked(caller, name)
+	if err == nil {
+		id = n.ID
+	}
+	d.mu.Unlock()
+	if errors.Is(err, errGone) {
+		return d.dropGone(n)
+	}
+	if err != nil {
+		return "", err
+	}
+	a, err := d.awaitIdle(ctx, name, id)
+	if err != nil {
+		return "", err
+	}
+	if err := d.hold(n, id); err != nil {
+		return "", err
+	}
+	defer d.release(n)
+	// A session between turns may begin one, as it does when the user types into it, so it stops before its worktree is judged.
+	if a.Status != "" {
+		if err := d.claude.Stop(id); err != nil {
+			return "", err
+		}
+		if err := d.awaitExit(ctx, name, a.PID); err != nil {
+			return "", err
+		}
+	}
+	d.mu.Lock()
+	err = d.childrenLocked(name)
+	d.mu.Unlock()
+	if err != nil {
+		return "", err
+	}
+	text, err := d.land(n, id)
+	if err != nil {
+		return "", err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.dropLocked(name)
+	d.saveLocked()
+	d.broadcastSessionsLocked()
+	log.Printf("merged and removed %s", name)
+	return text, nil
+}
+
+// errGone marks a worker whose session Claude Code no longer lists.
+var errGone = errors.New("gone")
+
+func (d *daemon) mergeableLocked(caller, name string) error {
+	n := d.nodes[name]
+	switch {
+	case n == nil || name == masterNode:
+		return fmt.Errorf("no worker %q", name)
+	case caller != n.Parent && caller != masterNode:
+		return fmt.Errorf("%s is %s's child, not yours", name, n.Parent)
+	case n.Killed:
+		return fmt.Errorf("the user stopped %s, so only the user can merge or remove it", name)
+	case n.Base == "":
+		return fmt.Errorf("bosun recorded no checkout that %s began from", name)
+	case n.Status == "exited":
+		return errGone
+	case n.ID == "" || n.Status == "starting" || n.held:
+		return fmt.Errorf("%s is %w", name, errStarting)
+	case n.BaseBranch == "":
+		return fmt.Errorf("%s began from a detached HEAD in %s, so it has no branch to merge into", name, n.Base)
+	}
+	return d.childrenLocked(name)
+}
+
+// childrenLocked refuses to merge name while a child of name's lives on, whose worktree began from name's.
+func (d *daemon) childrenLocked(name string) error {
+	for _, c := range d.nodes {
+		switch {
+		case c.Parent != name || c.Status == "exited":
+		case c.Killed:
+			return fmt.Errorf("%s has a child the user stopped, %s, which only the user can remove, with `claude rm %s`", name, c.Node, c.ID)
+		default:
+			return fmt.Errorf("%s still has a child, %s, which must merge into it first", name, c.Node)
+		}
+	}
+	return nil
+}
+
+// dropLocked forgets node name and its children, whose sessions are gone.
+func (d *daemon) dropLocked(name string) {
+	for _, c := range d.nodes {
+		if c.Parent == name {
+			d.dropLocked(c.Node)
+		}
+	}
+	delete(d.nodes, name)
+	delete(d.started, name)
+	if err := os.RemoveAll(filepath.Join(d.stateDir, "nodes", name)); err != nil {
+		log.Printf("%s: %v", name, err)
+	}
+}
+
+// dropGone forgets worker n, whose session Claude Code no longer lists, unless its branch holds commits that its base branch lacks.
+func (d *daemon) dropGone(n *Session) (string, error) {
+	branch := "worktree-" + n.Node
+	if tip, err := gitOut(n.Base, "rev-parse", "--verify", "-q", branch+"^{commit}"); err == nil {
+		if _, err := gitOut(n.Base, "merge-base", "--is-ancestor", tip, n.BaseBranch); err != nil {
+			return "", fmt.Errorf("%s's session is gone, but %s holds commits that %s lacks, so the user must merge or delete it", n.Node, branch, n.BaseBranch)
+		}
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err := d.childrenLocked(n.Node); err != nil {
+		return "", err
+	}
+	d.dropLocked(n.Node)
+	d.saveLocked()
+	d.broadcastSessionsLocked()
+	return fmt.Sprintf("%s's session was already removed, so bosun forgot it.", n.Node), nil
+}
+
+// land fast-forwards n's base branch to n's branch, whose session id has stopped, and then removes the session, its worktree and its branch.
+func (d *daemon) land(n *Session, id string) (string, error) {
+	branch := "worktree-" + n.Node
+	common, err := gitOut(n.Base, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	if err != nil {
+		return "", err
+	}
+	// A session can point its worktree's .git file at a repository of its own, whose config git would act on.
+	if theirs, err := gitOut(n.Dir, "rev-parse", "--path-format=absolute", "--git-common-dir"); err != nil || theirs != common {
+		return "", fmt.Errorf("%s's worktree %s is not one of %s's repository, so bosun leaves it to the user: %v", n.Node, n.Dir, n.Base, err)
+	}
+	if head, err := gitOut(n.Dir, "symbolic-ref", "--short", "HEAD"); err != nil || head != branch {
+		return "", fmt.Errorf("%s's worktree has %q checked out rather than %s, so bosun leaves it to the user", n.Node, head, branch)
+	}
+	tip, err := gitOut(n.Dir, "rev-parse", "HEAD")
+	if err != nil {
+		return "", err
+	}
+	dropStandIn(n.Dir)
+	dirty, err := gitOut(n.Dir, "status", "--porcelain")
+	if err != nil {
+		return "", err
+	}
+	if dirty != "" {
+		return "", fmt.Errorf("%s has uncommitted changes, which it must commit or drop before it merges:\n%s", n.Node, dirty)
+	}
+	if cur, err := gitOut(n.Base, "symbolic-ref", "--short", "HEAD"); err != nil || cur != n.BaseBranch {
+		return "", fmt.Errorf("%s began from %s in %s, which now has %q checked out, so the user must switch it back before %s merges", n.Node, n.BaseBranch, n.Base, cur, n.Node)
+	}
+	var exit *exec.ExitError
+	if _, err := gitOut(n.Base, "merge-base", "--is-ancestor", "HEAD", tip); errors.As(err, &exit) && exit.ExitCode() == 1 {
+		return "", fmt.Errorf("%s has fallen behind %s, so it must rebase onto %s before it merges", branch, n.BaseBranch, n.BaseBranch)
+	}
+	// Git would otherwise overwrite the user's ignored files, or stash the user's changes and leave conflicts in them.
+	if _, err := gitOut(n.Base, "-c", "merge.autostash=false", "merge", "--ff-only", "--no-overwrite-ignore", tip); err != nil {
+		return "", fmt.Errorf("the checkout %s refuses the merge, which only the user can clear: %w", n.Base, err)
+	}
+	if err := d.remove(id, tip); err != nil {
+		return "", fmt.Errorf("merged %s into %s, but removing %s failed: %w", branch, n.BaseBranch, n.Node, err)
+	}
+	return fmt.Sprintf("Merged %s into %s in %s, up to %.12s, and removed %s with its worktree and branch.", branch, n.BaseBranch, n.Base, tip, n.Node), nil
+}
+
+// dropStandIn deletes the empty .gitmodules that standInGitmodules wrote, which claude rm would refuse as an untracked file.
+func dropStandIn(dir string) {
+	path := filepath.Join(dir, ".gitmodules")
+	if fi, err := os.Stat(path); err != nil || fi.Size() != 0 {
+		return
+	}
+	if _, err := gitOut(dir, "ls-files", "--error-unmatch", ".gitmodules"); err != nil {
+		_ = os.Remove(path)
+	}
+}
+
+// remove runs claude rm on the stopped session id, whose worktree holds no commit past tip.
+func (d *daemon) remove(id, tip string) error {
+	err := d.claude.Remove(id, "")
+	if err == nil {
+		return nil
+	}
+	// A branch merged only locally still has commits on no remote, which claude rm discards only when told which.
+	m := discardHint.FindStringSubmatch(err.Error())
+	if m == nil || m[1] != tip {
+		return err
+	}
+	return d.claude.Remove(id, m[1]+"@"+m[2])
+}
+
+// gitOut runs git in dir with hooks and fsmonitor off, since a worker's commits or worktree could otherwise make the daemon run its code.
+func gitOut(dir string, args ...string) (string, error) {
+	out, err := exec.Command("git", append([]string{"-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-C", dir}, args...)...).CombinedOutput()
+	text := strings.TrimSpace(string(out))
+	if err != nil {
+		return text, fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, text)
+	}
+	return text, nil
 }
 
 // resume gives a worker that ended its turn a new prompt.
@@ -1119,15 +1326,15 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	d.mu.Lock()
 	n := d.nodes[name]
 	var id, dir, status string
-	var killed bool
+	var killed, held bool
 	if n != nil {
-		id, dir, status, killed = n.ID, n.Dir, n.Status, n.Killed
+		id, dir, status, killed, held = n.ID, n.Dir, n.Status, n.Killed, n.held
 	}
 	d.mu.Unlock()
 	switch {
 	case n == nil:
 		return fmt.Errorf("no node %q", name)
-	case id == "" || status == "starting":
+	case id == "" || status == "starting" || held:
 		// The listing may still show a session it just started as stopped, and a second resume would start a copy.
 		return fmt.Errorf("%s is %w", name, errStarting)
 	case status == "exited":
@@ -1141,18 +1348,10 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	}
 
 	// Claude Code resumes a running session into a copy under a new id, so a running session stops first.
-	// Meanwhile the empty ID keeps poll from reporting it stopped, and refuses a second resume.
-	d.mu.Lock()
-	switch {
-	case n.ID != id:
-		d.mu.Unlock()
-		return fmt.Errorf("%s is %w", name, errStarting)
-	case n.Killed:
-		d.mu.Unlock()
-		return fmt.Errorf("the user stopped %s", name)
+	if err := d.hold(n, id); err != nil {
+		return err
 	}
-	n.ID = ""
-	d.mu.Unlock()
+	defer d.release(n)
 	if a.Status != "" {
 		err = d.claude.Stop(id)
 		if err == nil {
@@ -1164,7 +1363,6 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	n.ID = id
 	if err != nil {
 		return err
 	}
@@ -1174,6 +1372,26 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	d.broadcastSessionsLocked()
 	log.Printf("resumed %s (%s)", name, id)
 	return nil
+}
+
+// hold claims n, still session id, for resume or merge, as long as the user did not stop it.
+func (d *daemon) hold(n *Session, id string) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	switch {
+	case n.ID != id || n.held:
+		return fmt.Errorf("%s is %w", n.Node, errStarting)
+	case n.Killed:
+		return fmt.Errorf("the user stopped %s", n.Node)
+	}
+	n.held = true
+	return nil
+}
+
+func (d *daemon) release(n *Session) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n.held = false
 }
 
 // resumeStopped continues the stopped session id, whose Claude Code session id is sid, with prompt.
@@ -1326,7 +1544,7 @@ func (d *daemon) switchModel(model string) error {
 	d.broadcastSessionsLocked()
 	d.mu.Unlock()
 	log.Printf("switched the master to %s (%s)", model, id)
-	if err := d.claude.Remove(old); err != nil {
+	if err := d.claude.Remove(old, ""); err != nil {
 		log.Print(err)
 	}
 	return nil
@@ -1378,7 +1596,7 @@ func (d *daemon) pollDue(now time.Time) bool {
 		return true
 	}
 	for _, n := range d.nodes {
-		if n.ID == "" || !betweenTurns(n.Status) {
+		if n.ID == "" || n.held || !betweenTurns(n.Status) {
 			return true
 		}
 	}
@@ -1420,7 +1638,7 @@ func (d *daemon) refresh(byID map[string]agent) (masterMoved bool) {
 	d.lastPoll = time.Now()
 	changed := false
 	for _, n := range d.nodes {
-		if n.ID == "" {
+		if n.ID == "" || n.held {
 			continue
 		}
 		status, state := "exited", ""
