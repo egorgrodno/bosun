@@ -54,6 +54,7 @@ func testDaemon(t *testing.T) (*daemon, *fakeClaude) {
 	dir := t.TempDir()
 	sock := filepath.Join(dir, "sock")
 	t.Setenv("BOSUN_SOCKET", sock)
+	t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(dir, "claude"))
 	fc := &fakeClaude{}
 	d := newDaemon("/bin/bosun", sock, filepath.Join(dir, "state"), filepath.Join(dir, "master"), fc)
 	ln, err := listen(sock)
@@ -213,6 +214,40 @@ func TestReservedSkipsMaster(t *testing.T) {
 	}
 }
 
+func TestReservedSparesClaudeCodeDirs(t *testing.T) {
+	testDaemon(t)
+	claude := os.Getenv("CLAUDE_CONFIG_DIR")
+	for _, p := range []string{
+		filepath.Join(claude, "projects", "-repo", "memory", "feedback.md"),
+		filepath.Join(claude, "jobs", "aaaaaaaa", "tmp", "query.sql"),
+	} {
+		write := map[string]any{"file_path": p, "content": "x"}
+		if out := receive(t, runHookAsync("a", hookEvent("PreToolUse", "t1", "Write", write))); out != "null" {
+			t.Fatalf("PreToolUse of a write to %s printed %s", p, out)
+		}
+	}
+	state := map[string]any{"file_path": filepath.Join(claude, "jobs", "aaaaaaaa", "state.json"), "content": "x"}
+	hook := runHookAsync("a", hookEvent("PreToolUse", "t2", "Write", state))
+	dec := openDecision(t, 1)
+	if dec.Reserved != "a write outside the worktree" {
+		t.Fatalf("decision = %+v", dec)
+	}
+	mustCall(t, Request{Op: "deny", ID: dec.ID})
+	receive(t, hook)
+}
+
+func TestMemoryDir(t *testing.T) {
+	t.Setenv("CLAUDE_CONFIG_DIR", "/c")
+	worker := Session{Repo: "/home/u/Projects/app", Dir: "/home/u/Projects/app/.claude/worktrees/a"}
+	if got, want := worker.memoryDir(), "/c/projects/-home-u-Projects-app/memory"; got != want {
+		t.Errorf("worker: %s, want %s", got, want)
+	}
+	master := Session{Dir: "/home/u/.local/state/bosun/master"}
+	if got, want := master.memoryDir(), "/c/projects/-home-u--local-state-bosun-master/memory"; got != want {
+		t.Errorf("master: %s, want %s", got, want)
+	}
+}
+
 func TestReservedDeniedWithoutDaemon(t *testing.T) {
 	t.Setenv("BOSUN_SOCKET", filepath.Join(t.TempDir(), "missing"))
 	out := receive(t, runHookAsync("a", hookEvent("PreToolUse", "t1", "Bash", bashTest)))
@@ -285,6 +320,7 @@ func TestSpawn(t *testing.T) {
 	}
 	var settings struct {
 		Worktree    map[string]string      `json:"worktree"`
+		Memory      string                 `json:"autoMemoryDirectory"`
 		Permissions map[string][]string    `json:"permissions"`
 		Hooks       map[string][]hookGroup `json:"hooks"`
 		Sandbox     struct {
@@ -297,6 +333,9 @@ func TestSpawn(t *testing.T) {
 	}
 	if settings.Worktree["baseRef"] != "head" || !slices.Contains(settings.Permissions["deny"], "AskUserQuestion") {
 		t.Fatalf("settings = %s", data)
+	}
+	if want := (&Session{Repo: repo}).memoryDir(); settings.Memory != want {
+		t.Fatalf("autoMemoryDirectory = %q, want %q", settings.Memory, want)
 	}
 	if !settings.Sandbox.Enabled || !slices.Contains(settings.Sandbox.Filesystem["denyRead"], d.socket) {
 		t.Fatalf("sandbox = %+v, want it on with the socket hidden", settings.Sandbox)
@@ -353,7 +392,10 @@ func TestSessionStartStandsInGitmodules(t *testing.T) {
 		_ = os.MkdirAll(filepath.Dir(filepath.Join(wt, p)), 0o755)
 		_ = os.WriteFile(filepath.Join(wt, p), nil, 0o644)
 	}
-	settingsPath, _, err := d.writeConfig("a")
+	d.mu.Lock()
+	a := d.nodes["a"]
+	d.mu.Unlock()
+	settingsPath, _, err := d.writeConfig(a)
 	if err != nil {
 		t.Fatal(err)
 	}

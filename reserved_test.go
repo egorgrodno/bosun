@@ -43,7 +43,11 @@ func TestReservedCommand(t *testing.T) {
 }
 
 func TestReservedWrite(t *testing.T) {
-	const wt = "/repo/.claude/worktrees/a"
+	const (
+		wt     = "/repo/.claude/worktrees/a"
+		memory = "/home/u/.claude/projects/-repo/memory"
+		job    = "/home/u/.claude/jobs/aaaaaaaa"
+	)
 	for _, tc := range []struct {
 		tool, path string
 		reserved   bool
@@ -56,9 +60,16 @@ func TestReservedWrite(t *testing.T) {
 		{"MultiEdit", "/etc/passwd", true},
 		{"Write", "/repo/.claude/worktrees/ab/x", true},
 		{"Read", "/etc/passwd", false},
+		{"Write", memory + "/feedback.md", false},
+		{"Edit", memory + "/MEMORY.md", false},
+		{"Write", job + "/tmp/query.sql", false},
+		{"Write", job + "/state.json", true},
+		{"Write", "/home/u/.claude/projects/-other/memory/x.md", true},
+		{"Write", "/home/u/.claude/settings.json", true},
+		{"Write", "../tmp/x", true},
 	} {
 		input, _ := json.Marshal(map[string]string{"file_path": tc.path})
-		if got := reservedAction(tc.tool, input, wt) != ""; got != tc.reserved {
+		if got := reservedAction(tc.tool, input, wt, memory, job+"/tmp") != ""; got != tc.reserved {
 			t.Errorf("%s %s: reserved = %v, want %v", tc.tool, tc.path, got, tc.reserved)
 		}
 	}

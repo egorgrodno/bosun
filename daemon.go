@@ -102,6 +102,14 @@ func stateDir() string {
 	return filepath.Join(home, ".local", "state", "bosun")
 }
 
+func claudeDir() string {
+	if d := os.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
+		return d
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude")
+}
+
 func runDaemon(args []string) error {
 	flags := flag.NewFlagSet("daemon", flag.ExitOnError)
 	masterDir := flags.String("master-dir", filepath.Join(stateDir(), "master"), "directory the master runs in, which Claude Code must trust")
@@ -197,6 +205,23 @@ func (s *Session) public() Session {
 	c := *s
 	c.pre = nil
 	return c
+}
+
+var notAlnum = regexp.MustCompile(`[^a-zA-Z0-9]`)
+
+// memoryDir is the auto memory directory Claude Code picks for the session's repository, or for its directory outside one, which the user's own sessions there share.
+// Claude Code adds a hash to a name over 200 characters and this does not, so such a repository's sessions keep memory apart from the user's.
+func (s *Session) memoryDir() string {
+	return filepath.Join(claudeDir(), "projects", notAlnum.ReplaceAllString(cmp.Or(s.Repo, s.Dir), "-"), "memory")
+}
+
+// writable lists where the session's file tools write without the user: its worktree, and the memory and scratch directories Claude Code's system prompt sends it to.
+func (s *Session) writable() []string {
+	dirs := []string{s.Dir, s.memoryDir()}
+	if s.ID != "" {
+		dirs = append(dirs, filepath.Join(claudeDir(), "jobs", s.ID, "tmp"))
+	}
+	return dirs
 }
 
 func (d *daemon) serve(ln net.Listener) {
@@ -337,7 +362,7 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 			n.pre = map[string]preCall{}
 		}
 		n.pre[in.ToolUseID] = preCall{in.ToolName, compact(in.ToolInput)}
-		if reason := reservedAction(in.ToolName, in.ToolInput, n.Dir); reason != "" {
+		if reason := reservedAction(in.ToolName, in.ToolInput, n.writable()...); reason != "" {
 			dec = &Decision{Kind: "permission", Node: node, Holder: "user", Reserved: reason, Tool: in.ToolName, Input: in.ToolInput, toolUseID: in.ToolUseID}
 		}
 	case "PermissionRequest":
@@ -710,7 +735,7 @@ func (d *daemon) spawn(caller, name, repo, prompt string) (*Session, error) {
 		return nil, err
 	}
 
-	id, err := d.start(name, dir, []string{"-w", name}, workerPrompt(name), prompt)
+	id, err := d.start(n, dir, []string{"-w", name}, workerPrompt(name), prompt)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err != nil {
@@ -753,13 +778,13 @@ func repoRoot(dir string) (string, error) {
 	return filepath.Dir(strings.TrimSpace(string(out))), nil
 }
 
-// start runs `claude --bg` for node in dir, with bosun's settings and MCP server.
-func (d *daemon) start(node, dir string, extra []string, system, prompt string) (string, error) {
-	settings, mcp, err := d.writeConfig(node)
+// start runs `claude --bg` for n in dir, with bosun's settings and MCP server.
+func (d *daemon) start(n *Session, dir string, extra []string, system, prompt string) (string, error) {
+	settings, mcp, err := d.writeConfig(n)
 	if err != nil {
 		return "", err
 	}
-	args := append([]string{"--bg", "-n", node}, extra...)
+	args := append([]string{"--bg", "-n", n.Node}, extra...)
 	args = append(args, "--settings", settings, "--mcp-config", mcp, "--append-system-prompt", system, "--", prompt)
 	return d.claude.Start(dir, args)
 }
@@ -774,7 +799,8 @@ type hookGroup struct {
 	Hooks []hookCommand `json:"hooks"`
 }
 
-func (d *daemon) writeConfig(node string) (settingsPath, mcpPath string, err error) {
+func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err error) {
+	node := n.Node
 	dir := filepath.Join(d.stateDir, "nodes", node)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", "", err
@@ -791,8 +817,10 @@ func (d *daemon) writeConfig(node string) (settingsPath, mcpPath string, err err
 		return "", "", err
 	}
 	settings := map[string]any{
-		"worktree":    map[string]string{"baseRef": "head"},
-		"permissions": permissions,
+		"worktree": map[string]string{"baseRef": "head"},
+		// Claude Code's default, set so that the reserved check spares exactly the directory the session writes.
+		"autoMemoryDirectory": n.memoryDir(),
+		"permissions":         permissions,
 		"env": map[string]string{
 			// Claude Code moves an MCP call still running after 120 seconds to the background, so ask and next_event would stop blocking the turn.
 			// The server option disableAutoBackground does not help: it applies only to SDK servers.
@@ -885,7 +913,7 @@ func (d *daemon) ensureMaster() error {
 	if err := os.MkdirAll(d.masterDir, 0o700); err != nil {
 		return err
 	}
-	id, err := d.start(masterNode, d.masterDir, nil, masterPrompt, "Call next_event to begin.")
+	id, err := d.start(m, d.masterDir, nil, masterPrompt, "Call next_event to begin.")
 	if err != nil {
 		return fmt.Errorf("starting the master in %s, which Claude Code must trust: %w", d.masterDir, err)
 	}

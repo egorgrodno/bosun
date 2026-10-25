@@ -8,8 +8,8 @@ import (
 	"strings"
 )
 
-// reservedAction names what in a tool call only the user may approve, or returns "". dir is the session's worktree.
-func reservedAction(tool string, input json.RawMessage, dir string) string {
+// reservedAction names what in a tool call only the user may approve, or returns "". A file tool may write within dirs, the first of which is the session's worktree.
+func reservedAction(tool string, input json.RawMessage, dirs ...string) string {
 	switch tool {
 	case "Bash":
 		var in struct {
@@ -29,19 +29,22 @@ func reservedAction(tool string, input json.RawMessage, dir string) string {
 			NotebookPath string `json:"notebook_path"`
 		}
 		_ = json.Unmarshal(input, &in)
-		if p := cmp.Or(in.FilePath, in.NotebookPath); p != "" && !within(dir, p) {
+		if p := cmp.Or(in.FilePath, in.NotebookPath); p != "" && !within(dirs, p) {
 			return "a write outside the worktree"
 		}
 	}
 	return ""
 }
 
-func within(dir, path string) bool {
+// within reports whether path lies in one of dirs, resolving a relative path against the first.
+func within(dirs []string, path string) bool {
 	if !filepath.IsAbs(path) {
-		path = filepath.Join(dir, path)
+		path = filepath.Join(dirs[0], path)
 	}
-	rel, err := filepath.Rel(dir, path)
-	return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+	return slices.ContainsFunc(dirs, func(dir string) bool {
+		rel, err := filepath.Rel(dir, path)
+		return err == nil && rel != ".." && !strings.HasPrefix(rel, "../")
+	})
 }
 
 func reservedCommand(script string) string {
