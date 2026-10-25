@@ -324,7 +324,12 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 		n.SessionID = in.SessionID
 	}
 	var dec *Decision
+	var worktree string
 	switch in.Event {
+	case "SessionStart":
+		if n.Repo != "" {
+			worktree = n.Dir
+		}
 	case "PreToolUse":
 		// A permission still open from an earlier call was denied in the session's own prompt, which runs no tool.
 		d.withdrawLocked(node, func(dec *Decision) bool { return dec.toolUseID != in.ToolUseID })
@@ -355,6 +360,11 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 		d.openLocked(dec)
 	}
 	d.mu.Unlock()
+	if worktree != "" {
+		if err := standInGitmodules(worktree); err != nil {
+			log.Printf("%s: .gitmodules: %v", node, err)
+		}
+	}
 	if dec == nil {
 		return resp, nil
 	}
@@ -362,6 +372,45 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 		resp.Behavior, resp.Text = a.behavior, a.text
 	}
 	return resp, nil
+}
+
+// standInGitmodules gives a worktree that lacks one an empty .gitmodules, which the session's excludes keep out of commits.
+// The sandbox of Claude Code 2.1.310 mounts /dev/null over a missing .gitmodules, which libgit2 cannot open, so every nix flake command in the repository fails.
+func standInGitmodules(worktree string) error {
+	path := filepath.Join(worktree, ".gitmodules")
+	if _, err := os.Lstat(path); err == nil {
+		return nil
+	}
+	return os.WriteFile(path, nil, 0o644)
+}
+
+// sandboxStandIns are what the sandbox of Claude Code 2.1.310 mounts /dev/null over in a session's directory, where missing, plus its own bookkeeping.
+// Git lists each as an untracked file it cannot add, so `git add -A` fails unless they are ignored.
+var sandboxStandIns = []string{
+	"/.bash_profile", "/.bashrc", "/.gitconfig", "/.gitmodules", "/.idea", "/.mcp.json", "/.profile", "/.ripgreprc", "/.vscode", "/.zprofile", "/.zshrc",
+	"/.claude/.cc-writes/", "/.claude/agents", "/.claude/commands", "/.claude/hooks", "/.claude/launch.json", "/.claude/loop.md", "/.claude/output-styles",
+	"/.claude/routines", "/.claude/scheduled_tasks.json", "/.claude/settings.json", "/.claude/settings.local.json", "/.claude/skills", "/.claude/workflows",
+}
+
+// writeExcludes writes the excludes file a session's git reads: the user's own, which core.excludesFile in the session's environment replaces, then the sandbox's stand-ins.
+func writeExcludes(path string) error {
+	own := ""
+	if out, err := exec.Command("git", "config", "--global", "--path", "--get", "core.excludesFile").Output(); err == nil {
+		own = strings.TrimSpace(string(out))
+	} else if dir := os.Getenv("XDG_CONFIG_HOME"); dir != "" {
+		own = filepath.Join(dir, "git", "ignore")
+	} else if home, err := os.UserHomeDir(); err == nil {
+		own = filepath.Join(home, ".config", "git", "ignore")
+	}
+	data, err := os.ReadFile(own)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if len(data) > 0 && !bytes.HasSuffix(data, []byte("\n")) {
+		data = append(data, '\n')
+	}
+	data = append(data, strings.Join(sandboxStandIns, "\n")+"\n"...)
+	return os.WriteFile(path, data, 0o600)
 }
 
 // match finds the tool_use_id of the PreToolUse a PermissionRequest follows, which carries none of its own.
@@ -737,13 +786,36 @@ func (d *daemon) writeConfig(node string) (settingsPath, mcpPath string, err err
 	if node != masterNode {
 		permissions["deny"] = []string{"AskUserQuestion"}
 	}
+	excludes := filepath.Join(dir, "gitignore")
+	if err := writeExcludes(excludes); err != nil {
+		return "", "", err
+	}
 	settings := map[string]any{
 		"worktree":    map[string]string{"baseRef": "head"},
 		"permissions": permissions,
-		// Claude Code moves an MCP call still running after 120 seconds to the background, so ask and next_event would stop blocking the turn.
-		// The server option disableAutoBackground does not help: it applies only to SDK servers.
-		"env": map[string]string{"CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0"},
+		"env": map[string]string{
+			// Claude Code moves an MCP call still running after 120 seconds to the background, so ask and next_event would stop blocking the turn.
+			// The server option disableAutoBackground does not help: it applies only to SDK servers.
+			"CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0",
+			// Only this session's git reads it, unlike the repository's info/exclude, which every worktree and the main checkout share.
+			"GIT_CONFIG_COUNT":   "1",
+			"GIT_CONFIG_KEY_0":   "core.excludesFile",
+			"GIT_CONFIG_VALUE_0": excludes,
+		},
+		"sandbox": map[string]any{
+			"enabled":           true,
+			"failIfUnavailable": true,
+			// The sandbox confines where a command writes, not what it does to the worktree, so auto mode and the master still judge it.
+			"autoAllowBashIfSandboxed": false,
+			// Linux cannot open a single socket path, and nix needs its daemon's. Hiding bosun's own keeps a worker from answering its own decisions.
+			"network": map[string]any{"allowAllUnixSockets": true},
+			"filesystem": map[string]any{
+				"allowWrite": []string{"~/.cache/go-build", "~/.cache/nix"},
+				"denyRead":   []string{d.socket},
+			},
+		},
 		"hooks": map[string]any{
+			"SessionStart":       quick,
 			"PreToolUse":         hold,
 			"PermissionRequest":  hold,
 			"PostToolUse":        quick,

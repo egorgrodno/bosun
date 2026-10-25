@@ -32,11 +32,13 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Trust.** `claude --bg` refuses a directory the user has not trusted. A first-level worker starts only in a trusted repository, and the master's own directory needs trust too. Every directory inside a trusted repository, worktrees included, shares its trust. A repository nested inside it needs trust of its own.
 
+**Sandbox.** Every session runs its Bash commands in Claude Code's sandbox, so a command writes only inside the session's directory, its repository's `.git`, temporary files, `~/.cache/go-build` and `~/.cache/nix`. `sudo` fails inside it, and bosun's socket is hidden from it, so a worker can neither act as root nor answer its own decisions. The sandbox refuses an unlisted host. The model then retries with the host in the Bash call's `allowed_domains`, and auto mode decides that retry.
+
 **The tree.** Every session has `spawn`, so a worker can add a level. The daemon caps depth and fan-out.
 
 **Worktrees.** `spawn` runs a child from its parent's worktree, so the child's branch `worktree-<node>` begins at the parent's `HEAD`. Every worktree sits directly in the repository's `.claude/worktrees/`, whatever its depth, so a node name must be unique within its repository. The master works in no repository.
 
-**Cleanup.** A parent merges a child's branch once the child is done. The daemon then removes the child with `claude rm`, since a session doing so would trip the reserved check on deleting a branch. `claude rm` refuses a worktree whose branch has unpushed commits, and a branch merged locally still has them, so the daemon passes `--discard-unpushed` with the `<commit>@<worktree-id>` that the refusing `claude rm` printed. `claude stop` and `claude rm` take the short `id`, not the `-n` name.
+**Cleanup.** A parent merges a child's branch once the child is done. The daemon then removes the child with `claude rm`, since a session doing so would trip the reserved check on deleting a branch. `claude rm` refuses a worktree whose branch has unpushed commits, and a branch merged locally still has them, so the daemon passes `--discard-unpushed` with the `<commit>@<worktree-id>` that the refusing `claude rm` printed. `claude rm` also refuses the empty `.gitmodules` the daemon writes on `SessionStart`, so the daemon deletes it first. `claude stop` and `claude rm` take the short `id`, not the `-n` name.
 
 ## Decisions
 
@@ -57,9 +59,10 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 - any `git push`, force pushes included
 - deleting a branch
-- a write outside the session's worktree
+- a write outside the session's worktree, through a file tool
+- a Bash command outside the sandbox, through `dangerouslyDisableSandbox`
 
-A `PreToolUse` hook catches a reserved action before Claude Code's allow rules and auto mode. Auto mode approves even a force push when its task asks for one. The check waits for your answer and returns `allow` or `deny`. A `PreToolUse` hook that times out or fails lets the call through to the normal flow. So the check denies shortly before its `timeout`, and on any error, an unreachable daemon included.
+Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved action before Claude Code's allow rules and auto mode. Auto mode approves even a force push when its task asks for one. The check waits for your answer and returns `allow` or `deny`. A `PreToolUse` hook that times out or fails lets the call through to the normal flow. So the check denies shortly before its `timeout`, and on any error, an unreachable daemon included.
 
 **Questions go to the master, whatever the depth.** Workers run without `AskUserQuestion`, which would wait on a person, and ask through `ask` instead.
 

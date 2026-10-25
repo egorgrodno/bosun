@@ -12,7 +12,7 @@ A master Claude Code session that runs a tree of worker sessions. It answers the
 
 ## Usage
 
-By default the daemon runs the master in `~/.local/state/bosun/master`. Claude Code must trust that directory, and every repository a worker starts in. Run `claude` in each once and accept the prompt.
+By default the daemon runs the master in `~/.local/state/bosun/master`. Claude Code must trust that directory, and every repository a worker starts in. Run `claude` in each once and accept the prompt. Sessions run their commands in Claude Code's sandbox, which on Linux needs `bwrap` and `socat` on the `PATH`.
 
 ```sh
 bosun daemon &

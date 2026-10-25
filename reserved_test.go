@@ -67,3 +67,20 @@ func TestReservedWrite(t *testing.T) {
 		t.Error("NotebookEdit outside the worktree is not reserved")
 	}
 }
+
+func TestReservedUnsandboxed(t *testing.T) {
+	for _, tc := range []struct {
+		input map[string]any
+		want  string
+	}{
+		{map[string]any{"command": "ls", "dangerouslyDisableSandbox": true}, "a command outside the sandbox"},
+		{map[string]any{"command": "git push", "dangerouslyDisableSandbox": true}, "git push"},
+		{map[string]any{"command": "ls", "dangerouslyDisableSandbox": false}, ""},
+		{map[string]any{"command": "curl example.com", "allowed_domains": []string{"example.com"}}, ""},
+	} {
+		input, _ := json.Marshal(tc.input)
+		if got := reservedAction("Bash", input, "/wt"); got != tc.want {
+			t.Errorf("Bash %v: reserved = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}

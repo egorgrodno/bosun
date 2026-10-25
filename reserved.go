@@ -14,9 +14,14 @@ func reservedAction(tool string, input json.RawMessage, dir string) string {
 	case "Bash":
 		var in struct {
 			Command string `json:"command"`
+			Unboxed bool   `json:"dangerouslyDisableSandbox"`
 		}
 		if json.Unmarshal(input, &in) == nil {
-			return reservedCommand(in.Command)
+			if r := reservedCommand(in.Command); r != "" || !in.Unboxed {
+				return r
+			}
+			// Auto mode approves running outside the sandbox without asking.
+			return "a command outside the sandbox"
 		}
 	case "Write", "Edit", "MultiEdit", "NotebookEdit":
 		var in struct {

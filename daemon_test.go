@@ -287,12 +287,19 @@ func TestSpawn(t *testing.T) {
 		Worktree    map[string]string      `json:"worktree"`
 		Permissions map[string][]string    `json:"permissions"`
 		Hooks       map[string][]hookGroup `json:"hooks"`
+		Sandbox     struct {
+			Enabled    bool                `json:"enabled"`
+			Filesystem map[string][]string `json:"filesystem"`
+		} `json:"sandbox"`
 	}
 	if err := json.Unmarshal(data, &settings); err != nil {
 		t.Fatal(err)
 	}
 	if settings.Worktree["baseRef"] != "head" || !slices.Contains(settings.Permissions["deny"], "AskUserQuestion") {
 		t.Fatalf("settings = %s", data)
+	}
+	if !settings.Sandbox.Enabled || !slices.Contains(settings.Sandbox.Filesystem["denyRead"], d.socket) {
+		t.Fatalf("sandbox = %+v, want it on with the socket hidden", settings.Sandbox)
 	}
 	if cmd := settings.Hooks["PreToolUse"][0].Hooks[0].Command; !strings.Contains(cmd, "BOSUN_NODE=b ") || !strings.HasSuffix(cmd, "'/bin/bosun' hook") {
 		t.Fatalf("hook command = %s", cmd)
@@ -313,6 +320,58 @@ func TestSpawn(t *testing.T) {
 	d.mu.Unlock()
 	if child != 1 {
 		t.Fatalf("b at depth %d", child)
+	}
+}
+
+func git(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("git", append([]string{"-C", dir, "-c", "user.name=t", "-c", "user.email=t@t"}, args...)...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, out)
+	}
+	return string(out)
+}
+
+func TestSessionStartStandsInGitmodules(t *testing.T) {
+	d, _ := testDaemon(t)
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	git(t, repo, "commit", "-q", "--allow-empty", "-m", "init")
+	wt := filepath.Join(repo, ".claude", "worktrees", "a")
+	git(t, repo, "worktree", "add", "-q", "-b", "worktree-a", wt)
+	d.mu.Lock()
+	d.nodes["a"].Repo, d.nodes["a"].Dir = repo, wt
+	d.mu.Unlock()
+
+	receive(t, runHookAsync("a", hookEvent("SessionStart", "", "", nil)))
+	if info, err := os.Stat(filepath.Join(wt, ".gitmodules")); err != nil || info.Size() != 0 {
+		t.Fatalf(".gitmodules: %v, %v", info, err)
+	}
+
+	// Regular files stand in for the sandbox's /dev/null mounts, which git ignores by name alike.
+	for _, p := range []string{".bashrc", ".claude/settings.json", ".claude/.cc-writes/x"} {
+		_ = os.MkdirAll(filepath.Dir(filepath.Join(wt, p)), 0o755)
+		_ = os.WriteFile(filepath.Join(wt, p), nil, 0o644)
+	}
+	settingsPath, _, err := d.writeConfig("a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var settings struct {
+		Env map[string]string `json:"env"`
+	}
+	data, _ := os.ReadFile(settingsPath)
+	_ = json.Unmarshal(data, &settings)
+	cmd := exec.Command("git", "-C", wt, "status", "--porcelain")
+	cmd.Env = os.Environ()
+	for k, v := range settings.Env {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
+	if out, err := cmd.Output(); err != nil || len(out) > 0 {
+		t.Fatalf("git status in the session's environment: %q, %v", out, err)
+	}
+	if status := git(t, wt, "status", "--porcelain"); !strings.Contains(status, ".gitmodules") {
+		t.Fatalf("git status outside the session's environment: %q", status)
 	}
 }
 
