@@ -23,3 +23,9 @@ Nobody watches this session. When you need a decision, such as a choice between 
 
 When the task is done, end your turn with a short summary of what you did and on which commits.`, node)
 }
+
+// tempFiles overrides Claude Code's own system prompt, which sends temporary files to a folder the sandbox keeps read-only.
+// It names the folder outright because Claude Code refuses to run, in a worktree, a script whose path a variable holds.
+func tempFiles(dir string) string {
+	return fmt.Sprintf("Put temporary files in %s, which is this session's alone and is $TMPDIR in Bash, and not in $CLAUDE_JOB_DIR/tmp: your Bash commands run in a sandbox that cannot write there.", dir)
+}

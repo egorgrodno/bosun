@@ -221,9 +221,20 @@ func (s *Session) memoryDir() string {
 	return filepath.Join(claudeDir(), "projects", notAlnum.ReplaceAllString(cmp.Or(s.Repo, s.Dir), "-"), "memory")
 }
 
-// writable lists where the session's file tools write without the user: its worktree, and the memory and scratch directories Claude Code's system prompt sends it to.
-func (s *Session) writable() []string {
-	dirs := []string{s.Dir, s.memoryDir()}
+// tempDir is the node's TMPDIR.
+func (d *daemon) tempDir(node string) string {
+	return filepath.Join(d.stateDir, "nodes", node, "tmp")
+}
+
+// scratchDir is the folder within tempDir that Claude Code makes the sandbox's TMPDIR.
+// The rest of tempDir, which holds files the session's own Claude Code process loads, stays read-only to the sandbox.
+func (d *daemon) scratchDir(node string) string {
+	return filepath.Join(d.tempDir(node), fmt.Sprintf("claude-%d", os.Getuid()))
+}
+
+// writable lists where the session's file tools write without the user: its worktree, its scratch folder, and the memory and job directories Claude Code's system prompt sends it to.
+func (d *daemon) writable(s *Session) []string {
+	dirs := []string{s.Dir, d.scratchDir(s.Node), s.memoryDir()}
 	if s.ID != "" {
 		dirs = append(dirs, filepath.Join(claudeDir(), "jobs", s.ID, "tmp"))
 	}
@@ -370,7 +381,7 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 			n.pre = map[string]preCall{}
 		}
 		n.pre[in.ToolUseID] = preCall{in.ToolName, compact(in.ToolInput)}
-		if reason := reservedAction(in.ToolName, in.ToolInput, n.writable()...); reason != "" {
+		if reason := reservedAction(in.ToolName, in.ToolInput, d.writable(n)...); reason != "" {
 			dec = &Decision{Kind: "permission", Node: node, Holder: "user", Reserved: reason, Tool: in.ToolName, Input: in.ToolInput, toolUseID: in.ToolUseID}
 		}
 	case "PermissionRequest":
@@ -796,7 +807,7 @@ func (d *daemon) start(n *Session, dir string, extra []string, system, prompt st
 	if n.Model != "" {
 		args = append(args, "--model", n.Model)
 	}
-	args = append(args, "--settings", settings, "--mcp-config", mcp, "--append-system-prompt", system, "--", prompt)
+	args = append(args, "--settings", settings, "--mcp-config", mcp, "--append-system-prompt", system+"\n\n"+tempFiles(d.scratchDir(n.Node)), "--", prompt)
 	return d.claude.Start(dir, args)
 }
 
@@ -813,7 +824,7 @@ type hookGroup struct {
 func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err error) {
 	node := n.Node
 	dir := filepath.Join(d.stateDir, "nodes", node)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.MkdirAll(d.tempDir(node), 0o700); err != nil {
 		return "", "", err
 	}
 	command := fmt.Sprintf("BOSUN_NODE=%s BOSUN_SOCKET=%s %s hook", node, shellQuote(d.socket), shellQuote(d.exe))
@@ -840,6 +851,9 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 			"GIT_CONFIG_COUNT":   "1",
 			"GIT_CONFIG_KEY_0":   "core.excludesFile",
 			"GIT_CONFIG_VALUE_0": excludes,
+			// Otherwise every session shares the sandbox's temporary folder, and each writes there.
+			// CLAUDE_CODE_TMPDIR would move Claude Code's own files but leave the sandbox's folder in /tmp.
+			"TMPDIR": d.tempDir(node),
 		},
 		"sandbox": map[string]any{
 			"enabled":           true,

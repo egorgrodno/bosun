@@ -34,7 +34,7 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Trust.** `claude --bg` refuses a directory the user has not trusted. A first-level worker starts only in a trusted repository, and the master's own directory needs trust too. Every directory inside a trusted repository, worktrees included, shares its trust. A repository nested inside it needs trust of its own.
 
-**Sandbox.** Every session runs its Bash commands in Claude Code's sandbox, so a command writes only inside the session's directory, its repository's `.git`, temporary files, `~/.cache/go-build` and `~/.cache/nix`. `sudo` fails inside it. The sandbox allows every unix socket, since nix needs its daemon's. bosun hides by path the sockets that reach outside the sandbox, its own included. A socket missing from that list stays open. Claude Code's system prompt sends a session's scratch files to `$CLAUDE_JOB_DIR/tmp`, which is read-only inside the sandbox (#14). The sandbox refuses an unlisted host. The model then retries with the host in the Bash call's `allowed_domains`, and auto mode decides that retry.
+**Sandbox.** Every session runs its Bash commands in Claude Code's sandbox, so a command writes only inside the session's directory, its repository's `.git`, its own temporary folder, `~/.cache/go-build` and `~/.cache/nix`. `sudo` fails inside it. The sandbox allows every unix socket, since nix needs its daemon's. bosun hides by path the sockets that reach outside the sandbox, its own included. A socket missing from that list stays open. Claude Code's system prompt sends scratch files to `$CLAUDE_JOB_DIR/tmp`, which is read-only inside the sandbox. bosun's prompt sends them to the session's temporary folder instead. The sandbox refuses an unlisted host. The model then retries with the host in the Bash call's `allowed_domains`, and auto mode decides that retry.
 
 **The tree.** Every session has `spawn`, so a worker can add a level. The daemon caps depth and fan-out.
 
@@ -61,7 +61,7 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 - any `git push`, force pushes included
 - deleting a branch
-- a write through a file tool outside the session's worktree, memory directory and `$CLAUDE_JOB_DIR/tmp`
+- a write through a file tool outside the session's worktree, memory directory, temporary folder and `$CLAUDE_JOB_DIR/tmp`
 - a Bash command outside the sandbox, through `dangerouslyDisableSandbox`
 
 Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved action before Claude Code's allow rules and auto mode. Auto mode approves even a force push when its task asks for one. The check waits for your answer and returns `allow` or `deny`. A `PreToolUse` hook that times out or fails lets the call through to the normal flow. So the check denies shortly before its `timeout`, and on any error, an unreachable daemon included.

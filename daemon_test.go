@@ -248,11 +248,12 @@ func TestReservedSkipsMaster(t *testing.T) {
 }
 
 func TestReservedSparesClaudeCodeDirs(t *testing.T) {
-	testDaemon(t)
+	d, _ := testDaemon(t)
 	claude := os.Getenv("CLAUDE_CONFIG_DIR")
 	for _, p := range []string{
 		filepath.Join(claude, "projects", "-repo", "memory", "feedback.md"),
 		filepath.Join(claude, "jobs", "aaaaaaaa", "tmp", "query.sql"),
+		filepath.Join(d.scratchDir("a"), "probe.sh"),
 	} {
 		write := map[string]any{"file_path": p, "content": "x"}
 		if out := receive(t, runHookAsync("a", hookEvent("PreToolUse", "t1", "Write", write))); out != "null" {
@@ -356,6 +357,7 @@ func TestSpawn(t *testing.T) {
 		Worktree    map[string]string      `json:"worktree"`
 		Memory      string                 `json:"autoMemoryDirectory"`
 		Permissions map[string][]string    `json:"permissions"`
+		Env         map[string]string      `json:"env"`
 		Hooks       map[string][]hookGroup `json:"hooks"`
 		Sandbox     struct {
 			Enabled    bool                `json:"enabled"`
@@ -373,6 +375,14 @@ func TestSpawn(t *testing.T) {
 	}
 	if deny := settings.Sandbox.Filesystem["denyRead"]; !settings.Sandbox.Enabled || !slices.Contains(deny, d.socket) || !slices.Contains(deny, "/run/user/1234") {
 		t.Fatalf("sandbox = %+v, want it on with the socket and the runtime folder hidden", settings.Sandbox)
+	}
+	if tmp := settings.Env["TMPDIR"]; tmp != d.tempDir("b") {
+		t.Fatalf("TMPDIR = %q, want %q", tmp, d.tempDir("b"))
+	} else if info, err := os.Stat(tmp); err != nil || !info.IsDir() {
+		t.Fatalf("TMPDIR: %v", err)
+	}
+	if system := argAfter(args, "--append-system-prompt"); !strings.Contains(system, d.scratchDir("b")) {
+		t.Fatalf("the system prompt names no scratch folder: %s", system)
 	}
 	if cmd := settings.Hooks["PreToolUse"][0].Hooks[0].Command; !strings.Contains(cmd, "BOSUN_NODE=b ") || !strings.HasSuffix(cmd, "'/bin/bosun' hook") {
 		t.Fatalf("hook command = %s", cmd)
