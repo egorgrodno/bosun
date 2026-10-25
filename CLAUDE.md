@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-bosun orchestrates Claude Code background sessions: one master and a tree of workers. [README.md](README.md) holds the scope. Nothing is built yet, so this file is the design. Its Claude Code behaviour and timings were measured against 2.1.310.
+bosun orchestrates Claude Code background sessions: one master and a tree of workers. [README.md](README.md) holds the scope. This file holds the design, of which the TUI, the panel, the systemd service and cleanup are not built yet. Its Claude Code behaviour and timings were measured against 2.1.310.
 
 ## Shape
 
@@ -20,6 +20,7 @@ One binary carries every part:
 | `bosun mcp` | the stdio MCP server each session starts, relaying to the daemon |
 | `bosun hook` | every hook each session runs |
 | `bosun tui` | the terminal frontend |
+| `bosun status`, `approve`, `deny`, `reply`, `tell`, `spawn`, `kill`, `watch` | the command-line frontend |
 
 The daemon holds each session's parent and the queue of decisions waiting on an answer. It reads which of its sessions run from `claude agents --json`, which also lists sessions bosun did not start.
 
@@ -29,13 +30,13 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Identity.** `--bg` ignores `--session-id` and picks its own. bosun knows a session by its node name, set in the environment of its hook commands and its MCP server. Each hook event carries Claude Code's `session_id`, which `claude agents --json` reports as `sessionId`, beside a short `id`.
 
-**Trust.** `claude --bg` refuses a directory the user has not trusted. A first-level worker starts only in a trusted repository, and the master's own directory needs trust too. A worktree inside a trusted repository needs no trust of its own.
+**Trust.** `claude --bg` refuses a directory the user has not trusted. A first-level worker starts only in a trusted repository, and the master's own directory needs trust too. Every directory inside a trusted repository, worktrees included, shares its trust. A repository nested inside it needs trust of its own.
 
 **The tree.** Every session has `spawn`, so a worker can add a level. The daemon caps depth and fan-out.
 
 **Worktrees.** `spawn` runs a child from its parent's worktree, so the child's branch `worktree-<node>` begins at the parent's `HEAD`. Every worktree sits directly in the repository's `.claude/worktrees/`, whatever its depth, so a node name must be unique within its repository. The master works in no repository.
 
-**Cleanup.** A parent merges a child's branch once the child is done. The daemon then removes the child with `claude rm`, since a session doing so would trip the reserved check on deleting a branch. `claude rm` refuses a worktree whose branch has unpushed commits, and a branch merged locally still has them, so the daemon passes `--discard-unpushed`. `claude stop` and `claude rm` take the short `id`, not the `-n` name.
+**Cleanup.** A parent merges a child's branch once the child is done. The daemon then removes the child with `claude rm`, since a session doing so would trip the reserved check on deleting a branch. `claude rm` refuses a worktree whose branch has unpushed commits, and a branch merged locally still has them, so the daemon passes `--discard-unpushed` with the `<commit>@<worktree-id>` that the refusing `claude rm` printed. `claude stop` and `claude rm` take the short `id`, not the `-n` name.
 
 ## Decisions
 
@@ -44,13 +45,13 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 | Permission | run `npm test`, edit a file | rules, then auto mode, then the master, then you |
 | Question | "X or Y?", "tests fail, keep going?" | the master, then you |
 
-**The permission hook is `PermissionRequest`.** It receives `session_id`, `tool_name` and `tool_input`. It answers with `hookSpecificOutput.decision.behavior` set to `allow` or `deny`, and a deny's `message` reaches the model verbatim. Auto mode approves without calling it.
+**The permission hook is `PermissionRequest`.** It receives `session_id`, `tool_name` and `tool_input`. It answers with `hookSpecificOutput.decision.behavior` set to `allow` or `deny`, and a deny's `message` reaches the model verbatim. Auto mode approves a call without running the hook, unless an `ask` rule matches the call.
 
-**Permissions reach the master once auto mode passes them up.** The daemon hands the permission to the master as an event. The master allows it, denies it, or escalates it to you.
+**Permissions reach the master once auto mode passes them up.** The daemon hands the permission to the master as an event. The master allows it, denies it, or escalates it to you. The master's own permissions go straight to you.
 
 **Waiting on you.** A hook's `timeout` may exceed the 600-second default, and the hook decides the call whenever it answers within it. Six seconds after the hook starts, the session also shows its own prompt, and `claude agents --json` reports it as `"status":"waiting","state":"blocked"`. After the `timeout`, only that prompt settles the call. The daemon then moves the decision out of its queue and shows the session as blocked in its own prompt.
 
-**An answer in the session wins.** Answering the session's own prompt through `claude attach` settles the call at once, and the hook keeps running. `PermissionRequest` carries no call id, so the daemon pairs it with the `PreToolUse` event before it, which carries `tool_use_id`. A `PostToolUse` for that id withdraws the decision. A denial in the session runs no tool, so the session's next `PreToolUse` or `Stop` withdraws it instead.
+**An answer in the session wins.** Answering the session's own prompt through `claude attach` settles the call at once, and the hook keeps running. `PermissionRequest` carries no call id, so the daemon pairs it with the `PreToolUse` event before it, which carries `tool_use_id`. A `PostToolUse` or `PostToolUseFailure` for that id withdraws the decision. A denial in the session runs no tool, so the session's next `PreToolUse` or `Stop` withdraws it instead.
 
 **Reserved actions skip the master.** Only you can approve one:
 
@@ -73,15 +74,15 @@ A `PreToolUse` hook catches a reserved action before Claude Code's allow rules a
 
 **The master loops on `next_event`.** It calls `next_event`, handles the event, and calls it again. A `Stop` hook reports a turn's end, and `claude agents --json` reports an exit.
 
-**Blocking tools send progress.** Claude Code aborts a stdio tool call that sends nothing for 30 seconds. While `next_event` or `ask` blocks, it sends `notifications/progress` on the call's `progressToken` every 10 seconds.
+**Blocking tools send progress.** Claude Code aborts a stdio tool call that sends nothing for 30 seconds. While `next_event` or `ask` blocks, it sends `notifications/progress` on the call's `progressToken` every 10 seconds. Claude Code also moves a call still running after 120 seconds to the background, unless the settings' `env` sets `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` to `0`.
 
 **Typing to the master.** Text typed into the master's session waits until the current tool call returns. So `next_event` must return empty within five minutes. A frontend's `tell` reaches the master as an event straight away.
 
 ## Frontends
 
-Both frontends are thin clients of one protocol on the daemon's socket. The daemon sends JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `tell`, `spawn`, `kill`. Every rule lives in the daemon.
+Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `tell`, `spawn`, `kill`. Every rule lives in the daemon.
 
-Both lead with the queue of decisions waiting on you, above the tree.
+Each leads with the queue of decisions waiting on you, above the tree.
 
 - **Quickshell panel.** It lives in the NixOS configuration's `modules/quickshell/`. Opening a session runs `claude attach <id>` in a new kitty window.
 - **`bosun tui`.** Opening a session runs `claude attach` in the TUI's terminal. `Ctrl+Z` exits `claude attach` with status 0, leaving the session running.

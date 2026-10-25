@@ -1,0 +1,870 @@
+package main
+
+import (
+	"bytes"
+	"cmp"
+	"context"
+	"encoding/json"
+	"errors"
+	"flag"
+	"fmt"
+	"io/fs"
+	"log"
+	"net"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+)
+
+const (
+	masterNode  = "master"
+	maxDepth    = 3
+	maxChildren = 4
+
+	// holdTimeout is the timeout of the PreToolUse and PermissionRequest hooks, so how long a decision waits.
+	// The hook gives up holdMargin before it, while Claude Code still reads what it prints.
+	holdTimeout = time.Hour
+	holdMargin  = 30 * time.Second
+
+	// idleReturn bounds next_event, because text typed into the master waits until the call returns.
+	idleReturn = 4 * time.Minute
+	pollEvery  = 3 * time.Second
+	// startGrace covers a session `claude --bg` started that `claude agents --json` does not list yet.
+	startGrace = 30 * time.Second
+)
+
+var nodeName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
+
+type daemon struct {
+	exe       string
+	socket    string
+	stateDir  string
+	masterDir string
+	claude    claudeCLI
+
+	mu        sync.Mutex
+	nodes     map[string]*Session
+	started   map[string]time.Time
+	decisions map[string]*Decision
+	nextID    int
+	events    []Event
+	wake      chan struct{}
+	watchers  map[*watcher]bool
+}
+
+type watcher struct {
+	ch     chan Event
+	cancel context.CancelFunc
+}
+
+// preCall is a PreToolUse not yet followed by its PostToolUse.
+type preCall struct {
+	tool  string
+	input string
+}
+
+type savedState struct {
+	NextID   int        `json:"nextId"`
+	Sessions []*Session `json:"sessions"`
+}
+
+func newDaemon(exe, socket, stateDir, masterDir string, claude claudeCLI) *daemon {
+	return &daemon{
+		exe:       exe,
+		socket:    socket,
+		stateDir:  stateDir,
+		masterDir: masterDir,
+		claude:    claude,
+		nodes:     map[string]*Session{},
+		started:   map[string]time.Time{},
+		decisions: map[string]*Decision{},
+		wake:      make(chan struct{}),
+		watchers:  map[*watcher]bool{},
+	}
+}
+
+func stateDir() string {
+	if p := os.Getenv("BOSUN_STATE"); p != "" {
+		return p
+	}
+	if d := os.Getenv("XDG_STATE_HOME"); d != "" {
+		return filepath.Join(d, "bosun")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "state", "bosun")
+}
+
+func runDaemon(args []string) error {
+	flags := flag.NewFlagSet("daemon", flag.ExitOnError)
+	masterDir := flags.String("master-dir", filepath.Join(stateDir(), "master"), "directory the master runs in, which Claude Code must trust")
+	_ = flags.Parse(args)
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	d := newDaemon(exe, socketPath(), stateDir(), *masterDir, claudeExec{})
+	if err := d.load(); err != nil {
+		return err
+	}
+	ln, err := listen(d.socket)
+	if err != nil {
+		return err
+	}
+	defer ln.Close()
+	go d.serve(ln)
+	if err := d.ensureMaster(); err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	tick := time.NewTicker(pollEvery)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-tick.C:
+			d.poll()
+		}
+	}
+}
+
+func listen(path string) (net.Listener, error) {
+	if conn, err := net.Dial("unix", path); err == nil {
+		conn.Close()
+		return nil, fmt.Errorf("a daemon already listens on %s", path)
+	}
+	_ = os.Remove(path)
+	return net.Listen("unix", path)
+}
+
+func (d *daemon) load() error {
+	data, err := os.ReadFile(filepath.Join(d.stateDir, "state.json"))
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var st savedState
+	if err := json.Unmarshal(data, &st); err != nil {
+		return fmt.Errorf("state.json: %w", err)
+	}
+	d.nextID = st.NextID
+	for _, s := range st.Sessions {
+		d.nodes[s.Node] = s
+	}
+	return nil
+}
+
+func (d *daemon) saveLocked() {
+	st := savedState{NextID: d.nextID}
+	for _, n := range d.sortedLocked() {
+		st.Sessions = append(st.Sessions, n)
+	}
+	data, _ := json.MarshalIndent(st, "", "  ")
+	path := filepath.Join(d.stateDir, "state.json")
+	err := os.MkdirAll(d.stateDir, 0o700)
+	if err == nil {
+		err = os.WriteFile(path+".tmp", data, 0o600)
+	}
+	if err == nil {
+		err = os.Rename(path+".tmp", path)
+	}
+	if err != nil {
+		log.Printf("saving state: %v", err)
+	}
+}
+
+func (d *daemon) sortedLocked() []*Session {
+	nodes := make([]*Session, 0, len(d.nodes))
+	for _, n := range d.nodes {
+		nodes = append(nodes, n)
+	}
+	slices.SortFunc(nodes, func(a, b *Session) int { return strings.Compare(a.Node, b.Node) })
+	return nodes
+}
+
+func (s *Session) public() Session {
+	c := *s
+	c.pre = nil
+	return c
+}
+
+func (d *daemon) serve(ln net.Listener) {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go d.handleConn(conn)
+	}
+}
+
+type out struct {
+	mu  sync.Mutex
+	enc *json.Encoder
+}
+
+func (o *out) send(r Response) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	_ = o.enc.Encode(r)
+}
+
+// handleConn answers each request on conn in turn. The connection closing cancels the request in flight, which withdraws its decision.
+func (d *daemon) handleConn(conn net.Conn) {
+	defer conn.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	reqs := make(chan Request)
+	go func() {
+		defer cancel()
+		dec := json.NewDecoder(conn)
+		for {
+			var r Request
+			if dec.Decode(&r) != nil {
+				return
+			}
+			select {
+			case reqs <- r:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	o := &out{enc: json.NewEncoder(conn)}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case r := <-reqs:
+			if r.Op == "watch" {
+				d.watch(ctx, cancel, o)
+				continue
+			}
+			o.send(d.handle(ctx, r))
+		}
+	}
+}
+
+func (d *daemon) handle(ctx context.Context, r Request) Response {
+	resp := Response{Type: "result"}
+	var err error
+	switch r.Op {
+	case "hook":
+		resp, err = d.hook(ctx, r.Node, r.Hook)
+	case "ask":
+		resp.Text, err = d.ask(ctx, r.Node, r.Text)
+	case "next_event":
+		if r.Node != masterNode {
+			err = errors.New("only the master waits for events")
+		} else {
+			resp.Events = d.nextEvent(ctx)
+		}
+	case "approve":
+		err = d.answer(r.Node, r.ID, "permission", answer{behavior: "allow"})
+	case "deny":
+		err = d.answer(r.Node, r.ID, "permission", answer{behavior: "deny", text: r.Text})
+	case "reply":
+		err = d.answer(r.Node, r.ID, "question", answer{text: r.Text})
+	case "escalate":
+		err = d.escalate(r.Node, r.ID, r.Text)
+	case "tell":
+		err = d.tell(r.Text)
+	case "spawn":
+		resp.Session, err = d.spawn(r.Node, r.Name, r.Repo, r.Text)
+	case "kill":
+		err = d.kill(r.Name)
+	case "status":
+		d.mu.Lock()
+		resp = d.snapshotLocked()
+		d.mu.Unlock()
+	default:
+		err = fmt.Errorf("unknown op %q", r.Op)
+	}
+	resp.Type = cmp.Or(resp.Type, "result")
+	if err != nil {
+		resp.Error = err.Error()
+	}
+	return resp
+}
+
+type hookInput struct {
+	Event       string          `json:"hook_event_name"`
+	SessionID   string          `json:"session_id"`
+	ToolName    string          `json:"tool_name"`
+	ToolInput   json.RawMessage `json:"tool_input"`
+	ToolUseID   string          `json:"tool_use_id"`
+	LastMessage string          `json:"last_assistant_message"`
+}
+
+// hook handles one hook event of a session. It blocks while a decision it opened waits, and answers with no behavior when the decision is withdrawn.
+func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Response, error) {
+	resp := Response{Type: "result"}
+	var in hookInput
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return resp, fmt.Errorf("hook input: %w", err)
+	}
+	d.mu.Lock()
+	n := d.nodes[node]
+	if n == nil {
+		d.mu.Unlock()
+		return resp, fmt.Errorf("unknown node %q", node)
+	}
+	if n.SessionID == "" {
+		n.SessionID = in.SessionID
+	}
+	var dec *Decision
+	switch in.Event {
+	case "PreToolUse":
+		// A permission still open from an earlier call was denied in the session's own prompt, which runs no tool.
+		d.withdrawLocked(node, func(dec *Decision) bool { return dec.toolUseID != in.ToolUseID })
+		if n.pre == nil {
+			n.pre = map[string]preCall{}
+		}
+		n.pre[in.ToolUseID] = preCall{in.ToolName, compact(in.ToolInput)}
+		if reason := reservedAction(in.ToolName, in.ToolInput, n.Dir); reason != "" {
+			dec = &Decision{Kind: "permission", Node: node, Holder: "user", Reserved: reason, Tool: in.ToolName, Input: in.ToolInput, toolUseID: in.ToolUseID}
+		}
+	case "PermissionRequest":
+		holder := "master"
+		if node == masterNode {
+			holder = "user"
+		}
+		dec = &Decision{Kind: "permission", Node: node, Holder: holder, Tool: in.ToolName, Input: in.ToolInput, toolUseID: n.match(in.ToolName, in.ToolInput)}
+	case "PostToolUse", "PostToolUseFailure":
+		delete(n.pre, in.ToolUseID)
+		d.withdrawLocked(node, func(dec *Decision) bool { return dec.toolUseID == in.ToolUseID })
+	case "Stop":
+		n.pre = nil
+		d.withdrawLocked(node, func(*Decision) bool { return true })
+		if node != masterNode {
+			d.pushLocked(Event{Kind: "turn_end", Node: node, Text: in.LastMessage})
+		}
+	}
+	if dec != nil {
+		d.openLocked(dec)
+	}
+	d.mu.Unlock()
+	if dec == nil {
+		return resp, nil
+	}
+	if a, ok := d.wait(ctx, dec); ok {
+		resp.Behavior, resp.Text = a.behavior, a.text
+	}
+	return resp, nil
+}
+
+// match finds the tool_use_id of the PreToolUse a PermissionRequest follows, which carries none of its own.
+func (n *Session) match(tool string, input json.RawMessage) string {
+	want := compact(input)
+	var id string
+	same := 0
+	for k, p := range n.pre {
+		if p.tool == tool && p.input == want {
+			return k
+		}
+		if p.tool == tool {
+			id = k
+			same++
+		}
+	}
+	if same == 1 {
+		return id
+	}
+	return ""
+}
+
+func compact(raw json.RawMessage) string {
+	var b bytes.Buffer
+	if json.Compact(&b, raw) != nil {
+		return string(raw)
+	}
+	return b.String()
+}
+
+func (d *daemon) ask(ctx context.Context, node, question string) (string, error) {
+	if question == "" {
+		return "", errors.New("the question is empty")
+	}
+	d.mu.Lock()
+	if d.nodes[node] == nil || node == masterNode {
+		d.mu.Unlock()
+		return "", errors.New("only a worker asks")
+	}
+	dec := &Decision{Kind: "question", Node: node, Holder: "master", Question: question}
+	d.openLocked(dec)
+	d.mu.Unlock()
+	a, ok := d.wait(ctx, dec)
+	if !ok {
+		return "", errors.New("the question was withdrawn")
+	}
+	return a.text, nil
+}
+
+func (d *daemon) openLocked(dec *Decision) {
+	d.nextID++
+	dec.ID = strconv.Itoa(d.nextID)
+	dec.answer = make(chan answer, 1)
+	d.decisions[dec.ID] = dec
+	d.saveLocked()
+	c := *dec
+	d.broadcastLocked(Event{Kind: "decision", Decision: &c})
+	if dec.Holder == "master" {
+		d.pushLocked(Event{Kind: "decision", Decision: &c})
+	}
+	log.Printf("decision %s: %s from %s, for the %s", dec.ID, dec.Kind, dec.Node, dec.Holder)
+}
+
+func (d *daemon) wait(ctx context.Context, dec *Decision) (answer, bool) {
+	select {
+	case a := <-dec.answer:
+		return a, !a.withdrawn
+	case <-ctx.Done():
+		d.mu.Lock()
+		if d.decisions[dec.ID] == dec {
+			d.settleLocked(dec, answer{withdrawn: true})
+		}
+		d.mu.Unlock()
+		return answer{}, false
+	}
+}
+
+func (d *daemon) settleLocked(dec *Decision, a answer) {
+	delete(d.decisions, dec.ID)
+	dec.answer <- a
+	d.broadcastLocked(Event{Kind: "settled", ID: dec.ID})
+	if a.withdrawn {
+		log.Printf("decision %s: withdrawn", dec.ID)
+	} else {
+		log.Printf("decision %s: answered %s", dec.ID, cmp.Or(a.behavior, "with text"))
+	}
+}
+
+// withdrawLocked settles the node's open permissions that match, except reserved ones, whose hook still blocks the call.
+func (d *daemon) withdrawLocked(node string, match func(*Decision) bool) {
+	for _, dec := range d.decisions {
+		if dec.Node == node && dec.Kind == "permission" && dec.Reserved == "" && match(dec) {
+			d.settleLocked(dec, answer{withdrawn: true})
+		}
+	}
+}
+
+// answer settles a decision for caller: the master for a decision it holds, or "" for the user, who may answer any.
+func (d *daemon) answer(caller, id, kind string, a answer) error {
+	if caller != "" && caller != masterNode {
+		return errors.New("only the master or the user answers")
+	}
+	if kind == "question" && a.text == "" {
+		return errors.New("the answer is empty")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	dec := d.decisions[id]
+	switch {
+	case dec == nil:
+		return fmt.Errorf("no open decision %s", id)
+	case dec.Kind != kind:
+		return fmt.Errorf("decision %s is a %s", id, dec.Kind)
+	case caller == masterNode && dec.Holder != "master":
+		return fmt.Errorf("decision %s waits on the user", id)
+	}
+	if a.behavior == "deny" && a.text == "" {
+		a.text = "The user denied this."
+		if caller == masterNode {
+			a.text = "The bosun master denied this."
+		}
+	}
+	d.settleLocked(dec, a)
+	return nil
+}
+
+func (d *daemon) escalate(caller, id, note string) error {
+	if caller != masterNode {
+		return errors.New("only the master escalates")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	dec := d.decisions[id]
+	if dec == nil {
+		return fmt.Errorf("no open decision %s", id)
+	}
+	if dec.Holder != "master" {
+		return fmt.Errorf("decision %s already waits on the user", id)
+	}
+	dec.Holder, dec.Note = "user", note
+	c := *dec
+	d.broadcastLocked(Event{Kind: "decision", Decision: &c})
+	log.Printf("decision %s: escalated", id)
+	return nil
+}
+
+func (d *daemon) tell(text string) error {
+	if text == "" {
+		return errors.New("nothing to tell")
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.pushLocked(Event{Kind: "tell", Text: text})
+	return nil
+}
+
+func (d *daemon) pushLocked(ev Event) {
+	d.events = append(d.events, ev)
+	close(d.wake)
+	d.wake = make(chan struct{})
+}
+
+// nextEvent waits for the master's events and returns them all, leaving out decisions settled or escalated since.
+func (d *daemon) nextEvent(ctx context.Context) []Event {
+	timer := time.NewTimer(idleReturn)
+	defer timer.Stop()
+	for {
+		d.mu.Lock()
+		var evs []Event
+		for _, ev := range d.events {
+			if ev.Decision != nil {
+				if cur := d.decisions[ev.Decision.ID]; cur == nil || cur.Holder != "master" {
+					continue
+				}
+			}
+			evs = append(evs, ev)
+		}
+		d.events = nil
+		wake := d.wake
+		d.mu.Unlock()
+		if len(evs) > 0 {
+			return evs
+		}
+		select {
+		case <-wake:
+		case <-timer.C:
+			return nil
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+func (d *daemon) watch(ctx context.Context, cancel context.CancelFunc, o *out) {
+	w := &watcher{ch: make(chan Event, 256), cancel: cancel}
+	d.mu.Lock()
+	d.watchers[w] = true
+	snap := d.snapshotLocked()
+	d.mu.Unlock()
+	o.send(snap)
+	go func() {
+		defer func() {
+			d.mu.Lock()
+			delete(d.watchers, w)
+			d.mu.Unlock()
+		}()
+		for {
+			select {
+			case ev := <-w.ch:
+				o.send(Response{Type: "event", Event: &ev})
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
+// broadcastLocked tells every frontend, and drops one too slow to keep up rather than block.
+func (d *daemon) broadcastLocked(ev Event) {
+	for w := range d.watchers {
+		select {
+		case w.ch <- ev:
+		default:
+			w.cancel()
+			delete(d.watchers, w)
+		}
+	}
+}
+
+func (d *daemon) broadcastSessionsLocked() {
+	ev := Event{Kind: "sessions"}
+	for _, n := range d.sortedLocked() {
+		ev.Sessions = append(ev.Sessions, n.public())
+	}
+	d.broadcastLocked(ev)
+}
+
+func (d *daemon) snapshotLocked() Response {
+	resp := Response{Type: "snapshot", Sessions: []Session{}, Decisions: []Decision{}}
+	for _, n := range d.sortedLocked() {
+		resp.Sessions = append(resp.Sessions, n.public())
+	}
+	for _, dec := range d.decisions {
+		resp.Decisions = append(resp.Decisions, *dec)
+	}
+	slices.SortFunc(resp.Decisions, func(a, b Decision) int {
+		x, _ := strconv.Atoi(a.ID)
+		y, _ := strconv.Atoi(b.ID)
+		return x - y
+	})
+	return resp
+}
+
+// spawn starts a child of caller, or of the master when a frontend asks. A child of the master needs repo; a deeper one branches from its parent's worktree.
+func (d *daemon) spawn(caller, name, repo, prompt string) (*Session, error) {
+	caller = cmp.Or(caller, masterNode)
+	if !nodeName.MatchString(name) || name == masterNode {
+		return nil, fmt.Errorf("invalid node name %q: use lowercase letters, digits and hyphens", name)
+	}
+	if prompt == "" {
+		return nil, errors.New("the prompt is empty")
+	}
+	d.mu.Lock()
+	parent := d.nodes[caller]
+	if parent == nil {
+		d.mu.Unlock()
+		return nil, fmt.Errorf("unknown node %q", caller)
+	}
+	dir, root := parent.Dir, parent.Repo
+	d.mu.Unlock()
+	if caller == masterNode {
+		if repo == "" {
+			return nil, errors.New("a worker the master starts needs a repo")
+		}
+		var err error
+		if dir, err = filepath.Abs(repo); err != nil {
+			return nil, err
+		}
+		if root, err = repoRoot(dir); err != nil {
+			return nil, err
+		}
+	}
+	worktree := filepath.Join(root, ".claude", "worktrees", name)
+	if _, err := os.Stat(worktree); err == nil {
+		return nil, fmt.Errorf("%s already exists", worktree)
+	}
+
+	d.mu.Lock()
+	err := d.admitLocked(caller, name)
+	if err == nil {
+		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Depth: d.nodes[caller].Depth + 1, Status: "starting"}
+		d.started[name] = time.Now()
+	}
+	n := d.nodes[name]
+	d.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+
+	id, err := d.start(name, dir, []string{"-w", name}, workerPrompt(name), prompt)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err != nil {
+		delete(d.nodes, name)
+		return nil, err
+	}
+	n.ID = id
+	d.saveLocked()
+	d.broadcastSessionsLocked()
+	log.Printf("spawned %s (%s) under %s", name, id, caller)
+	c := n.public()
+	return &c, nil
+}
+
+// admitLocked applies the caps on depth and fan-out. Node names are unique across the daemon, which keeps them unique within each repository.
+func (d *daemon) admitLocked(parent, name string) error {
+	if d.nodes[name] != nil {
+		return fmt.Errorf("node %q exists", name)
+	}
+	if d.nodes[parent].Depth >= maxDepth {
+		return fmt.Errorf("%s is at the depth cap of %d", parent, maxDepth)
+	}
+	live := 0
+	for _, n := range d.nodes {
+		if n.Parent == parent && n.Status != "exited" {
+			live++
+		}
+	}
+	if live >= maxChildren {
+		return fmt.Errorf("%s already runs %d children", parent, maxChildren)
+	}
+	return nil
+}
+
+func repoRoot(dir string) (string, error) {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "--path-format=absolute", "--git-common-dir").Output()
+	if err != nil {
+		return "", fmt.Errorf("%s is not in a git repository", dir)
+	}
+	return filepath.Dir(strings.TrimSpace(string(out))), nil
+}
+
+// start runs `claude --bg` for node in dir, with bosun's settings and MCP server.
+func (d *daemon) start(node, dir string, extra []string, system, prompt string) (string, error) {
+	settings, mcp, err := d.writeConfig(node)
+	if err != nil {
+		return "", err
+	}
+	args := append([]string{"--bg", "-n", node}, extra...)
+	args = append(args, "--settings", settings, "--mcp-config", mcp, "--append-system-prompt", system, "--", prompt)
+	return d.claude.Start(dir, args)
+}
+
+type hookCommand struct {
+	Type    string `json:"type"`
+	Command string `json:"command"`
+	Timeout int    `json:"timeout,omitempty"`
+}
+
+type hookGroup struct {
+	Hooks []hookCommand `json:"hooks"`
+}
+
+func (d *daemon) writeConfig(node string) (settingsPath, mcpPath string, err error) {
+	dir := filepath.Join(d.stateDir, "nodes", node)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", "", err
+	}
+	command := fmt.Sprintf("BOSUN_NODE=%s BOSUN_SOCKET=%s %s hook", node, shellQuote(d.socket), shellQuote(d.exe))
+	hold := []hookGroup{{Hooks: []hookCommand{{Type: "command", Command: command, Timeout: int(holdTimeout / time.Second)}}}}
+	quick := []hookGroup{{Hooks: []hookCommand{{Type: "command", Command: command}}}}
+	permissions := map[string][]string{"allow": {"mcp__bosun"}}
+	if node != masterNode {
+		permissions["deny"] = []string{"AskUserQuestion"}
+	}
+	settings := map[string]any{
+		"worktree":    map[string]string{"baseRef": "head"},
+		"permissions": permissions,
+		// Claude Code moves an MCP call still running after 120 seconds to the background, so ask and next_event would stop blocking the turn.
+		// The server option disableAutoBackground does not help: it applies only to SDK servers.
+		"env": map[string]string{"CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS": "0"},
+		"hooks": map[string]any{
+			"PreToolUse":         hold,
+			"PermissionRequest":  hold,
+			"PostToolUse":        quick,
+			"PostToolUseFailure": quick,
+			"Stop":               quick,
+		},
+	}
+	mcp := map[string]any{"mcpServers": map[string]any{"bosun": map[string]any{
+		"type":       "stdio",
+		"command":    d.exe,
+		"args":       []string{"mcp"},
+		"env":        map[string]string{"BOSUN_NODE": node, "BOSUN_SOCKET": d.socket},
+		"alwaysLoad": true,
+	}}}
+	settingsPath = filepath.Join(dir, "settings.json")
+	mcpPath = filepath.Join(dir, "mcp.json")
+	if err := writeJSON(settingsPath, settings); err != nil {
+		return "", "", err
+	}
+	return settingsPath, mcpPath, writeJSON(mcpPath, mcp)
+}
+
+func writeJSON(path string, v any) error {
+	data, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+func (d *daemon) kill(name string) error {
+	d.mu.Lock()
+	n := d.nodes[name]
+	var id string
+	if n != nil {
+		id = n.ID
+	}
+	d.mu.Unlock()
+	switch {
+	case n == nil:
+		return fmt.Errorf("unknown node %q", name)
+	case id == "":
+		return fmt.Errorf("%s is still starting", name)
+	}
+	return d.claude.Stop(id)
+}
+
+// ensureMaster adopts the master of an earlier run while Claude Code still lists it, and starts one otherwise.
+func (d *daemon) ensureMaster() error {
+	agents, err := d.claude.Agents()
+	if err != nil {
+		return err
+	}
+	d.mu.Lock()
+	if m := d.nodes[masterNode]; m != nil && slices.ContainsFunc(agents, func(a agent) bool { return a.ID == m.ID }) {
+		d.mu.Unlock()
+		return nil
+	}
+	m := &Session{Node: masterNode, Dir: d.masterDir, Status: "starting"}
+	d.nodes[masterNode] = m
+	d.started[masterNode] = time.Now()
+	d.mu.Unlock()
+	if err := os.MkdirAll(d.masterDir, 0o700); err != nil {
+		return err
+	}
+	id, err := d.start(masterNode, d.masterDir, nil, masterPrompt, "Call next_event to begin.")
+	if err != nil {
+		return fmt.Errorf("starting the master in %s, which Claude Code must trust: %w", d.masterDir, err)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	m.ID = id
+	d.saveLocked()
+	d.broadcastSessionsLocked()
+	log.Printf("started the master (%s) in %s", id, d.masterDir)
+	return nil
+}
+
+// poll refreshes each session from `claude agents --json`, and tells the master of a worker that stopped being listed.
+func (d *daemon) poll() {
+	agents, err := d.claude.Agents()
+	if err != nil {
+		log.Print(err)
+		return
+	}
+	byID := map[string]agent{}
+	for _, a := range agents {
+		byID[a.ID] = a
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	changed := false
+	for _, n := range d.nodes {
+		if n.ID == "" {
+			continue
+		}
+		status, state := "exited", ""
+		a, listed := byID[n.ID]
+		switch {
+		case listed:
+			status, state = a.Status, a.State
+			n.SessionID = cmp.Or(n.SessionID, a.SessionID)
+		case n.Status == "starting" && time.Since(d.started[n.Node]) < startGrace:
+			continue
+		}
+		if status == n.Status && state == n.State {
+			continue
+		}
+		if status == "exited" && n.Node != masterNode {
+			d.pushLocked(Event{Kind: "exit", Node: n.Node})
+			log.Printf("%s exited", n.Node)
+		}
+		n.Status, n.State = status, state
+		changed = true
+	}
+	if changed {
+		d.saveLocked()
+		d.broadcastSessionsLocked()
+	}
+}

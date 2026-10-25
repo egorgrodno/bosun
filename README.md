@@ -2,13 +2,27 @@
 
 A master Claude Code session that runs a tree of worker sessions. It answers their routine questions and brings you the rest. A Quickshell panel drives it on the NixOS desktops, and a TUI drives it everywhere else.
 
-**Nothing is built yet.** [CLAUDE.md](CLAUDE.md) holds the design.
+[CLAUDE.md](CLAUDE.md) holds the design. The daemon and a command-line frontend work. The TUI and the panel are not built.
 
 ## Scope
 
 - **Claude Code only.** Every session is a `claude --bg` background session.
 - **One machine, one fleet.** The daemon listens on a unix socket and never on the network.
 - **No process ownership.** Claude Code starts, attaches, stops and lists sessions. bosun never holds a PTY.
+
+## Usage
+
+By default the daemon runs the master in `~/.local/state/bosun/master`. Claude Code must trust that directory, and every repository a worker starts in. Run `claude` in each once and accept the prompt.
+
+```sh
+bosun daemon &
+bosun tell 'Fix the flaky test in ~/Projects/app'
+bosun status      # the decisions waiting, then the tree
+bosun approve 3
+claude attach <id>
+```
+
+`bosun` alone lists every command.
 
 ## Development
 
@@ -17,4 +31,5 @@ direnv allow     # or: nix develop
 git config core.hooksPath .githooks
 nix fmt
 nix flake check
+go test ./...
 ```
