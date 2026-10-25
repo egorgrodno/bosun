@@ -46,6 +46,9 @@ const (
 // idleWait bounds how long resume waits for a worker to be listed idle, which it is not until its Stop hook returns.
 var idleWait = 30 * time.Second
 
+// stopWait bounds how long a resume waits for the session it stopped to leave the listing.
+const stopWait = 10 * time.Second
+
 var errInTurn = errors.New("still in its turn")
 
 // eventsWaiting is the prompt that wakes the master, and the reason a block of its Stop gives.
@@ -1114,6 +1117,9 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	next := id
 	err = d.claude.Stop(id)
 	if err == nil {
+		err = d.awaitGone(ctx, name, id)
+	}
+	if err == nil {
 		next, err = d.claude.Start(dir, []string{"--bg", "--resume", a.SessionID, "--", prompt})
 	}
 	d.mu.Lock()
@@ -1128,6 +1134,29 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	d.broadcastSessionsLocked()
 	log.Printf("resumed %s (%s)", name, next)
 	return nil
+}
+
+// awaitGone waits until Claude Code no longer lists the session id.
+// claude stop may return before the supervisor settles the session, and a resume before then starts a copy without the session's options.
+func (d *daemon) awaitGone(ctx context.Context, name, id string) error {
+	deadline := time.Now().Add(stopWait)
+	for {
+		agents, err := d.claude.Agents()
+		if err != nil {
+			return err
+		}
+		if !slices.ContainsFunc(agents, func(a agent) bool { return a.ID == id }) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%s is still listed %v after claude stop", name, stopWait)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
 
 // awaitIdle waits until Claude Code lists the session id as idle, and returns its listing.

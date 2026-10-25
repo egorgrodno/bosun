@@ -26,6 +26,10 @@ type fakeClaude struct {
 	removed    []string
 	fail       func(args []string) error
 	supervisor int
+	// linger keeps a stopped session listed for that many more listings, as Claude Code does until its supervisor settles it.
+	linger       int
+	stopping     map[string]int
+	resumedEarly bool
 }
 
 func (f *fakeClaude) Supervisor() (int, error) {
@@ -39,6 +43,9 @@ func (f *fakeClaude) Start(dir string, args []string) (string, error) {
 	defer f.mu.Unlock()
 	f.starts = append(f.starts, args)
 	f.dirs = append(f.dirs, dir)
+	if slices.Contains(args, "--resume") && len(f.stopping) > 0 {
+		f.resumedEarly = true
+	}
 	if f.fail != nil {
 		if err := f.fail(args); err != nil {
 			return "", err
@@ -78,12 +85,27 @@ func argAfter(args []string, name string) string {
 func (f *fakeClaude) Agents() ([]agent, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	for id, n := range f.stopping {
+		if n > 0 {
+			f.stopping[id] = n - 1
+			continue
+		}
+		delete(f.stopping, id)
+		f.agents = slices.DeleteFunc(f.agents, func(a agent) bool { return a.ID == id })
+	}
 	return slices.Clone(f.agents), nil
 }
 
 func (f *fakeClaude) Stop(id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.linger > 0 {
+		if f.stopping == nil {
+			f.stopping = map[string]int{}
+		}
+		f.stopping[id] = f.linger
+		return nil
+	}
 	f.agents = slices.DeleteFunc(f.agents, func(a agent) bool { return a.ID == id })
 	return nil
 }
@@ -487,6 +509,7 @@ func TestResume(t *testing.T) {
 	}
 	fc.mu.Lock()
 	fc.agents[len(fc.agents)-1].Status = "idle"
+	fc.linger = 2
 	fc.mu.Unlock()
 	if _, err := call(context.Background(), Request{Op: "resume", Node: "a", Name: "a", Text: "x"}); err == nil {
 		t.Fatal("a worker resumed itself")
@@ -496,12 +519,13 @@ func TestResume(t *testing.T) {
 	fc.mu.Lock()
 	dir := fc.dirs[len(fc.dirs)-1]
 	stopped := !slices.ContainsFunc(fc.agents, func(a agent) bool { return a.ID == "aaaaaaaa" })
+	early := fc.resumedEarly
 	fc.mu.Unlock()
 	if args := fc.lastStart(); dir != worktree || !slices.Equal(args, []string{"--bg", "--resume", "s-a", "--", "fix the review"}) {
 		t.Fatalf("claude ran in %s with %q", dir, args)
 	}
-	if !stopped {
-		t.Fatal("the worker was resumed without being stopped, which starts a copy")
+	if !stopped || early {
+		t.Fatalf("the worker was resumed while still listed, which starts a copy: stopped %v, resumed early %v", stopped, early)
 	}
 	d.poll()
 	d.mu.Lock()

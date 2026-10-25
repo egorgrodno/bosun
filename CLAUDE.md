@@ -28,7 +28,7 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Spawning.** `spawn` runs `claude --bg -n <node> -w <node>` with `--settings` and `--mcp-config`. The settings carry the hooks and `worktree.baseRef: head`. Sessions started outside bosun load nothing from it.
 
-**Resuming.** A stopped `--bg` session keeps its options, model included. `claude --bg --resume <session-id>` without flags continues it under the same id. A prompt after `--` starts its next turn. With any flag, the command starts a copy of the conversation under a new id.
+**Resuming.** A stopped `--bg` session keeps its options, model included. `claude --bg --resume <session-id>` without flags continues it under the same id. A prompt after `--` starts its next turn. With any flag, the command starts a copy of the conversation under a new id. So does a resume of a session still running, which one is for a moment after `claude stop` returns, until `claude agents --json` stops listing it.
 
 **Upgrades.** A session reads its settings and MCP config only when its process starts. Both run bosun through `bosun` in the state directory, a link that each daemon start points at its own binary, and each start rewrites every session's settings.
 
