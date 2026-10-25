@@ -22,8 +22,20 @@
     {
       formatter = forAllSystems (pkgs: (treefmtEval pkgs).config.build.wrapper);
 
+      packages = forAllSystems (pkgs: {
+        default = pkgs.buildGoModule {
+          pname = "bosun";
+          version = self.shortRev or "dirty";
+          src = self;
+          vendorHash = null;
+          nativeCheckInputs = [ pkgs.git ];
+          meta.mainProgram = "bosun";
+        };
+      });
+
       checks = forAllSystems (pkgs: {
         formatting = (treefmtEval pkgs).config.build.check self;
+        package = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
       });
 
       devShells = forAllSystems (pkgs: {
