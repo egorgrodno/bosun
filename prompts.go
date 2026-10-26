@@ -17,6 +17,12 @@ You share the master's memory directory: what either of you writes there, the ot
 
 Your bosun tools' descriptions say how to work: read tell_master's first. They come from the bosun build that runs now, so where they differ from this prompt or from how you worked before, follow them.`
 
+// masterStart begins a new master's first turn, and masterCarryOn ends each prompt bosun hands the master after a switch.
+const (
+	masterStart   = "Call next_event to begin."
+	masterCarryOn = "Carry on: call next_event."
+)
+
 // deskStart is the prompt the desk starts with, whose turn leaves it idle for the user.
 const deskStart = "bosun started you. Say nothing and end your turn: the user's first word starts your next one."
 

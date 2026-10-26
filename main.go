@@ -17,6 +17,9 @@ const usage = `usage:
   bosun tui                        the decisions waiting and the tree, in the terminal
   bosun status [--json]            the decisions waiting, and the tree
   bosun watch                      stream the daemon's snapshot and events
+  bosun conversation [-before ID] [-limit N] NAME
+                                   print a session's latest conversation entries, or those before entry ID, as JSON
+  bosun follow [-limit N] NAME     stream a session's conversation as JSON lines: its latest entries, then each new one
   bosun approve ID                 allow a permission
   bosun deny ID [MESSAGE]          deny a permission
   bosun reply ID ANSWER            answer a question
@@ -51,6 +54,8 @@ func main() {
 		err = runStatus(args)
 	case "watch":
 		err = runWatch()
+	case "conversation", "follow":
+		err = runConversation(cmd, args)
 	case "tui":
 		err = runTUI()
 	case "attach":

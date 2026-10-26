@@ -27,8 +27,11 @@ type Request struct {
 	Effort string `json:"effort,omitempty"`
 	Text   string `json:"text,omitempty"`
 	// Turns is how many of a session's last turns a transcript shows.
-	Turns int             `json:"turns,omitempty"`
-	Hook  json.RawMessage `json:"hook,omitempty"`
+	Turns int `json:"turns,omitempty"`
+	// Before and Limit pick the entries of a session's conversation that a conversation or follow request returns: the last Limit before the one with ID Before.
+	Before string          `json:"before,omitempty"`
+	Limit  int             `json:"limit,omitempty"`
+	Hook   json.RawMessage `json:"hook,omitempty"`
 	// Words quotes the user's message that the desk's answer to a decision acts on.
 	Words string `json:"words,omitempty"`
 	// Plugins and Connectors are what a spawn adds to the worker's lean start.
@@ -55,6 +58,16 @@ type Response struct {
 	Paused    bool       `json:"paused,omitempty"`
 	// Log holds the fleet's latest entries, oldest first.
 	Log []Entry `json:"log,omitempty"`
+}
+
+// ConvLine is a line the daemon sends for a session's conversation: the "result" of a conversation request, or on a follow a "reset", then "entries" and "progress" lines.
+// Session is the Claude Code session id of the conversation, and More marks entries older than those sent.
+type ConvLine struct {
+	Type    string `json:"type"`
+	Error   string `json:"error,omitempty"`
+	Session string `json:"session,omitempty"`
+	Entries []Said `json:"entries,omitempty"`
+	More    bool   `json:"more,omitempty"`
 }
 
 // Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, tell and message; the desk gets tell; a frontend gets decision, settled, answered, sessions, activity, message, paused, unpaused and log.
@@ -181,6 +194,8 @@ type Session struct {
 	Taken  []Event `json:"taken,omitempty"`
 	// LimitedUntil is when the usage limit that stopped the session resets, and the daemon resumes it.
 	LimitedUntil *time.Time `json:"limitedUntil,omitempty"`
+	// Prompts holds the latest prompts that another session or the user handed the session through bosun, for its conversation to name who sent each.
+	Prompts []sentPrompt `json:"prompts,omitempty"`
 	// Unseen marks a desk that bosun handed a tell or an answer since the user last opened it, so its reply may wait there unread.
 	Unseen bool `json:"unseen,omitempty"`
 

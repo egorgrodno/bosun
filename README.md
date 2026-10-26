@@ -25,6 +25,8 @@ bosun attach <id>
 
 `bosun` alone lists every command. `bosun pause` stops every session, such as before a reboot, and `bosun unpause` resumes the turns it cut. `bosun model -effort low desk sonnet` moves the desk to another model and effort, keeping its conversation, and `m` in `bosun tui` does the same for the master or the desk.
 
+`bosun follow <node>` streams a session's conversation as JSON lines for a frontend, and `bosun conversation -before <id> <node>` pages back through it.
+
 Talk to the desk: type into it through `bosun attach`, or send it a line with `bosun tell`. The master and the desk refuse messages from your other Claude Code sessions, though the sender's `SendMessage` reports success.
 
 The flake's default package builds `bosun`, so `nix run github:egorgrodno/bosun -- daemon` runs the daemon. As a systemd user service, the daemon needs `KillMode=process`, so that stopping the daemon leaves the sessions running.

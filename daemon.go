@@ -449,8 +449,40 @@ func (d *daemon) sortedLocked() []*Session {
 
 func (s *Session) public() Session {
 	c := *s
-	c.pre, c.Events, c.Taken = nil, nil, nil
+	c.pre, c.Events, c.Taken, c.Prompts = nil, nil, nil, nil
 	return c
+}
+
+// sentPrompt is a prompt that From handed a session, known by its promptSum.
+type sentPrompt struct {
+	Sum  string `json:"sum"`
+	From string `json:"from"`
+}
+
+// keptPrompts is how many of a session's latest handed prompts it keeps.
+const keptPrompts = 32
+
+// handedLocked notes that from handed the session prompt.
+func (s *Session) handedLocked(from, prompt string) {
+	s.Prompts = append(s.Prompts, sentPrompt{promptSum(prompt), from})
+	s.Prompts = s.Prompts[max(0, len(s.Prompts)-keptPrompts):]
+}
+
+// senderOf returns who handed session node the prompt text, or "" when nobody did through bosun.
+func (d *daemon) senderOf(node string) func(string) string {
+	return func(text string) string {
+		sum := promptSum(text)
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if n := d.nodes[node]; n != nil {
+			for _, p := range slices.Backward(n.Prompts) {
+				if p.Sum == sum {
+					return p.From
+				}
+			}
+		}
+		return ""
+	}
 }
 
 var notAlnum = regexp.MustCompile(`[^a-zA-Z0-9]`)
@@ -551,7 +583,8 @@ type out struct {
 	enc *json.Encoder
 }
 
-func (o *out) send(r Response) {
+// send writes r, a Response or a ConvLine.
+func (o *out) send(r any) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
 	_ = o.enc.Encode(r)
@@ -584,11 +617,16 @@ func (d *daemon) handleConn(conn net.Conn) {
 		case <-ctx.Done():
 			return
 		case r := <-reqs:
-			if r.Op == "watch" {
+			switch r.Op {
+			case "watch":
 				d.watch(ctx, cancel, o)
-				continue
+			case "follow":
+				go d.follow(ctx, cancel, o, r.Name, r.Limit)
+			case "conversation":
+				o.send(d.conversation(r.Name, r.Before, r.Limit))
+			default:
+				o.send(d.handle(ctx, r))
 			}
-			o.send(d.handle(ctx, r))
 		}
 	}
 }
@@ -1922,7 +1960,7 @@ func (d *daemon) spawn(caller, name, repo, model, effort, prompt string, plugins
 	// Once a worker runs in the repository, its sandbox may have changed the setup.
 	fresh := !slices.ContainsFunc(slices.Collect(maps.Values(d.nodes)), func(s *Session) bool { return s.Repo == root })
 	if err == nil {
-		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Base: dir, BaseBranch: branch, Model: cmp.Or(model, d.workerModel), Effort: cmp.Or(effort, d.workerEffort), Plugins: plugins, Connectors: connectors, Depth: d.nodes[caller].Depth + 1, Status: "starting", Heard: time.Now()}
+		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Base: dir, BaseBranch: branch, Model: cmp.Or(model, d.workerModel), Effort: cmp.Or(effort, d.workerEffort), Plugins: plugins, Connectors: connectors, Depth: d.nodes[caller].Depth + 1, Status: "starting", Heard: time.Now(), Prompts: []sentPrompt{{promptSum(prompt), cmp.Or(spawned.From, "user")}}}
 		d.started[name] = time.Now()
 	}
 	n := d.nodes[name]
@@ -2546,6 +2584,12 @@ func (d *daemon) resume(ctx context.Context, caller, name, model, effort, prompt
 	if err := checkEffort(effort); err != nil {
 		return err
 	}
+	d.mu.Lock()
+	if n := d.nodes[name]; n != nil {
+		n.handedLocked(masterNode, prompt)
+		d.saveLocked()
+	}
+	d.mu.Unlock()
 	if err := d.carryOnAs(ctx, name, prompt, model, effort); err != nil {
 		return err
 	}
@@ -2938,7 +2982,7 @@ func (d *daemon) ensureMaster() error {
 	if err := os.MkdirAll(d.deskDir(), 0o700); err != nil {
 		return err
 	}
-	id, err := d.start(m, d.masterDir, nil, masterPrompt, "Call next_event to begin.")
+	id, err := d.start(m, d.masterDir, nil, masterPrompt, masterStart)
 	if err != nil {
 		return fmt.Errorf("starting the master in %s, which Claude Code must trust: %w", d.masterDir, err)
 	}
@@ -3070,9 +3114,9 @@ func (d *daemon) switchMaster(next *Session) error {
 	if err := d.claude.Stop(old); err != nil {
 		return err
 	}
-	id, err := d.start(next, next.Dir, []string{"--resume", sid}, masterPrompt, fmt.Sprintf("The user switched you to %s. Carry on: call next_event.", label))
+	id, err := d.start(next, next.Dir, []string{"--resume", sid}, masterPrompt, fmt.Sprintf("The user switched you to %s. %s", label, masterCarryOn))
 	if err != nil {
-		d.restoreMaster(old, pid, fmt.Sprintf("Switching you to %s failed, so you keep what you ran at. Carry on: call next_event.", label))
+		d.restoreMaster(old, pid, fmt.Sprintf("Switching you to %s failed, so you keep what you ran at. %s", label, masterCarryOn))
 		return err
 	}
 

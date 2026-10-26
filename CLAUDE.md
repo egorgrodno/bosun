@@ -21,7 +21,7 @@ One binary carries every part:
 | `bosun mcp` | the stdio MCP server each session starts, relaying to the daemon |
 | `bosun hook` | every hook each session runs |
 | `bosun tui` | the terminal frontend |
-| `bosun status`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `watch` | the command-line frontend |
+| `bosun status`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `watch`, `conversation`, `follow` | the command-line frontend |
 
 The daemon holds each session's parent and the queue of decisions waiting on an answer. It reads each session's state from `claude agents --json --all`, which also lists sessions bosun did not start.
 
@@ -250,7 +250,7 @@ A text the turn takes in gets a `queue-operation` with `operation` `remove` and 
 
 ## Frontends
 
-Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `attached`, `transcript`. Every rule lives in the daemon.
+Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `attached`, `transcript`, `conversation`, `follow`. Every rule lives in the daemon.
 
 A decision's `reserved` holds the reason it is a reserved action, such as `a force push`. Its `userOnly` marks an action on your list.
 
@@ -289,6 +289,28 @@ A `decision` entry's `by` is the role of the session that asks, or that sent the
 - `transcript` takes a node `name` and an optional `turns`, 3 by default, and returns that session's last turns in `text`.
 - `attach` clears a stale desk first, which can take most of a minute. A frontend must wait that long for the answer before it runs `claude attach`.
 - `attached` takes the `id` that `claude attach` runs on. A frontend sends it on a connection of its own and closes that connection once `claude attach` exits. The master's id holds without an answer until then, and any other gets an answer at once.
+
+**A session's conversation.** The daemon reads a session's transcript and sends it as entries. `bosun transcript` and the desk's `transcript` read through the same entries.
+
+- `conversation` takes a node `name`, and optionally `before`, an entry's `id`, and `limit`. Its result holds `session`, `entries` and `more`. `session` is the conversation's Claude Code session id. `entries` are the last `limit` entries before `before`, or the conversation's last ones. `more` marks older entries. `meta` entries count against no limit, so those among the page come along.
+- `follow` takes `name` and `limit`, on a connection of its own, and streams until the connection closes. It sends `{"type":"reset","session":"<id>"}`, then `{"type":"entries","entries":[…],"more":…}` with the last `limit` entries. After that, each `entries` line holds the entries that landed, and those already sent that changed. A change to an entry older than the first page is left out, and a `conversation` request reads it. A new conversation, or a transcript cut short, starts the stream over with a `reset`. A clear gives the master or the desk a new conversation, and a model switch any session. A session gone ends the stream with a `result` holding `error`.
+
+Every entry has `id` and `kind`, and each from a record with a `timestamp` has `at`. `id` is the record's `uuid`, or `L<line>` for a record without one. A record's entries past its first add `#<n>`, n being the index of the block each comes from. An entry that changes goes out again under its `id`, and a frontend replaces it.
+
+| `kind` | Carries | From |
+|---|---|---|
+| `prompt` | `from`, `text`, `midTurn` | a prompt, or a `queued_command` attachment, which sets `midTurn` |
+| `queued` | `text`, `taken` | a `queue-operation` `enqueue`, which a later `remove`, `dequeue` or `popAll` marks `taken` |
+| `text`, `thinking` | `text` | an assistant block |
+| `tool` | `call`, `name`, `input`, and once it lands `result`: `at`, `text`, `error`, `interrupted`, `diff` | a `tool_use` block and its `tool_result` |
+| `compact` | `summary` | a `compact_boundary` and the `isCompactSummary` record |
+| `command` | `name`, `args`, `output` | a slash command's `<command-name>` record, and its `<local-command-stdout>` or `local_command` record |
+| `meta` | `recordType`, `raw` | a record bosun knows as bookkeeping, an `isMeta` record that is no peer's message, a subagent's `isSidechain` record, or a queue operation that took nothing |
+| `unsupported` | `recordType`, `raw` | any record or content block bosun does not know |
+
+A prompt's `from` is `user`, `bosun` for a prompt bosun wrote, `claude` for Claude Code's own notification, or a node name. A node name is a peer message's sender, or the session that handed the prompt through `spawn` or `resume`. The transcript records such a prompt as the user's, so the daemon keeps a hash of each of a session's latest 32 in `state.json`. `diff` holds an edit's `structuredPatch` hunks, and one hunk of added lines for a file a write created.
+
+`recordType` is the record's `type`. For an attachment, a `system` record or a `queue-operation`, a `/` and the attachment's type, the subtype or the operation follow, as in `attachment/edited_text_file`. A block's entry has its record's type, a `/` and the block's type, as in `assistant/server_tool_use`. A line that is no JSON has `invalid JSON`. `raw` is the record or block, with each string cut to 2000 characters and `…`. A frontend shows an unknown `kind` the way it shows `unsupported`.
 
 Each leads with the queue of decisions waiting on you, above the tree. The desk is its own row above the master's tree. Under each session's row, `bosun tui` and `bosun status` show its activity as the tool, a space and the argument, or as the text. Below the tree they show the log's latest 10 entries.
 

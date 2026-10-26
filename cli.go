@@ -177,6 +177,47 @@ func runWatch() error {
 	return err
 }
 
+// runConversation prints entries of a session's conversation as a JSON line, and runFollow its new entries as JSON lines until the daemon goes away.
+func runConversation(cmd string, args []string) error {
+	flags := flag.NewFlagSet(cmd, flag.ExitOnError)
+	before := new(string)
+	if cmd == "conversation" {
+		before = flags.String("before", "", "the entry whose older entries to print")
+	}
+	limit := flags.Int("limit", convLimit, "how many entries to print, not counting meta")
+	_ = flags.Parse(args)
+	if flags.NArg() != 1 {
+		return errors.New(usage)
+	}
+	conn, err := net.Dial("unix", socketPath())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if err := json.NewEncoder(conn).Encode(Request{Op: cmd, Name: flags.Arg(0), Before: *before, Limit: *limit}); err != nil {
+		return err
+	}
+	r := bufio.NewReader(conn)
+	for {
+		line, err := r.ReadBytes('\n')
+		if err != nil {
+			if cmd == "follow" {
+				return errors.New("the daemon went away")
+			}
+			return err
+		}
+		var l ConvLine
+		_ = json.Unmarshal(line, &l)
+		_, _ = os.Stdout.Write(line)
+		if l.Type == "result" {
+			if l.Error != "" {
+				return errors.New(l.Error)
+			}
+			return nil
+		}
+	}
+}
+
 func printStatus(w io.Writer, s Response) {
 	if s.Paused {
 		fmt.Fprintln(w, "Paused: bosun unpause resumes the turns it stopped.")
