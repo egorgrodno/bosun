@@ -15,15 +15,15 @@ const convLimit = 100
 // followPoll is how often a follow reads the transcript for new records.
 var followPoll = 250 * time.Millisecond
 
-// conversationID returns the Claude Code session id of session name's current conversation.
-func (d *daemon) conversationID(name string) (string, error) {
+// conversationID returns the Claude Code session id of session name's current conversation, and the short id the supervisor knows the session by.
+func (d *daemon) conversationID(name string) (sid, short string, err error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	n := d.nodes[name]
 	if n == nil {
-		return "", fmt.Errorf("no session %q", name)
+		return "", "", fmt.Errorf("no session %q", name)
 	}
-	return cmp.Or(n.Conversation, n.SessionID), nil
+	return cmp.Or(n.Conversation, n.SessionID), n.ID, nil
 }
 
 // conversation returns up to limit entries of session name's conversation before the one with ID before, or its last ones.
@@ -32,7 +32,7 @@ func (d *daemon) conversation(name, before string, limit int) ConvLine {
 	if limit <= 0 {
 		limit = convLimit
 	}
-	sid, err := d.conversationID(name)
+	sid, _, err := d.conversationID(name)
 	if err == nil {
 		var c *conversation
 		if c, err = readConversation(sid, d.senderOf(name)); err == nil {
@@ -47,7 +47,7 @@ func (d *daemon) conversation(name, before string, limit int) ConvLine {
 }
 
 // follow sends session name's conversation until ctx ends or the session is gone: a reset and the last limit entries, then each entry as it lands or changes.
-// A new conversation, as a clear or a switch begins, sends a reset and its own last entries.
+// A new conversation, as a clear or a switch begins, sends a reset and its own last entries. Beside them go progress lines from the supervisor.
 func (d *daemon) follow(ctx context.Context, cancel context.CancelFunc, o *out, name string, limit int) {
 	defer cancel()
 	if limit <= 0 {
@@ -58,19 +58,21 @@ func (d *daemon) follow(ctx context.Context, cancel context.CancelFunc, o *out, 
 		c   *conversation
 		f   *os.File
 		// read is how far into f the whole lines reach, paged whether the reset's page went out, and first the place of the page's first entry.
-		read  int64
-		paged bool
-		first int
+		read        int64
+		paged       bool
+		first       int
+		progressing bool
 	)
 	defer func() {
 		if f != nil {
 			f.Close()
 		}
 	}()
-	tick := time.NewTicker(followPoll)
+	poll := followPoll
+	tick := time.NewTicker(poll)
 	defer tick.Stop()
 	for {
-		next, err := d.conversationID(name)
+		next, _, err := d.conversationID(name)
 		if err != nil {
 			o.send(ConvLine{Type: "result", Error: err.Error()})
 			return
@@ -107,6 +109,10 @@ func (d *daemon) follow(ctx context.Context, cancel context.CancelFunc, o *out, 
 			if es := c.flush(first); len(es) > 0 {
 				o.send(ConvLine{Type: "entries", Entries: es})
 			}
+		}
+		if paged && !progressing {
+			progressing = true
+			go d.progress(ctx, o, name, poll, resubscribeWait)
 		}
 		select {
 		case <-ctx.Done():

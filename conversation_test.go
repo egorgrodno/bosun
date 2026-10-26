@@ -3,12 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -206,8 +208,8 @@ func TestConversationEdges(t *testing.T) {
 // follow leaves out a change to an entry it never sent, and starts over on a transcript cut short.
 func TestFollowEdges(t *testing.T) {
 	d, _ := testDaemon(t)
-	followPoll = 10 * time.Millisecond
-	t.Cleanup(func() { followPoll = 250 * time.Millisecond })
+	followFast(t)
+	fakeSupervisor(t, func(op, short string) []string { return nil })
 	call := `{"type":"assistant","uuid":"a-call","message":{"content":[{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"true"}}]}}` + "\n"
 	text := `{"type":"assistant","uuid":"a-text","message":{"content":[{"type":"text","text":"Waiting."}]}}` + "\n"
 	result := `{"type":"user","uuid":"r-call","message":{"content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}}` + "\n"
@@ -323,10 +325,77 @@ func TestConversationRequest(t *testing.T) {
 	}
 }
 
+// fakeSocket is the socket of the fake supervisor that runs, which controlSocket names once a test has installed it.
+var fakeSocket struct {
+	once sync.Once
+	mu   sync.Mutex
+	name string
+}
+
+// fakeSupervisor answers on an abstract socket as Claude Code's supervisor does: serve gets each request's op and short, and returns the lines to answer with.
+func fakeSupervisor(t *testing.T, serve func(op, short string) []string) {
+	t.Helper()
+	name := fmt.Sprintf("@bosun-supervisor-%d-%s", os.Getpid(), t.Name())
+	ln, err := net.Listen("unix", name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	// A follow's goroutines outlive its test, so controlSocket changes once, and the socket it names changes under a lock.
+	fakeSocket.once.Do(func() {
+		controlSocket = func() (string, error) {
+			fakeSocket.mu.Lock()
+			defer fakeSocket.mu.Unlock()
+			if fakeSocket.name == "" {
+				return "", errors.New("no fake supervisor runs")
+			}
+			return fakeSocket.name, nil
+		}
+	})
+	fakeSocket.mu.Lock()
+	fakeSocket.name = name
+	fakeSocket.mu.Unlock()
+	t.Cleanup(func() {
+		fakeSocket.mu.Lock()
+		fakeSocket.name = ""
+		fakeSocket.mu.Unlock()
+	})
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				var req struct{ Op, Short string }
+				if json.NewDecoder(conn).Decode(&req) != nil {
+					return
+				}
+				for _, l := range serve(req.Op, req.Short) {
+					if l == "" {
+						// A blank line holds the connection open until the test ends.
+						<-t.Context().Done()
+						return
+					}
+					_, _ = conn.Write([]byte(l + "\n"))
+				}
+			}()
+		}
+	}()
+}
+
+// followFast makes a follow read the transcript every 10 ms, and resubscribe at once.
+func followFast(t *testing.T) {
+	poll, wait := followPoll, resubscribeWait
+	followPoll, resubscribeWait = 10*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { followPoll, resubscribeWait = poll, wait })
+}
+
 func TestFollow(t *testing.T) {
 	d, _ := testDaemon(t)
-	followPoll = 10 * time.Millisecond
-	t.Cleanup(func() { followPoll = 250 * time.Millisecond })
+	followFast(t)
+	fakeSupervisor(t, func(op, short string) []string { return nil })
 	data := writeProbe(t, "s-probe", 9)
 	d.mu.Lock()
 	d.nodes["a"].SessionID = "s-probe"

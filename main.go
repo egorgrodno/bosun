@@ -19,7 +19,7 @@ const usage = `usage:
   bosun watch                      stream the daemon's snapshot and events
   bosun conversation [-before ID] [-limit N] NAME
                                    print a session's latest conversation entries, or those before entry ID, as JSON
-  bosun follow [-limit N] NAME     stream a session's conversation as JSON lines: its latest entries, then each new one
+  bosun follow [-limit N] NAME     stream a session's conversation as JSON lines: its latest entries, each new one, and its turn in progress
   bosun approve ID                 allow a permission
   bosun deny ID [MESSAGE]          deny a permission
   bosun reply ID ANSWER            answer a question
