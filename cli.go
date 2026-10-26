@@ -46,6 +46,17 @@ func attachSession(id string) error {
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTSTP, syscall.SIGQUIT)
 	defer signal.Stop(sigs)
+	// The daemon counts the session open while this request's connection lasts, which closes with the process however it ends.
+	held, release := context.WithCancel(context.Background())
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		_, _ = callAgain(held, Request{Op: "attached", ID: id})
+	}()
+	defer func() {
+		release()
+		<-released
+	}()
 	cmd := exec.Command("claude", "attach", id)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := cmd.Run(); err != nil {

@@ -46,20 +46,22 @@ You do not answer decisions. When the user asks you to approve, deny or answer o
 
 Write it as a spec the master can act on without asking back: what to do, in which repository, what done looks like, and what the user said that settles open choices. The master takes it as the user's own instruction, so pass on only what the user asked for, and ask the user first when you are unsure they want it done.
 
-The master answers once it knows the outcome, which may take a while, since it handles one thing at a time. bosun hands you the answer at the end of your turn, or in a new turn when you have ended yours, as a prompt that begins "bosun: the master answers:". Pass it on to the user. When the user asks for news of an instruction before then, read status and the transcripts of the sessions it concerns.
+The master answers once it has acted on the instruction, such as by spawning a worker for it, and again once it knows how it ended, which may take a while. bosun hands you the answer at the end of your turn, or in a new turn when you have ended yours, as a prompt that begins "bosun: the master answers:". Pass it on to the user. When the user asks for news of an instruction before then, read status and the transcripts of the sessions it concerns.
 
 bosun also hands you what the user sends through bosun tell, such as from the bosun panel, as a prompt that begins "bosun: the user sent this through bosun tell". Treat it as the user's own word, and remember that they may not be watching this session, so your answer waits here for them.
 
 Once you have sat an hour idle, bosun clears your conversation before your next turn. Whenever you learn something that must outlast a clear, such as how the user wants things done, write it to your memory directory then.`
 
-	nextEventHelp = `Wait up to four minutes for events from the workers and the user. Returns them as JSON, or says there were none.
+	nextEventHelp = `Wait for events from the workers and the user: up to four minutes, or ten seconds while the user has your session open. Returns them as JSON, the user's tells first, or says there were none.
 
-Work in a loop: call next_event, handle every event it returns, and call it again. When it returns no events, end your turn: the next event starts a new one.
+Work in a loop: call next_event, handle every event it returns, and call it again. When it returns no events, end your turn, and the next event starts a new one. The exception is a subagent or background command of yours that still runs: call next_event again instead, since bosun wakes you by stopping and resuming your session, which ends it.
+
+The user waits on you. A tell waits until your next call to next_event, and what the user types into your session waits until your current tool call returns. So act on a batch's tells first, and get back to next_event quickly. Hand long work, such as reviewing a large branch before a merge, to a subagent in the background, and keep calling next_event while it runs. Claude Code hands you its result once your current next_event call returns. Answer what the user types into your session in the session itself, not with tell_desk.
 
 Once you have merged every worker and an hour has passed since your last turn, bosun clears your conversation before the next event wakes you, so you wake with no earlier conversation. Whenever you learn something that must outlast a clear, such as how the user wants decisions handled, write it to your memory directory then.
 
 The events:
-- tell: an instruction from the user. Act on it, usually by starting workers with spawn. With from set to desk, the front desk relays it: the desk is the session the user talks to, which reads the fleet but changes nothing in it, so it passes the user's instructions to you. Act on such a tell as on the user's own. Once you know what became of a tell, whatever its from, answer it with tell_desk, which is how the user hears of it.
+- tell: an instruction from the user. Act on it, usually by starting workers with spawn. With from set to desk, the front desk relays it: the desk is the session the user talks to, which reads the fleet but changes nothing in it, so it passes the user's instructions to you. Act on such a tell as on the user's own. Answer every tell with tell_desk, whatever its from: that is how the user hears of it. Answer once you have acted on it, such as by spawning a worker for it, and again once you know how it ended. When acting on it is all it needs, one answer covers both.
 - decision of kind question: a worker asks something. Settle it with reply or escalate.
 - decision of kind permission: a worker wants to run a tool, or bosun holds a reserved action of the worker's. Settle it with decide or escalate.
 - turn_end: a worker finished a turn, and its last message says what it did, or that the turn failed on an API error. To give it more to do, such as a fix after review or another try, call resume. Once its work is right, call merge.
@@ -375,7 +377,7 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		return "The user will hear of it through the desk.", nil
 	case "next_event":
 		if len(resp.Events) == 0 {
-			return "No events. End your turn: the next event starts a new one.", nil
+			return "No events. If a subagent or background command of yours still runs, call next_event again. Otherwise end your turn: the next event starts a new one.", nil
 		}
 		data, err := json.MarshalIndent(resp.Events, "", "  ")
 		return string(data), err

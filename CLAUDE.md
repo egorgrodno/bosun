@@ -132,13 +132,13 @@ In the normal flow, auto mode decides a call outside the sandbox alone. The sett
 
 **A parent hears of its children.** A worker's `turn_end` and `exit` go to its parent. The master gets them only for its own children, and for the children of a worker that `bosun kill` stopped or that has exited. A worker runs no `next_event`, so the daemon queues the reports. A parent in its turn gets them at its `Stop`, which the daemon blocks with the reports as its reason. The daemon resumes a parent between turns with the reports as its prompt. `SendMessage`'s `notify_when_idle` cannot replace this queue: the child's process holds the subscription, so a stop or resume of the child voids it, and it fires only once.
 
-**An idle master sleeps.** Once `next_event` returns empty, the master ends its turn, and the next event resumes it. So an idle master spends no turns. The daemon blocks a `Stop` that comes while events wait, which sends the master back to `next_event`. If the master stops again before calling `next_event`, the daemon lets it, queues a notice for you, and the next event resumes it. On start, the daemon adopts an idle or stopped master as asleep, unless an event waits for it.
+**An idle master sleeps.** Once `next_event` returns empty, the master ends its turn, and the next event resumes it. So an idle master spends no turns. The daemon blocks a `Stop` that comes while events wait, which sends the master back to `next_event`. If the master stops again before calling `next_event`, the daemon lets it, queues a notice for you, and the next event resumes it. On start, the daemon adopts an idle or stopped master as asleep, unless an event waits for it. A wake stops and resumes the master, which ends a subagent or background command still running. So the master hands long work, such as a review before a merge, to a subagent in the background, and keeps calling `next_event` while it runs.
 
 **A stale master wakes cleared.** A wake past the prompt cache's hour re-reads the master's whole transcript uncached. So once the tree holds no worker and the master's transcript has gone an hour unwritten, the daemon resumes the master with `/clear` before it wakes it. What the master must keep across a clear lives in its memory directory.
 
 **Blocking tools send progress.** Claude Code aborts a stdio tool call that sends nothing for 30 seconds. While `next_event` or `ask` blocks, it sends `notifications/progress` on the call's `progressToken` every 10 seconds. Claude Code also moves a call still running after 120 seconds to the background, unless the settings' `env` sets `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` to `0`.
 
-**Typing to the master.** Text typed into a sleeping master starts its turn. Text typed while a tool call runs waits until the call returns, so `next_event` must return empty within five minutes.
+**Typing to the master.** Text typed into a sleeping master starts its turn. Text typed while a tool call runs waits until the call returns, so `next_event` must return empty within five minutes. While `bosun attach` or `bosun tui` runs `claude attach` on the master, it holds an `attached` request on the daemon, and `next_event` then returns within seconds. A bare `claude attach` holds nothing, so text typed there waits until `next_event` returns empty.
 
 ## Messages
 
@@ -184,7 +184,7 @@ A worker's parent must hear of every turn of it that ends or stops, unless a pau
 
 **The desk outlasts a restart.** On start the daemon adopts the desk while Claude Code lists it, and otherwise starts a new one that gets the old one's queue. A desk that cannot start leaves a notice.
 
-**Blocked calls outlast a restart.** While the daemon is away, a hook, `ask` and `next_event` send their request again under the same `key`. A hook does so within its own timeout, and `ask` and `next_event` for 30 seconds after they last reached the daemon. The restarted daemon hands each the decision or batch it waited on, and an escalated decision stays with you. A decision whose request has not come back 30 seconds after the start is settled. If its session still waits in its own prompt, a permission then becomes a notice, as it does a minute before the `timeout`. A call that gives up falls back: a `PreToolUse` denies its call, a `PermissionRequest` leaves it to the session's own prompt, and `ask` and `next_event` fail.
+**Blocked calls outlast a restart.** While the daemon is away, a hook, `ask`, `next_event` and `attached` send their request again under the same `key`. A hook does so within its own timeout, and the others for 30 seconds after they last reached the daemon. The restarted daemon hands each the decision or batch it waited on, and an escalated decision stays with you. A decision whose request has not come back 30 seconds after the start is settled. If its session still waits in its own prompt, a permission then becomes a notice, as it does a minute before the `timeout`. A call that gives up falls back: a `PreToolUse` denies its call, a `PermissionRequest` leaves it to the session's own prompt, and `ask` and `next_event` fail.
 
 **Missed turn ends.** Each hook of a session's turn marks it in a turn, and the daemon saves the mark. `Stop` and `StopFailure` clear it. A marked worker still listed between turns ten seconds after its last hook ended its turn unheard. Either the daemon was away, or the user interrupted the turn. An idle one reaches its parent as a `turn_end` with the last message of its transcript. A stopped one reaches it as an `exit`, or as a `turn_end` if its transcript shows the turn finished. On start, a worker counts as marked when its transcript holds a message newer than the last turn end its parent heard. That covers a turn that ran while no daemon did.
 
@@ -192,7 +192,7 @@ A worker's parent must hear of every turn of it that ends or stops, unless a pau
 
 ## Frontends
 
-Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `transcript`. Every rule lives in the daemon.
+Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `attached`, `transcript`. Every rule lives in the daemon.
 
 A decision's `reserved` holds the reason it is a reserved action, such as `a force push`.
 
@@ -203,6 +203,7 @@ In the snapshot and the `sessions` event, the desk is the session whose `node` i
 - `tell` goes to the desk, or to the master when there is no desk, and its result does not say which. During a pause it waits for `unpause`.
 - `transcript` takes a node `name` and an optional `turns`, 3 by default, and returns that session's last turns in `text`.
 - `attach` clears a stale desk first, which can take most of a minute. A frontend must wait that long for the answer before it runs `claude attach`.
+- `attached` takes the `id` that `claude attach` runs on. A frontend sends it on a connection of its own and closes that connection once `claude attach` exits. The master's id holds without an answer until then, and any other gets an answer at once.
 
 Each leads with the queue of decisions waiting on you, above the tree. The desk is its own row above the master's tree.
 
@@ -214,5 +215,6 @@ Each leads with the queue of decisions waiting on you, above the tree. The desk 
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
 - **Restarts and pauses.** Only a fake `claude` has run the restart handling and the pause. No real reboot, crash or pause has been measured. The daemon reads transcripts in the 2.1.310 format. Whether `claude stop` runs the `Stop` hook is unmeasured, so the daemon ignores a `Stop` from a session that a pause stopped.
 - **The desk.** No real desk has run. A probe session inside the master's directory measured the desk's trust, `autoMemoryDirectory` from `--settings` and the clear's transcript, and nothing more. Handing an idle desk its queue stops and resumes it, as waking the master does. Whether a `claude attach` open on it survives that is unmeasured. That a file tool's sensitive write asks even in auto mode comes from the 2.1.310 binary.
+- **The open master and its subagents.** No real `claude attach` has run under the `attached` hold. While you have the master open, it sleeps ten seconds after its last event, so a wake stops and resumes it under your `claude attach`. Whether the attach survives that is unmeasured. That a stop ends a background subagent, and that its result waits for the running tool call to return, are assumed, not measured.
 - **Reserved actions at the master.** Only the tests' fake hooks have sent one. Whether a file tool writes through a symlink, as the check assumes, is unmeasured.
 - **The allowlist.** No real session has run it. Two things are unmeasured: whether an `ask` rule sends a call outside the sandbox to `PermissionRequest` in auto mode, and whether `Bash(nixos-rebuild:*)` matches a flake with a `#host` attribute. The gate finds a push's repository from the hook's `cwd`. In the 2.1.310 binary that is the session's working directory, which a `cd` in an earlier Bash call moves, but no real session has shown it.

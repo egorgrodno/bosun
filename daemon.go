@@ -49,6 +49,9 @@ const (
 // idleWait bounds how long resume waits for a worker to be listed idle, which it is not until its Stop hook returns.
 var idleWait = 30 * time.Second
 
+// openReturn bounds next_event while the user has the master open through bosun attach, where what they type waits for the call to return.
+var openReturn = 10 * time.Second
+
 // promptAfter is how long a permission waits on the master or the user before the daemon leaves it to the session's own prompt, ahead of the hook giving up.
 var promptAfter = holdTimeout - 2*holdMargin
 
@@ -125,6 +128,9 @@ type daemon struct {
 	// taken is the batch of events that next_event, called with takenKey, last handed the master, which its next call or Stop acknowledges.
 	taken    []Event
 	takenKey string
+	// masterOpen counts the frontends running claude attach on the master, and masterOpenAt is when the first of them began.
+	masterOpen   int
+	masterOpenAt time.Time
 	// orphans holds by id the decisions of an earlier run until orphansUntil, for the hooks and asks that wait on them to send their requests again.
 	orphans      map[string]*Decision
 	orphansUntil time.Time
@@ -585,6 +591,8 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 		err = d.resume(ctx, r.Node, r.Name, r.Text)
 	case "attach":
 		err = d.attach(r.ID)
+	case "attached":
+		d.attached(ctx, r.ID)
 	case "kill":
 		err = d.kill(r.Name)
 	case "merge":
@@ -1537,11 +1545,10 @@ func (d *daemon) pendingLocked() []Event {
 	return evs
 }
 
-// nextEvent waits for an event the master acts on, and returns it with every other event waiting.
+// nextEvent waits for an event the master acts on, and returns it with every other event waiting, the user's tells first.
 // The call acknowledges the events the last call took, unless it is that call sent again under its key, which gets them again.
 func (d *daemon) nextEvent(ctx context.Context, key string) []Event {
-	timer := time.NewTimer(idleReturn)
-	defer timer.Stop()
+	begun := time.Now()
 	d.mu.Lock()
 	if key != "" && key == d.takenKey {
 		evs := d.taken
@@ -1565,22 +1572,43 @@ func (d *daemon) nextEvent(ctx context.Context, key string) []Event {
 		if !ready {
 			d.events = evs
 		} else {
+			evs = tellsFirst(evs)
 			d.taken, d.takenKey = evs, key
 			d.saveLocked()
 		}
 		wake := d.wake
+		wait := idleReturn - time.Since(begun)
+		if d.masterOpen > 0 {
+			wait = min(wait, openReturn-min(time.Since(begun), time.Since(d.masterOpenAt)))
+		}
 		d.mu.Unlock()
 		if ready {
 			return evs
 		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-wake:
+			timer.Stop()
 		case <-timer.C:
 			return nil
 		case <-ctx.Done():
+			timer.Stop()
 			return nil
 		}
 	}
+}
+
+// tellsFirst moves the tells in evs ahead of the other events, keeping the order within each.
+func tellsFirst(evs []Event) []Event {
+	var tells, rest []Event
+	for _, ev := range evs {
+		if ev.Kind == "tell" {
+			tells = append(tells, ev)
+		} else {
+			rest = append(rest, ev)
+		}
+	}
+	return append(tells, rest...)
 }
 
 func (d *daemon) watch(ctx context.Context, cancel context.CancelFunc, o *out) {
@@ -2282,6 +2310,30 @@ func (d *daemon) attach(id string) error {
 		d.mu.Unlock()
 	}
 	return err
+}
+
+// attached holds while a frontend runs claude attach on session id, until ctx ends as the frontend's connection closes, however its process ends.
+// Only the master's counts: while the user has it open, next_event returns within openReturn.
+func (d *daemon) attached(ctx context.Context, id string) {
+	d.mu.Lock()
+	if m := d.nodes[masterNode]; m == nil || id == "" || m.ID != id {
+		d.mu.Unlock()
+		return
+	}
+	if d.masterOpen == 0 {
+		d.masterOpenAt = time.Now()
+	}
+	d.masterOpen++
+	// A next_event already waiting takes the shorter bound.
+	close(d.wake)
+	d.wake = make(chan struct{})
+	d.mu.Unlock()
+	log.Printf("the user opened the master")
+	<-ctx.Done()
+	d.mu.Lock()
+	d.masterOpen--
+	d.mu.Unlock()
+	log.Printf("the user left the master")
 }
 
 // clearStaleDesk clears the desk once it is stale, and reports whether it did. It spares a desk holding answers that the user has not opened it to read since bosun handed it a tell. Its caller holds deskLock.

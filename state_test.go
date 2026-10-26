@@ -134,7 +134,7 @@ func TestRestartKeepsDecisions(t *testing.T) {
 		t.Fatalf("decisions = %+v", decs)
 	}
 	events := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events
-	if len(events) != 2 || events[0].Decision == nil || events[0].Decision.ID != permission.ID || events[1].Kind != "tell" {
+	if len(events) != 2 || events[0].Kind != "tell" || events[1].Decision == nil || events[1].Decision.ID != permission.ID {
 		t.Fatalf("events = %+v", events)
 	}
 

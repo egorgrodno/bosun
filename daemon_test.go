@@ -923,6 +923,119 @@ func TestAttachSession(t *testing.T) {
 	}
 }
 
+// masterOpen waits until the daemon counts n frontends with the master open.
+func masterOpen(t *testing.T, d *daemon, n int) {
+	t.Helper()
+	for range 500 {
+		d.mu.Lock()
+		open := d.masterOpen
+		d.mu.Unlock()
+		if open == n {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("the daemon never counted %d frontends with the master open", n)
+}
+
+// The daemon counts the master open for as long as bosun attach runs claude attach on it, across a restart of the daemon too.
+func TestAttachSessionOpensMaster(t *testing.T) {
+	d, _ := testDaemon(t)
+	bin := t.TempDir()
+	done := filepath.Join(bin, "done")
+	script := fmt.Sprintf("#!/bin/sh\nwhile [ ! -e %s ]; do sleep 0.01; done\n", done)
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	d.mu.Lock()
+	master := d.nodes[masterNode].ID
+	d.mu.Unlock()
+
+	attached := make(chan error, 1)
+	go func() { attached <- attachSession(master) }()
+	masterOpen(t, d, 1)
+	d = restart(t, d)
+	masterOpen(t, d, 1)
+	if err := os.WriteFile(done, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-attached; err != nil {
+		t.Fatal(err)
+	}
+	masterOpen(t, d, 0)
+}
+
+// While the user has the master open, next_event returns within openReturn, a call already waiting included, and it waits its full time again once they leave.
+func TestNextEventWhileMasterOpen(t *testing.T) {
+	d, _ := testDaemon(t)
+	wait := openReturn
+	openReturn = 100 * time.Millisecond
+	t.Cleanup(func() { openReturn = wait })
+	d.mu.Lock()
+	master := d.nodes[masterNode].ID
+	d.mu.Unlock()
+
+	waiting := make(chan Response, 1)
+	go func() {
+		resp, _ := call(context.Background(), Request{Op: "next_event", Node: masterNode})
+		waiting <- resp
+	}()
+	select {
+	case <-waiting:
+		t.Fatal("next_event returned with no events while nobody had the master open")
+	case <-time.After(3 * openReturn):
+	}
+	open, leave := context.WithCancel(context.Background())
+	defer leave()
+	go func() { _, _ = call(open, Request{Op: "attached", ID: master}) }()
+	select {
+	case resp := <-waiting:
+		if len(resp.Events) != 0 || resp.Error != "" {
+			t.Fatalf("next_event returned %+v", resp)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a waiting next_event kept waiting once the user opened the master")
+	}
+	begun := time.Now()
+	if evs := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events; len(evs) != 0 {
+		t.Fatalf("next_event returned %+v", evs)
+	}
+	if took := time.Since(begun); took < openReturn {
+		t.Fatalf("next_event returned after %v, before openReturn", took)
+	}
+
+	// Another session open in a frontend holds nothing.
+	mustCall(t, Request{Op: "attached", ID: "aaaaaaaa"})
+	masterOpen(t, d, 1)
+
+	leave()
+	masterOpen(t, d, 0)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*openReturn)
+	defer cancel()
+	if _, err := call(ctx, Request{Op: "next_event", Node: masterNode}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("next_event once the user left the master: %v", err)
+	}
+}
+
+// next_event hands the master the user's tells ahead of the events that came before them.
+func TestNextEventTellsFirst(t *testing.T) {
+	d, _ := testDaemon(t)
+	d.mu.Lock()
+	d.pushLocked(Event{Kind: "turn_end", Node: "a", Text: "done"})
+	d.mu.Unlock()
+	mustCall(t, Request{Op: "tell", Text: "from a frontend"})
+	mustCall(t, Request{Op: "tell", Node: deskNode, Text: "from the desk"})
+	evs := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events
+	var got []string
+	for _, ev := range evs {
+		got = append(got, ev.Kind+":"+ev.Text)
+	}
+	if want := []string{"tell:from a frontend", "tell:from the desk", "turn_end:done"}; !slices.Equal(got, want) {
+		t.Fatalf("next_event returned %q, want %q", got, want)
+	}
+}
+
 func TestKill(t *testing.T) {
 	d, fc := testDaemon(t)
 	fc.mu.Lock()
@@ -1404,7 +1517,7 @@ func TestMessageWaitsForEvent(t *testing.T) {
 	}
 	mustCall(t, Request{Op: "tell", Text: "x"})
 	evs := <-got
-	if len(evs) != 2 || evs[0].Kind != "message" || evs[0].Node != "a" || evs[0].From != "b" || evs[0].Text != "b merges first.\nThen rebase onto worktree-b." || evs[1].Kind != "tell" {
+	if len(evs) != 2 || evs[0].Kind != "tell" || evs[1].Kind != "message" || evs[1].Node != "a" || evs[1].From != "b" || evs[1].Text != "b merges first.\nThen rebase onto worktree-b." {
 		t.Fatalf("events = %+v", evs)
 	}
 
