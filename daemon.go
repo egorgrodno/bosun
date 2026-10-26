@@ -294,7 +294,7 @@ func (d *daemon) sortedLocked() []*Session {
 
 func (s *Session) public() Session {
 	c := *s
-	c.pre = nil
+	c.pre, c.Events, c.Taken = nil, nil, nil
 	return c
 }
 
@@ -563,7 +563,7 @@ func (d *daemon) hook(ctx context.Context, node, socket string, raw json.RawMess
 				d.asleep = true
 			}
 		case node != masterNode:
-			d.pushLocked(Event{Kind: "turn_end", Node: node, Text: fmt.Sprintf("Its turn failed on an API error, %s: %s", in.Error, in.LastMessage)})
+			d.reportLocked(Event{Kind: "turn_end", Node: node, Text: fmt.Sprintf("Its turn failed on an API error, %s: %s", in.Error, in.LastMessage)})
 		default:
 			// Waking it at once could fail the same way without end, so the next event retries it.
 			d.asleep = true
@@ -574,8 +574,14 @@ func (d *daemon) hook(ctx context.Context, node, socket string, raw json.RawMess
 		n.LimitedUntil = nil
 		d.withdrawLocked(node, func(*Decision) bool { return true })
 		switch {
+		case node != masterNode && len(n.Events) > 0:
+			// A worker runs no next_event, so news of its children waits for the end of its turn, which goes on with it.
+			resp.Behavior, resp.Text = "block", childReport(n.Events)
+			n.Taken, n.Events = append(n.Taken, n.Events...), nil
+			d.saveLocked()
 		case node != masterNode:
-			d.pushLocked(Event{Kind: "turn_end", Node: node, Text: in.LastMessage})
+			n.Taken = nil
+			d.reportLocked(Event{Kind: "turn_end", Node: node, Text: in.LastMessage})
 		case !needsMaster(d.pendingLocked()):
 			d.asleep = true
 			log.Print("the master sleeps until the next event")
@@ -922,6 +928,86 @@ func (d *daemon) pushLocked(ev Event) {
 		d.asleep = false
 		go d.wakeMaster()
 	}
+}
+
+// reportLocked tells the parent of worker ev.Node that it ended its turn or stopped. The master hears through its events.
+// A worker parent runs no next_event, so it hears at the end of its turn, or between turns in a new one. A parent the user stopped, or one gone, leaves its children to the master.
+func (d *daemon) reportLocked(ev Event) {
+	var p *Session
+	if n := d.nodes[ev.Node]; n != nil {
+		p = d.nodes[n.Parent]
+	}
+	if p == nil || p.Node == masterNode || p.Killed || p.Status == "exited" {
+		d.pushLocked(ev)
+		return
+	}
+	p.Events = append(p.Events, ev)
+	d.saveLocked()
+	log.Printf("%s of %s, for %s", ev.Kind, ev.Node, p.Node)
+	if betweenTurns(p.Status) {
+		go d.deliver(p.Node)
+	}
+}
+
+// orphanLocked leaves n's children to the master, since n will not act on their reports: it hands over those n has not read, or read in a turn still open, and tells of each other child between turns.
+func (d *daemon) orphanLocked(n *Session) {
+	told := map[string]bool{}
+	for _, ev := range slices.Concat(n.Taken, n.Events) {
+		d.pushLocked(ev)
+		told[ev.Node] = true
+	}
+	n.Taken, n.Events = nil, nil
+	for _, c := range d.sortedLocked() {
+		if c.Parent == n.Node && !told[c.Node] && !c.Killed && c.Status != "exited" && betweenTurns(c.Status) {
+			d.pushLocked(Event{Kind: "turn_end", Node: c.Node, Text: fmt.Sprintf("Its parent, %s, has stopped, so it reports to you now. Its last turn ended before then.", n.Node)})
+		}
+	}
+}
+
+// deliver starts a turn of worker name, between turns, that hands it its children's reports.
+// While it cannot start one, its next Stop, or the poll that finds it between turns, hands them over. When starting one fails, the master gets them.
+func (d *daemon) deliver(name string) {
+	d.mu.Lock()
+	n := d.nodes[name]
+	if n == nil || n.Killed || n.LimitedUntil != nil || len(n.Events) == 0 {
+		d.mu.Unlock()
+		return
+	}
+	evs := n.Events
+	n.Events = nil
+	d.mu.Unlock()
+	err := d.carryOn(context.Background(), name, childReport(evs))
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	switch {
+	case err == nil:
+		n.Taken = append(n.Taken, evs...)
+	case errors.Is(err, errInTurn) || errors.Is(err, errStarting):
+		n.Events = append(evs, n.Events...)
+	default:
+		log.Printf("telling %s of its children: %v", name, err)
+		n.Events = append(evs, n.Events...)
+		d.orphanLocked(n)
+	}
+	d.saveLocked()
+}
+
+// childReport is what bosun tells a worker of its children.
+func childReport(evs []Event) string {
+	var b strings.Builder
+	b.WriteString("bosun: news of your children.")
+	for _, ev := range evs {
+		switch {
+		case ev.Kind == "turn_end":
+			fmt.Fprintf(&b, "\n\n%s ended its turn:\n%s", ev.Node, ev.Text)
+		case ev.Text != "":
+			fmt.Fprintf(&b, "\n\n%s has stopped. %s", ev.Node, ev.Text)
+		default:
+			fmt.Fprintf(&b, "\n\n%s stopped in the middle of its turn. A message to it carries it on.", ev.Node)
+		}
+	}
+	b.WriteString("\n\nOnce a child's work is right, merge it. To give it more to do, send it a message.")
+	return b.String()
 }
 
 // wakeMaster resumes the master asleep. A master found in a turn, as one is once the user types into it, or starting needs no waking: it reads the events before its turn ends.
@@ -1355,7 +1441,7 @@ func (d *daemon) kill(name string) error {
 	var killed, held bool
 	if n != nil {
 		id, killed, held = n.ID, n.Killed, n.held
-		// Marked first, so that a poll that sees the worker stopped tells the master nothing of its own.
+		// Marked first, so that a poll that sees the worker stopped tells its parent nothing of its own.
 		n.Killed = killed || (id != "" && !held && name != masterNode)
 	}
 	d.stirred = true
@@ -1373,7 +1459,8 @@ func (d *daemon) kill(name string) error {
 	case err != nil:
 		n.Killed = killed
 	case n.Killed && !killed:
-		d.pushLocked(Event{Kind: "exit", Node: name, Text: "The user stopped it."})
+		d.reportLocked(Event{Kind: "exit", Node: name, Text: "The user stopped it."})
+		d.orphanLocked(n)
 		d.saveLocked()
 		d.broadcastSessionsLocked()
 	}
@@ -1381,7 +1468,7 @@ func (d *daemon) kill(name string) error {
 }
 
 // merge fast-forwards the branch that worker name began from to the worker's branch, then removes the worker: its session, worktree and branch.
-// Its parent or the master may merge it, since the master hears every worker's turn end.
+// Its parent or the master may merge it, since the master hears of a worker whose parent the user stopped.
 func (d *daemon) merge(ctx context.Context, caller, name string) (string, error) {
 	d.mu.Lock()
 	n := d.nodes[name]
@@ -2022,6 +2109,10 @@ func (d *daemon) refresh(byID map[string]agent) (masterMoved bool) {
 		case listed:
 			status = "stopped"
 		}
+		// A deliver that found the session in its turn or held put its reports back, and only this retries it.
+		if betweenTurns(status) && status != "exited" && len(n.Events) > 0 {
+			go d.deliver(n.Node)
+		}
 		if status == n.Status && state == n.State {
 			continue
 		}
@@ -2030,12 +2121,20 @@ func (d *daemon) refresh(byID map[string]agent) (masterMoved bool) {
 			d.sleepLocked()
 		// Claude Code stops a worker idle for an hour, which has sent its turn_end and still resumes, so only a worker stopped in its turn is news.
 		case (status == "stopped" || status == "exited") && !betweenTurns(n.Status) && n.Node != masterNode && !n.Killed:
-			d.pushLocked(Event{Kind: "exit", Node: n.Node})
+			text := ""
+			if status == "exited" {
+				text = "Its session is gone, so nothing resumes it."
+			}
+			d.reportLocked(Event{Kind: "exit", Node: n.Node, Text: text})
 			log.Printf("%s %s in its turn", n.Node, status)
 		}
 		n.Status, n.State = status, state
 		if !listed || a.Status == "" {
 			n.Socket = ""
+		}
+		// A worker the user stopped handed its children over then.
+		if status == "exited" && n.Node != masterNode && !n.Killed {
+			d.orphanLocked(n)
 		}
 		changed = true
 	}

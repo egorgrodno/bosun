@@ -94,6 +94,9 @@ type Session struct {
 	Conversation string `json:"conversation,omitempty"`
 	// Socket is the messaging socket of the session's running process, forgotten once the process stops, since another process may take the path.
 	Socket string `json:"socket,omitempty"`
+	// Events holds the turn ends and exits of a worker's children until bosun hands them to it, and Taken those handed over in its current turn.
+	Events []Event `json:"events,omitempty"`
+	Taken  []Event `json:"taken,omitempty"`
 	// LimitedUntil is when the usage limit that stopped the session resets, and the daemon resumes it.
 	LimitedUntil *time.Time `json:"limitedUntil,omitempty"`
 

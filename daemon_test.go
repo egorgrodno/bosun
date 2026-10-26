@@ -536,6 +536,136 @@ func TestWorkerExitTellsMaster(t *testing.T) {
 	}
 }
 
+// addChild gives worker a a child c, as a spawn by a would.
+func addChild(d *daemon) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.nodes["c"] = &Session{Node: "c", Parent: "a", Repo: "/repo", Dir: "/repo/.claude/worktrees/c", Base: worktree, Depth: 2, ID: "cccccccc", Status: "busy"}
+}
+
+func masterEvents(d *daemon) []Event {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.pendingLocked()
+}
+
+// stopHook runs node's Stop hook for a turn whose last message is text, and returns what it prints.
+func stopHook(t *testing.T, node, text string) string {
+	t.Helper()
+	raw, _ := json.Marshal(map[string]any{"hook_event_name": "Stop", "session_id": "s-" + node, "last_assistant_message": text})
+	return receive(t, runHookAsync(node, raw))
+}
+
+// awaitQueued waits until node holds n reports waiting, and taken reports handed over in its turn.
+func awaitQueued(t *testing.T, d *daemon, node string, n, taken int) {
+	t.Helper()
+	for range 500 {
+		d.mu.Lock()
+		s := d.nodes[node]
+		ok := len(s.Events) == n && len(s.Taken) == taken
+		d.mu.Unlock()
+		if ok {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("%s never held %d reports waiting and %d taken", node, n, taken)
+}
+
+// A worker in its turn hears of its child's turn end when its own turn would end, and its turn goes on.
+func TestChildTurnEndBlocksParentStop(t *testing.T) {
+	d, _ := testDaemon(t)
+	addChild(d)
+	stopHook(t, "c", "Fixed the parser on worktree-c.")
+	if evs := masterEvents(d); len(evs) != 0 {
+		t.Fatalf("the master got %+v", evs)
+	}
+	out := stopHook(t, "a", "Waiting for c.")
+	if !strings.Contains(out, `"decision":"block"`) || !strings.Contains(out, `c ended its turn:\nFixed the parser on worktree-c.`) {
+		t.Fatalf("a's Stop printed %s", out)
+	}
+	if evs := masterEvents(d); len(evs) != 0 {
+		t.Fatalf("a's blocked Stop told the master %+v", evs)
+	}
+	awaitQueued(t, d, "a", 0, 1)
+	if out := stopHook(t, "a", "Merged c."); out != "null" {
+		t.Fatalf("a's next Stop printed %s", out)
+	}
+	if evs := masterEvents(d); len(evs) != 1 || evs[0].Kind != "turn_end" || evs[0].Node != "a" {
+		t.Fatalf("the master got %+v", evs)
+	}
+	awaitQueued(t, d, "a", 0, 0)
+}
+
+// A worker between turns hears of its child in a new turn, once nothing else holds it.
+func TestChildTurnEndWakesParent(t *testing.T) {
+	d, fc := testDaemon(t)
+	addChild(d)
+	fc.add(agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a", Status: "idle"})
+	fc.add(agent{ID: "cccccccc", SessionID: "s-c", Name: "c", Status: "idle"})
+	d.mu.Lock()
+	d.nodes["a"].Status, d.nodes["a"].held = "idle", true
+	d.mu.Unlock()
+	stopHook(t, "c", "Done.")
+	awaitQueued(t, d, "a", 1, 0)
+	d.mu.Lock()
+	d.nodes["a"].held = false
+	d.mu.Unlock()
+	d.poll()
+	awaitQueued(t, d, "a", 0, 1)
+	args := fc.lastStart()
+	if argAfter(args, "--resume") != "s-a" || !strings.Contains(args[len(args)-1], "c ended its turn:\nDone.") {
+		t.Fatalf("claude ran with %q", args)
+	}
+	if evs := masterEvents(d); len(evs) != 0 {
+		t.Fatalf("the master got %+v", evs)
+	}
+}
+
+// The master gets the reports of a child whose parent is gone.
+func TestChildReportsGoToMaster(t *testing.T) {
+	d, fc := testDaemon(t)
+	addChild(d)
+	fc.add(agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a", Status: "busy"})
+	fc.add(agent{ID: "cccccccc", SessionID: "s-c", Name: "c", Status: "busy"})
+	d.poll()
+	// c stops in its turn while a works, and then a's session is gone.
+	fc.setStatus("cccccccc", "")
+	d.poll()
+	if evs := masterEvents(d); len(evs) != 0 {
+		t.Fatalf("the master got %+v", evs)
+	}
+	fc.mu.Lock()
+	fc.agents = slices.DeleteFunc(fc.agents, func(a agent) bool { return a.ID == "aaaaaaaa" })
+	fc.mu.Unlock()
+	d.poll()
+	evs := masterEvents(d)
+	if len(evs) != 2 || evs[0].Kind != "exit" || evs[0].Node != "a" || evs[0].Text == "" || evs[1].Kind != "exit" || evs[1].Node != "c" {
+		t.Fatalf("the master got %+v", evs)
+	}
+}
+
+// Once the user stops a parent, the master hears of each of its children, one whose report the parent already took included.
+func TestKilledParentLeavesChildrenToMaster(t *testing.T) {
+	d, fc := testDaemon(t)
+	addChild(d)
+	d.mu.Lock()
+	d.nodes["e"] = &Session{Node: "e", Parent: "a", Repo: "/repo", Dir: "/repo/.claude/worktrees/e", Base: worktree, Depth: 2, ID: "eeeeeeee", Status: "idle"}
+	d.mu.Unlock()
+	fc.add(agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a", Status: "busy"})
+	stopHook(t, "c", "Done.")
+	stopHook(t, "a", "Waiting for c.")
+	mustCall(t, Request{Op: "kill", Name: "a"})
+	evs := masterEvents(d)
+	if len(evs) != 3 || evs[0].Kind != "exit" || evs[0].Node != "a" || evs[1].Node != "c" || evs[1].Text != "Done." || evs[2].Node != "e" {
+		t.Fatalf("the master got %+v", evs)
+	}
+	stopHook(t, "c", "Done again.")
+	if evs := masterEvents(d); len(evs) != 4 || evs[3].Node != "c" || evs[3].Text != "Done again." {
+		t.Fatalf("the master got %+v", evs)
+	}
+}
+
 // A copy lacks the session's options, bosun's hooks and sandbox among them, so it must not stand in for the worker.
 func TestResumeIntoCopy(t *testing.T) {
 	d, fc := testDaemon(t)

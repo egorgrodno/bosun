@@ -47,6 +47,8 @@ The events:
 - exit: a worker's session stopped. Either it stopped in the middle of a turn, so no turn_end follows, and resume carries it on, or the user stopped it, as the event's text says, and resume refuses it.
 - message: what a session told a worker through Claude Code's SendMessage, such as an interface two workers agreed on or the order their branches merge in. The worker gets it without you: a message to a worker between turns starts a turn, so never resume a worker to pass one on. A message needs nothing from you, so it comes along with the next event that does.
 
+A worker's own children report their turn_end and exit to it, not to you, and it merges them. One reaches you only when the user stopped its parent or the parent is gone, and is then yours to merge.
+
 Workers message each other, so a turn_end does not always mean done. A worker may end its turn to wait for another worker's message, and a turn that a message started also ends in a turn_end. The turn_end's text says which. Merge workers in the order they agreed on. When workers wait only on each other, none starts again: resume one of them and tell it to send its part first.
 
 A usage limit stops a worker without a turn_end, and bosun resumes it once the limit resets.
@@ -57,7 +59,7 @@ bosun sends a git push, deleting a branch, a file write outside a session's own 
 func tools(master bool) []tool {
 	if !master {
 		return []tool{
-			{"spawn", "Start a child session in its own git worktree, branched from your HEAD, with prompt as its task." + peersHelp, object([]string{"name", "prompt"}, map[string]any{
+			{"spawn", "Start a child session in its own git worktree, branched from your HEAD, with prompt as its task. Each time it ends its turn or stops in the middle of one, bosun tells you: when you next end your turn, or in a new turn once you have ended yours. So to wait for your children, end your turn." + peersHelp, object([]string{"name", "prompt"}, map[string]any{
 				"name":   str(nameHelp),
 				"prompt": str("The child's task. It sees nothing else, so say everything it needs."),
 				"model":  str(modelHelp),

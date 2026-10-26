@@ -34,7 +34,7 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Retiring.** Claude Code's supervisor stops a background session that has sat idle for an hour. `claude agents --json --all` keeps listing it without a `pid` or `status` until `claude rm`, the same as a session that `claude stop` stopped. Either resumes like an idle session, so stopped does not mean done. The listing cannot tell a kill from a retirement, so the daemon marks each worker that `bosun kill` stops, and `resume` refuses it.
 
-**Usage limits.** A turn that ends on an API error runs the `StopFailure` hook instead of `Stop`. Its `error` names the kind, such as `rate_limit`, `overloaded` or `server_error`, and its `last_assistant_message` holds Claude Code's message. For a usage limit that message says when the limit resets, as `resets 3pm (Europe/Berlin)`, or past a day `resets Oct 27, 3pm (Europe/Berlin)`. The daemon resumes each session a limit stopped at that time, the master first. Every session shares one account, so a limit usually stops them all, though a limit on one model stops only its sessions. A worker's other errors reach the master as its `turn_end`.
+**Usage limits.** A turn that ends on an API error runs the `StopFailure` hook instead of `Stop`. Its `error` names the kind, such as `rate_limit`, `overloaded` or `server_error`, and its `last_assistant_message` holds Claude Code's message. For a usage limit that message says when the limit resets, as `resets 3pm (Europe/Berlin)`, or past a day `resets Oct 27, 3pm (Europe/Berlin)`. The daemon resumes each session a limit stopped at that time, the master first. Every session shares one account, so a limit usually stops them all, though a limit on one model stops only its sessions. A worker's other errors reach its parent as its `turn_end`.
 
 **Upgrades.** A session reads its settings and MCP config only when its process starts. Both run bosun through `bosun` in the state directory, a link that each daemon start points at its own binary, and each start rewrites every session's settings. The system prompt is another matter. Claude Code snapshots it into the transcript, and every resume reuses the snapshot, even a resume with new flags. Tool descriptions come from the MCP server, which each process start runs from the current build. So the master's system prompt holds only what never changes, and its tools' descriptions hold its rules.
 
@@ -88,7 +88,7 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 | `spawn` | every session | starts a child session |
 | `merge` | every session | lands a finished worker's branch and removes the worker |
 | `ask` | workers | sends a question to the master and blocks until the answer |
-| `next_event` | master | blocks until a worker asks, needs a permission, ends a turn or exits, or a frontend sends `tell` |
+| `next_event` | master | blocks until a worker asks or needs a permission, a child of the master ends a turn or exits, or a frontend sends `tell` |
 | `reply` | master | answers a question |
 | `decide` | master | allows or denies a permission |
 | `resume` | master | gives a worker that ended its turn, or stopped in it, a new prompt |
@@ -96,6 +96,8 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 | `notify` | master | queues a notice for you, about a problem that is not a decision |
 
 **The master loops on `next_event`.** It calls `next_event`, handles the event, and calls it again. A `Stop` hook reports a worker's turn end, and the session listing reports a worker that stops in its turn.
+
+**A parent hears of its children.** A worker's `turn_end` and `exit` go to its parent. The master gets them only for its own children, and for the children of a worker that `bosun kill` stopped or that has exited. A worker runs no `next_event`, so the daemon queues the reports. A parent in its turn gets them at its `Stop`, which the daemon blocks with the reports as its reason. The daemon resumes a parent between turns with the reports as its prompt. `SendMessage`'s `notify_when_idle` cannot replace this queue: the child's process holds the subscription, so a stop or resume of the child voids it, and it fires only once.
 
 **An idle master sleeps.** Once `next_event` returns empty, the master ends its turn, and the next event resumes it. So an idle master spends no turns. The daemon blocks a `Stop` that comes while events wait, which sends the master back to `next_event`. If the master stops again before calling `next_event`, the daemon lets it, queues a notice for you, and the next event resumes it. While the daemon is stopped, the master's calls fail and its turn ends. On start, the daemon adopts an idle or stopped master as asleep.
 
@@ -107,7 +109,7 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 
 ## Messages
 
-**Workers talk through Claude Code.** `SendMessage` reaches a running session by its `-n` name, so workers address each other by node name. Auto mode runs it without a permission request, so the master never decides on a message. A message arrives between tool calls, so one to a worker blocked in `ask` waits until the call returns. A message to an idle session starts a turn, and that turn's `Stop` reaches the master as a `turn_end`.
+**Workers talk through Claude Code.** `SendMessage` reaches a running session by its `-n` name, so workers address each other by node name. Auto mode runs it without a permission request, so the master never decides on a message. A message arrives between tool calls, so one to a worker blocked in `ask` waits until the call returns. A message to an idle session starts a turn, and that turn's `Stop` reaches its parent as a `turn_end`.
 
 **Messages stay in the tree.** The user's other sessions act on a peer's message in auto mode, without bosun's reserved check. So every session's `PreToolUse` checks the `to` of a `SendMessage`:
 
@@ -139,4 +141,3 @@ Each leads with the queue of decisions waiting on you, above the tree.
 ## Open questions
 
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
-- **Turn ends below the master.** Only the master gets `turn_end`, so a worker cannot tell when its own child is ready to merge, and the master merges it instead. A worker could subscribe to its child with `SendMessage`'s `notify_when_idle`, which works between background sessions and whose notice starts the subscriber's next turn (#29).
