@@ -161,6 +161,8 @@ func settledEntry(dec *Decision, a answer, o outcome) Entry {
 	switch {
 	case dec.Kind == "notice" && a.withdrawn:
 		e.Withdrawn, e.Cause = true, o.cause
+	case dec.Kind == "notice" && o.behavior != "":
+		e.Behavior = o.behavior
 	case dec.Kind == "notice":
 	case o.behavior != "":
 		e.Behavior = o.behavior

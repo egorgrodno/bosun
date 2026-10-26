@@ -134,6 +134,21 @@ func (s *controlFake) typed(short string) string {
 	return s.keys[short]
 }
 
+// openPromptNotice opens a permission of worker a's to run tool, then leaves it to a's own prompt, as bosun does once it can hold it no longer, and returns the notice's id.
+func openPromptNotice(d *daemon, tool string, input json.RawMessage) string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	dec := &Decision{Kind: "permission", Node: "a", Holder: "master", Tool: tool, Input: input}
+	d.openLocked(dec)
+	d.promptLocked(dec, "waits in its own prompt", "test")
+	for id, dec := range d.decisions {
+		if dec.Prompt {
+			return id
+		}
+	}
+	return ""
+}
+
 // setNeeds writes what the dialog of session id asks, as Claude Code's job state holds it.
 func setNeeds(t *testing.T, id, needs string) {
 	t.Helper()
@@ -176,10 +191,14 @@ func assertKeyKept(t *testing.T, d *daemon, texts ...string) {
 // Only the user, from a frontend, steers a session: neither a session's request nor its MCP server reaches these ops.
 func TestSteeringRefusesSessions(t *testing.T) {
 	d, _, sup := steerDaemon(t, "busy")
+	notice := openPromptNotice(d, "Bash", json.RawMessage(`{"command":"npm test"}`))
+	setNeeds(t, "aaaaaaaa", "approve Bash: npm test")
 	for _, node := range []string{masterNode, deskNode, "a"} {
 		for _, r := range []Request{
 			{Op: "say", Node: node, Name: "a", Text: "hi"},
 			{Op: "interrupt", Node: node, Name: "a"},
+			{Op: "approve", Node: node, ID: notice},
+			{Op: "deny", Node: node, ID: notice},
 		} {
 			if _, err := call(context.Background(), r); err == nil {
 				t.Fatalf("%s from %s went through", r.Op, node)
@@ -200,7 +219,7 @@ func TestSteeringRefusesSessions(t *testing.T) {
 	if ops := sup.ops(); len(ops) != 0 {
 		t.Fatalf("the supervisor got %v", ops)
 	}
-	if n := len(logOf(d, "say")) + len(logOf(d, "interrupt")); n != 0 {
+	if n := len(logOf(d, "say")) + len(logOf(d, "interrupt")) + len(logOf(d, "prompt")); n != 0 {
 		t.Fatalf("%d uses logged", n)
 	}
 }
@@ -415,6 +434,59 @@ func TestInterruptFallsBack(t *testing.T) {
 			}
 		})
 	}
+}
+
+// approve and deny on a notice of a permission waiting in the session's own prompt press the dialog's keys.
+func TestAnswerOwnPrompt(t *testing.T) {
+	d, _, sup := steerDaemon(t, "waiting")
+	open := func() string { return openPromptNotice(d, "Bash", json.RawMessage(`{"command":"npm test"}`)) }
+	id := open()
+	if dec := openDecision(t, 1); !dec.Prompt || dec.Tool != "Bash" {
+		t.Fatalf("notice = %+v", dec)
+	}
+	setNeeds(t, "aaaaaaaa", "approve Read: /etc/hosts")
+	if _, err := call(context.Background(), Request{Op: "approve", ID: id}); err == nil {
+		t.Fatal("approved a prompt that asks about another call")
+	}
+	setNeeds(t, "aaaaaaaa", "approve Bash: npm test")
+	mustCall(t, Request{Op: "approve", ID: id})
+	if got := sup.typed("aaaaaaaa"); got != "\r" {
+		t.Fatalf("typed %q", got)
+	}
+	if n := len(mustCall(t, Request{Op: "status"}).Decisions); n != 0 {
+		t.Fatalf("%d decisions open", n)
+	}
+
+	id = open()
+	mustCall(t, Request{Op: "deny", ID: id, Text: "run the unit tests only"})
+	if got := sup.typed("aaaaaaaa"); got != "\r\x1b" {
+		t.Fatalf("typed %q", got)
+	}
+	if last := sup.last(); last["op"] != "reply" || last["text"] != "run the unit tests only" {
+		t.Fatalf("last request %v", last)
+	}
+	logged := logOf(d, "prompt")
+	if len(logged) != 2 || logged[0].Behavior != "allow" || logged[1].Behavior != "deny" || logged[1].Via != "supervisor" || logged[1].Node != "a" {
+		t.Fatalf("logged %+v", logged)
+	}
+	settled := logOf(d, "settled")
+	if last := settled[len(settled)-1]; last.By != "user" || last.Behavior != "deny" {
+		t.Fatalf("settled %+v", settled)
+	}
+	assertKeyKept(t, d)
+}
+
+// Without a supervisor bosun cannot press the dialog's keys, so the notice stays open.
+func TestAnswerOwnPromptWithoutSupervisor(t *testing.T) {
+	d, _, _ := steerDaemon(t, "waiting")
+	useFakeSocket(t, "")
+	openPromptNotice(d, "Bash", nil)
+	setNeeds(t, "aaaaaaaa", "approve Bash: npm test")
+	dec := openDecision(t, 1)
+	if _, err := call(context.Background(), Request{Op: "approve", ID: dec.ID}); err == nil || !strings.Contains(err.Error(), "bosun attach aaaaaaaa") {
+		t.Fatalf("approve without a supervisor: %v", err)
+	}
+	openDecision(t, 1)
 }
 
 // The master's queue holds what the user said until next_event returns, so a say ends the wait.

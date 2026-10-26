@@ -352,6 +352,8 @@ func logLine(e Entry) string {
 		what = with("→ " + e.Node)
 	case "interrupt":
 		what = "interrupted " + e.Node + "'s turn"
+	case "prompt":
+		what = with(fmt.Sprintf("answered %s's own prompt: %s", e.Node, e.Behavior))
 	case "turn_end":
 		what = with("ended its turn")
 	case "exit":

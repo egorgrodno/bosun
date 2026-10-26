@@ -142,13 +142,13 @@ type Decision struct {
 	Refused string `json:"refused,omitempty"`
 	// UserOnly marks a reserved action on the user's list, which only the user's own answer in a frontend settles.
 	UserOnly bool `json:"userOnly,omitempty"`
+	// Prompt marks a notice that a permission waits in its session's own prompt, which the session moving on withdraws, and which the user's approve or deny answers there.
+	Prompt bool `json:"prompt,omitempty"`
 
 	toolUseID string
 	// key is the Key of the request that waits on the decision.
 	key    string
 	opened time.Time
-	// prompt marks a notice that a permission waits in its session's own prompt, which the session moving on withdraws.
-	prompt bool
 	// from is the session that sent a notice, for the log, and empty for bosun's own.
 	from   string
 	answer chan answer

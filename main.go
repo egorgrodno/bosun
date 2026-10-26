@@ -20,8 +20,8 @@ const usage = `usage:
   bosun conversation [-before ID] [-limit N] NAME
                                    print a session's latest conversation entries, or those before entry ID, as JSON
   bosun follow [-limit N] NAME     stream a session's conversation as JSON lines: its latest entries, each new one, and its turn in progress
-  bosun approve ID                 allow a permission
-  bosun deny ID [MESSAGE]          deny a permission
+  bosun approve ID                 allow a permission, in the session's own prompt for a notice that waits there
+  bosun deny ID [MESSAGE]          deny a permission, the same way
   bosun reply ID ANSWER            answer a question
   bosun dismiss ID                 clear a notice from the master
   bosun tell TEXT                  send the front desk a message, or the master when there is no desk

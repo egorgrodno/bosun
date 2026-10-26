@@ -193,7 +193,6 @@ type savedDecision struct {
 	ToolUseID string    `json:"toolUseId,omitempty"`
 	Key       string    `json:"key,omitempty"`
 	Opened    time.Time `json:"opened"`
-	Prompt    bool      `json:"prompt,omitempty"`
 }
 
 func newDaemon(exe, socket, stateDir, masterDir string, claude claudeCLI) *daemon {
@@ -380,7 +379,7 @@ func (d *daemon) load() error {
 	d.events, d.taken, d.takenKey, d.paused, d.answered = st.Events, st.Taken, st.TakenKey, st.Paused, st.Answered
 	for _, sd := range st.Decisions {
 		dec := sd.Decision
-		dec.toolUseID, dec.key, dec.opened, dec.prompt = sd.ToolUseID, sd.Key, sd.Opened, sd.Prompt
+		dec.toolUseID, dec.key, dec.opened = sd.ToolUseID, sd.Key, sd.Opened
 		dec.answer = make(chan answer, 1)
 		d.decisions[dec.ID] = &dec
 		if dec.Kind != "notice" {
@@ -402,7 +401,7 @@ func (d *daemon) saveLocked() {
 	}
 	for _, dec := range d.snapshotLocked().Decisions {
 		o := d.decisions[dec.ID]
-		st.Decisions = append(st.Decisions, savedDecision{Decision: dec, ToolUseID: o.toolUseID, Key: o.key, Opened: o.opened, Prompt: o.prompt})
+		st.Decisions = append(st.Decisions, savedDecision{Decision: dec, ToolUseID: o.toolUseID, Key: o.key, Opened: o.opened})
 	}
 	data, _ := json.MarshalIndent(st, "", "  ")
 	if err := writeDurably(filepath.Join(d.stateDir, "state.json"), data); err != nil {
@@ -647,10 +646,16 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 		} else {
 			resp.Events = d.nextEvent(ctx, r.Key)
 		}
-	case "approve":
-		resp.Text, err = d.answer(r.Node, r.ID, r.Words, "permission", answer{behavior: "allow"})
-	case "deny":
-		resp.Text, err = d.answer(r.Node, r.ID, r.Words, "permission", answer{behavior: "deny", text: r.Text})
+	case "approve", "deny":
+		a := answer{behavior: "allow"}
+		if r.Op == "deny" {
+			a = answer{behavior: "deny", text: r.Text}
+		}
+		if d.promptNotice(r.ID) {
+			resp.Text, err = d.answerPrompt(ctx, r.Node, r.ID, a)
+		} else {
+			resp.Text, err = d.answer(r.Node, r.ID, r.Words, "permission", a)
+		}
 	case "reply":
 		resp.Text, err = d.answer(r.Node, r.ID, r.Words, "question", answer{text: r.Text})
 	case "escalate":
@@ -1152,7 +1157,7 @@ func (d *daemon) wait(ctx context.Context, dec *Decision) (answer, bool) {
 		if n := d.nodes[dec.Node]; n != nil {
 			id = n.ID
 		}
-		d.promptLocked(dec, fmt.Sprintf("%s has waited for permission to run %s as long as bosun can hold a permission, so only its own prompt can answer it now: bosun attach %s", dec.Node, describe(*dec), id), "bosun could hold it no longer, which left it to "+dec.Node+"'s own prompt")
+		d.promptLocked(dec, fmt.Sprintf("%s has waited for permission to run %s as long as bosun can hold a permission, so only its own prompt can answer it now: approve or deny this notice, or bosun attach %s", dec.Node, describe(*dec), id), "bosun could hold it no longer, which left it to "+dec.Node+"'s own prompt")
 		return answer{}, false
 	case <-ctx.Done():
 		d.mu.Lock()
@@ -1197,7 +1202,7 @@ func (d *daemon) goneLocked(node string) string {
 // o says how, for the log.
 func (d *daemon) withdrawLocked(node string, match func(*Decision) bool, o outcome) {
 	for _, dec := range d.decisions {
-		if dec.Node == node && (dec.Kind == "permission" && dec.Reserved == "" || dec.prompt) && match(dec) {
+		if dec.Node == node && (dec.Kind == "permission" && dec.Reserved == "" || dec.Prompt) && match(dec) {
 			d.settleLocked(dec, answer{withdrawn: true}, o)
 		}
 	}
@@ -1206,7 +1211,7 @@ func (d *daemon) withdrawLocked(node string, match func(*Decision) bool, o outco
 // promptLocked settles permission dec, whose hook can no longer answer it, for cause, and opens in its place a notice for the user, with note, until the session moves on.
 func (d *daemon) promptLocked(dec *Decision, note, cause string) {
 	d.settleLocked(dec, answer{withdrawn: true}, outcome{by: "bosun", cause: cause})
-	d.openLocked(&Decision{Kind: "notice", Node: dec.Node, Holder: "user", Note: note, toolUseID: dec.toolUseID, prompt: true})
+	d.openLocked(&Decision{Kind: "notice", Node: dec.Node, Holder: "user", Note: note, Tool: dec.Tool, Input: dec.Input, toolUseID: dec.toolUseID, Prompt: true})
 }
 
 // expireOrphans settles each decision of an earlier run whose hook or ask did not send its request again by orphansUntil, and so no longer waits on bosun.
@@ -1223,7 +1228,7 @@ func (d *daemon) expireOrphans(now time.Time) {
 		switch {
 		case d.decisions[id] != dec:
 		case dec.Kind == "permission" && dec.Reserved == "" && n != nil && n.Status == "waiting":
-			d.promptLocked(dec, fmt.Sprintf("bosun restarted while %s waited for permission to run %s, and the request did not come back, so only its own prompt can answer it now: bosun attach %s", dec.Node, describe(*dec), n.ID), "bosun restarted and the request did not come back, which left it to "+dec.Node+"'s own prompt")
+			d.promptLocked(dec, fmt.Sprintf("bosun restarted while %s waited for permission to run %s, and the request did not come back, so only its own prompt can answer it now: approve or deny this notice, or bosun attach %s", dec.Node, describe(*dec), n.ID), "bosun restarted and the request did not come back, which left it to "+dec.Node+"'s own prompt")
 		default:
 			d.settleLocked(dec, answer{withdrawn: true}, outcome{by: "bosun", cause: "bosun restarted and the request did not come back"})
 		}
@@ -3289,7 +3294,7 @@ func (d *daemon) refresh(byID map[string]agent, listed time.Time) (masterMoved b
 			go d.deliver(n.Node)
 		}
 		if betweenTurns(status) {
-			d.withdrawLocked(n.Node, func(dec *Decision) bool { return dec.prompt }, outcome{by: "session", cause: n.Node + " moved past the call"})
+			d.withdrawLocked(n.Node, func(dec *Decision) bool { return dec.Prompt }, outcome{by: "session", cause: n.Node + " moved past the call"})
 		}
 		// The turn's hooks ran, but not its Stop: the daemon was away, or the user interrupted the turn.
 		missed := n.Turn && betweenTurns(status) && n.turnAt.Before(listed.Add(-turnSettle))

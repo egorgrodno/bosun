@@ -302,6 +302,64 @@ func (d *daemon) interruptedLocked(n *Session, why string, runsOn bool) {
 	d.saveLocked()
 }
 
+// promptNotice reports whether decision id is a notice of a permission waiting in its session's own prompt.
+func (d *daemon) promptNotice(id string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	dec := d.decisions[id]
+	return dec != nil && dec.Kind == "notice" && dec.Prompt
+}
+
+// answerPrompt gives the user's answer to the permission that notice id says waits in its session's own prompt, by pressing the dialog's keys through the supervisor: Enter on its first option, Yes, or Esc, No. A message with a denial follows as the user's text.
+func (d *daemon) answerPrompt(ctx context.Context, caller, id string, a answer) (string, error) {
+	if caller != "" {
+		return "", errFrontendOnly
+	}
+	d.mu.Lock()
+	dec := d.decisions[id]
+	if dec == nil || !dec.Prompt {
+		d.mu.Unlock()
+		return "", fmt.Errorf("no open decision %s", id)
+	}
+	name, tool := dec.Node, dec.Tool
+	d.mu.Unlock()
+	_, sid, _, err := d.steerable(name)
+	if err != nil {
+		return "", err
+	}
+	needs, err := jobNeeds(sid)
+	switch {
+	case err != nil:
+		return "", fmt.Errorf("bosun cannot read what %s's own prompt asks: %v", name, err)
+	case needOf(needs).Kind != "permission":
+		return "", fmt.Errorf("%s's own prompt asks for no permission now", name)
+	case tool != "" && needOf(needs).Tool != tool:
+		return "", fmt.Errorf("%s's own prompt asks about another call now: %s", name, needs)
+	}
+	c, err := newControl(ctx)
+	if err != nil {
+		return "", fmt.Errorf("bosun cannot answer %s's own prompt, %v, so answer it in the session: bosun attach %s", name, err, sid)
+	}
+	keys := "\r"
+	if a.behavior == "deny" {
+		keys = "\x1b"
+	}
+	err = c.keys(sid, keys)
+	if err == nil && a.behavior == "deny" && a.text != "" {
+		err = c.reply(sid, a.text)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.logUseLocked(Entry{Kind: "prompt", Node: name, Behavior: a.behavior, Text: a.text, Via: "supervisor"}, err)
+	if err != nil {
+		return "", err
+	}
+	if d.decisions[id] == dec {
+		d.settleLocked(dec, a, outcome{by: "user", behavior: a.behavior})
+	}
+	return "", nil
+}
+
 // needOf is the dialog that needs names, and the zero Need for none.
 func needOf(needs string) Need {
 	if n := parseNeeds(needs); n != nil {
