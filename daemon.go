@@ -25,9 +25,7 @@ import (
 )
 
 const (
-	masterNode  = "master"
-	maxDepth    = 3
-	maxChildren = 4
+	masterNode = "master"
 
 	// holdTimeout is the timeout of the PreToolUse and PermissionRequest hooks, so how long a decision waits.
 	// The hook gives up holdMargin before it, while Claude Code still reads what it prints.
@@ -74,6 +72,9 @@ type daemon struct {
 	masterDir   string
 	masterModel string
 	workerModel string
+	// maxDepth caps the depth of the tree, where the master's children are at depth 1, and maxChildren the live children of each session.
+	maxDepth    int
+	maxChildren int
 	claude      claudeCLI
 
 	// masterLock is held while the master is woken, switched or resumed idle, so that no two of them resume it at once.
@@ -124,18 +125,26 @@ type savedState struct {
 
 func newDaemon(exe, socket, stateDir, masterDir string, claude claudeCLI) *daemon {
 	return &daemon{
-		exe:       exe,
-		socket:    socket,
-		stateDir:  stateDir,
-		masterDir: masterDir,
-		claude:    claude,
-		nodes:     map[string]*Session{},
-		started:   map[string]time.Time{},
-		decisions: map[string]*Decision{},
-		wake:      make(chan struct{}),
-		watchers:  map[*watcher]bool{},
+		exe:         exe,
+		socket:      socket,
+		stateDir:    stateDir,
+		masterDir:   masterDir,
+		maxDepth:    defaultMaxDepth,
+		maxChildren: defaultMaxChildren,
+		claude:      claude,
+		nodes:       map[string]*Session{},
+		started:     map[string]time.Time{},
+		decisions:   map[string]*Decision{},
+		wake:        make(chan struct{}),
+		watchers:    map[*watcher]bool{},
 	}
 }
+
+// The default caps keep a worker that hands its whole task to a child, which does the same, from spawning until the account's usage limit stops every session.
+const (
+	defaultMaxDepth    = 3
+	defaultMaxChildren = 4
+)
 
 func stateDir() string {
 	if p := os.Getenv("BOSUN_STATE"); p != "" {
@@ -161,13 +170,19 @@ func runDaemon(args []string) error {
 	masterDir := flags.String("master-dir", filepath.Join(stateDir(), "master"), "directory the master runs in, which Claude Code must trust")
 	masterModel := flags.String("master-model", "", "model of a master the daemon starts, such as fable, opus or sonnet; the user's default when empty")
 	workerModel := flags.String("worker-model", "", "model of a worker started without one; the user's default when empty")
+	maxDepth := flags.Int("max-depth", defaultMaxDepth, "deepest level of the tree, where the master's children are at level 1")
+	maxChildren := flags.Int("max-children", defaultMaxChildren, "most children each session runs at once, a stopped one included until it is killed")
 	_ = flags.Parse(args)
+	if *maxDepth < 1 || *maxChildren < 1 {
+		return errors.New("-max-depth and -max-children must be at least 1")
+	}
 	exe, err := os.Executable()
 	if err != nil {
 		return err
 	}
 	d := newDaemon(exe, socketPath(), stateDir(), *masterDir, claudeExec{})
 	d.masterModel, d.workerModel = *masterModel, *workerModel
+	d.maxDepth, d.maxChildren = *maxDepth, *maxChildren
 	if err := d.fitsSockets(masterNode); err != nil {
 		return fmt.Errorf("the state path %s is too long, so set BOSUN_STATE to a shorter one: %w", d.stateDir, err)
 	}
@@ -1113,8 +1128,8 @@ func (d *daemon) admitLocked(parent, name string) error {
 	if d.nodes[name] != nil {
 		return fmt.Errorf("node %q exists", name)
 	}
-	if d.nodes[parent].Depth >= maxDepth {
-		return fmt.Errorf("%s is at the depth cap of %d", parent, maxDepth)
+	if d.nodes[parent].Depth >= d.maxDepth {
+		return fmt.Errorf("%s is at the depth cap of %d", parent, d.maxDepth)
 	}
 	live := 0
 	for _, n := range d.nodes {
@@ -1122,8 +1137,8 @@ func (d *daemon) admitLocked(parent, name string) error {
 			live++
 		}
 	}
-	if live >= maxChildren {
-		return fmt.Errorf("%s already runs %d children", parent, maxChildren)
+	if live >= d.maxChildren {
+		return fmt.Errorf("%s already runs %d children", parent, d.maxChildren)
 	}
 	return nil
 }

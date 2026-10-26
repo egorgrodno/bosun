@@ -8,6 +8,7 @@ import (
 
 const usage = `usage:
   bosun daemon [-master-dir DIR] [-master-model M] [-worker-model M]
+               [-max-depth N] [-max-children N]
                                    run the daemon, which starts the master
   bosun mcp                        the MCP server each session starts
   bosun hook                       every hook each session runs

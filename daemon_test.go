@@ -1278,6 +1278,27 @@ func TestCapCountsStoppedWorkers(t *testing.T) {
 	mustCall(t, Request{Op: "spawn", Node: masterNode, Name: "e", Repo: repo, Text: "x"})
 }
 
+func TestCaps(t *testing.T) {
+	d, _ := testDaemon(t)
+	repo := t.TempDir()
+	if out, err := exec.Command("git", "init", "-q", repo).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	d.mu.Lock()
+	d.maxDepth, d.maxChildren = 2, 2
+	d.mu.Unlock()
+	mustCall(t, Request{Op: "spawn", Node: masterNode, Name: "b", Repo: repo, Text: "x"})
+	if _, err := call(context.Background(), Request{Op: "spawn", Node: masterNode, Name: "c", Repo: repo, Text: "x"}); err == nil || !strings.Contains(err.Error(), "2 children") {
+		t.Fatalf("a third child beside a and b: %v", err)
+	}
+	d.mu.Lock()
+	d.nodes["a"].Depth = 2
+	d.mu.Unlock()
+	if _, err := call(context.Background(), Request{Op: "spawn", Node: "a", Name: "c", Text: "x"}); err == nil || !strings.Contains(err.Error(), "depth cap of 2") {
+		t.Fatalf("a child below depth 2: %v", err)
+	}
+}
+
 func TestSpawnLeavesRoomForSandboxSockets(t *testing.T) {
 	// A 29-byte state path gives a node a TMPDIR of 40 bytes plus its name.
 	d := newDaemon("/bin/bosun", "sock", "/home/egor/.local/state/bosun", "/master", &fakeClaude{})

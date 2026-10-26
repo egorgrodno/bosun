@@ -48,7 +48,7 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Sandbox.** Every session runs its Bash commands in Claude Code's sandbox, so a command writes only inside the session's directory, its repository's `.git`, its own temporary folder, `~/.cache/go-build`, `~/.cache/nix` and `~/.cache/treefmt`. `sudo` fails inside it. The sandbox allows every unix socket, since nix needs its daemon's. bosun hides by path the sockets that reach outside the sandbox, its own included. A socket missing from that list stays open. Claude Code's system prompt sends scratch files to `$CLAUDE_JOB_DIR/tmp`, which is read-only inside the sandbox. bosun's prompt sends them to the session's temporary folder instead. The sandbox refuses an unlisted host. The model then retries with the host in the Bash call's `allowed_domains`, and auto mode decides that retry.
 
-**The tree.** Every session has `spawn`, so a worker can add a level. The daemon caps depth and fan-out.
+**The tree.** Every session has `spawn`, so a worker can add a level. The daemon's `-max-depth` and `-max-children` cap depth and fan-out.
 
 **Worktrees.** `spawn` runs a child from its parent's worktree, so the child's branch `worktree-<node>` begins at the parent's `HEAD`. Every worktree sits directly in the repository's `.claude/worktrees/`, whatever its depth, so a node name must be unique within its repository. The master works in no repository.
 
