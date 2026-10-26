@@ -20,12 +20,15 @@ bosun tell 'Fix the flaky test in ~/Projects/app'
 bosun status      # the decisions waiting, the tree, then the log
 bosun tui         # the same, live, to answer them and attach to a session
 bosun approve 3
+bosun say worker-a 'also run the linter'
 bosun attach <id>
 ```
 
 `bosun` alone lists every command. `bosun pause` stops every session, such as before a reboot, and `bosun unpause` resumes the turns it cut. `bosun model -effort low desk sonnet` moves the desk to another model and effort, keeping its conversation, and `m` in `bosun tui` does the same for the master or the desk.
 
 `bosun follow <node>` streams a session's conversation and its turn in progress as JSON lines for a frontend, and `bosun conversation -before <id> <node>` pages back through it.
+
+`bosun say` types into one of bosun's sessions as you, a slash command such as `/compact` included. The daemon sends it through Claude Code's supervisor with its control key, which nothing else in bosun reads. When the supervisor's protocol has changed, it stops the session and resumes it instead.
 
 Talk to the desk: type into it through `bosun attach`, or send it a line with `bosun tell`. The master and the desk refuse messages from your other Claude Code sessions, though the sender's `SendMessage` reports success.
 

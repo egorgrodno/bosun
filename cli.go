@@ -122,7 +122,7 @@ func runCommand(cmd string, args []string) error {
 		_ = flags.Parse(args)
 		req.Model, req.Effort, args = *model, *effort, flags.Args()
 	}
-	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1}[cmd]
+	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "say": 2}[cmd]
 	if len(args) < need {
 		return errors.New(usage)
 	}
@@ -137,6 +137,8 @@ func runCommand(cmd string, args []string) error {
 		req.Name, req.Repo, req.Text = args[0], args[1], strings.Join(args[2:], " ")
 	case "kill":
 		req.Name = args[0]
+	case "say":
+		req.Name, req.Text = args[0], strings.Join(args[1:], " ")
 	}
 	resp, err := call(context.Background(), req)
 	if resp.Text != "" {
@@ -346,12 +348,17 @@ func logLine(e Entry) string {
 		what = with("resumed the fleet")
 	case "model":
 		what = fmt.Sprintf("switched %s to %s", e.Node, modelLabel(Session{Model: e.Model, Effort: e.Effort}))
+	case "say":
+		what = with("→ " + e.Node)
 	case "turn_end":
 		what = with("ended its turn")
 	case "exit":
 		what = with("stopped in its turn")
 	default:
 		what = with(e.Kind)
+	}
+	if e.Error != "" {
+		what += " (failed: " + e.Error + ")"
 	}
 	return fmt.Sprintf("%s %-12s %s", e.At.Local().Format("15:04"), who, what)
 }

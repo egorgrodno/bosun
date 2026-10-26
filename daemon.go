@@ -144,6 +144,8 @@ type daemon struct {
 	// masterOpen counts the frontends running claude attach on the master, and masterOpenAt is when the first of them began.
 	masterOpen   int
 	masterOpenAt time.Time
+	// saidMaster holds from a say to the master in its turn until next_event returns, which the text waits for.
+	saidMaster bool
 	// orphans holds by id the decisions of an earlier run until orphansUntil, for the hooks and asks that wait on them to send their requests again.
 	orphans      map[string]*Decision
 	orphansUntil time.Time
@@ -659,6 +661,8 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 		resp.Text, err = d.answer(r.Node, r.ID, r.Words, "notice", answer{})
 	case "tell":
 		err = d.tell(r.Node, r.Text)
+	case "say":
+		resp.Text, err = d.say(ctx, r.Node, r.Name, r.Text)
 	case "transcript":
 		resp.Text, err = d.transcript(r.Name, r.Turns)
 	case "spawn":
@@ -1802,6 +1806,9 @@ func (d *daemon) nextEvent(ctx context.Context, key string) []Event {
 			d.taken, d.takenKey = evs, key
 			d.saveLocked()
 		}
+		// What the user said waits in the master's queue until this call returns.
+		said := d.saidMaster
+		d.saidMaster = false
 		wake := d.wake
 		wait := idleReturn - time.Since(begun)
 		if d.masterOpen > 0 {
@@ -1810,6 +1817,9 @@ func (d *daemon) nextEvent(ctx context.Context, key string) []Event {
 		d.mu.Unlock()
 		if ready {
 			return evs
+		}
+		if said {
+			return nil
 		}
 		timer := time.NewTimer(wait)
 		select {

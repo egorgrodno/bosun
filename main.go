@@ -25,6 +25,7 @@ const usage = `usage:
   bosun reply ID ANSWER            answer a question
   bosun dismiss ID                 clear a notice from the master
   bosun tell TEXT                  send the front desk a message, or the master when there is no desk
+  bosun say NODE TEXT              type TEXT into a session as yours, a slash command too
   bosun spawn [-model M] [-effort E] NAME REPO PROMPT
                                    start a worker under the master
   bosun kill NAME                  stop a session
@@ -62,7 +63,7 @@ func main() {
 		err = runAttach(args)
 	case "model":
 		err = runModel(args)
-	case "approve", "deny", "reply", "dismiss", "tell", "spawn", "kill", "pause", "unpause":
+	case "approve", "deny", "reply", "dismiss", "tell", "say", "spawn", "kill", "pause", "unpause":
 		err = runCommand(cmd, args)
 	default:
 		fmt.Fprintln(os.Stderr, usage)

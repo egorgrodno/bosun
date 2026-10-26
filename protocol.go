@@ -108,7 +108,10 @@ type Entry struct {
 	Withdrawn bool   `json:"withdrawn,omitempty"`
 	Cause     string `json:"cause,omitempty"`
 	// Words quotes the user's message that the desk settled a decision on.
-	Words  string `json:"words,omitempty"`
+	Words string `json:"words,omitempty"`
+	// Via is how the user's action reached the session: supervisor where the daemon presented Claude Code's control key, resume where it stopped or resumed the session instead. Error is why the action failed.
+	Via    string `json:"via,omitempty"`
+	Error  string `json:"error,omitempty"`
 	Repo   string `json:"repo,omitempty"`
 	Model  string `json:"model,omitempty"`
 	Effort string `json:"effort,omitempty"`

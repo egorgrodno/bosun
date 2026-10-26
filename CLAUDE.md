@@ -244,13 +244,38 @@ A text the turn takes in gets a `queue-operation` with `operation` `remove` and 
 
 **A signal or a stop ends the process, not the turn.** No measured supervisor op interrupts a turn. `SIGINT` to the session's process ends it, as `claude stop` does. Neither runs `Stop`: each runs `SessionEnd` with `reason` `other`. The transcript ends on the tool call that was running. The next prompt writes that call's result, `[Tool call interrupted: the session ended before this call's result was recorded ...]`. A stop followed by a resume without flags or a prompt leaves the session idle. That interrupts a turn at the cost of a process start.
 
-**The supervisor's `attach` op may carry keys.** In the binary, the op turns its connection into the session's terminal. After its JSON reply, the socket carries raw terminal bytes both ways, so Esc or Enter written there acts as a key. It needs the same `auth` as `reply`. A probe's request omitted a required string field and got `malformed request`.
-
 **`/compact` runs no turn.** It compacts the session in place, under the same session id. It runs `PreCompact` and `PostCompact` with `trigger` `manual`. It runs `SessionStart` with `source` `compact`, and no `UserPromptSubmit`. It ran as the prompt after `--` in a resume of a stopped session, and as a `reply`. Unlike a prompt, a `reply` of `/compact` during a turn waited for the turn's `Stop`, then ran.
+
+## Steering a session
+
+**You steer bosun's sessions from a frontend.** `say` types text into a session as yours. It names a session by node, so it reaches only bosun's own sessions.
+
+**The control key stays with the daemon.** You allowed the daemon to read `~/.claude/daemon/control.key` on 2026-10-26, on these terms:
+
+1. Only the daemon reads the key. It never reaches a session, a frontend, a log or any output.
+2. The daemon uses it only for an action you take from a frontend, never at a session's request.
+3. It uses it only on bosun's own sessions.
+4. Every use goes into the fleet's log, naming the action and the session.
+5. The daemon checks that the supervisor protocol still works, and falls back to stop-and-resume when it does not.
+
+The daemon refuses `say` from a request that names a node, as every MCP and hook request does, and no MCP tool maps to it. `control.go` reads the key for each action and keeps it nowhere. An error quoting the supervisor has the key cut out. Each action that presents the key logs an entry of its kind with `via` `supervisor`, and `error` when it failed.
+
+**The protocol check.** The daemon pings the supervisor before it reads the key, and goes on only at `proto` 1. A missing socket, an answer that is not JSON, another `proto`, a refusal coded `EPROTO`, `EUNKNOWN` or `EAUTH` or with no code, or a missing key counts as a changed protocol. `say` then falls back as below, and any other refusal fails it.
+
+**`say`.** Text that begins with `/` runs as a command. `say` refuses `/model`, which would change the model behind the daemon's record, and `/clear`, which changes the session id. A say to the desk is your message, which its `UserPromptSubmit` carries. Text waits until the running tool call returns, so a say to the master in its turn makes `next_event` return at once.
+
+| The session | `say` |
+|---|---|
+| stopped | resumes it with the text after `--`, without the key |
+| waiting in a permission prompt, whose `needs` begins `approve`, or waiting where `needs` cannot be read | refuses, since the prompt would hold the text and a stop drops it |
+| idle, in its turn or in a question | sends `reply` through the supervisor |
+| any other, with the protocol changed | stops it and resumes it with the text, which cuts a turn short |
+
+**A turn that `say`'s fallback cuts short.** No `Stop` runs, so the daemon ends the turn itself, and the session goes on with the text. It withdraws the session's open decisions. A worker's parent gets a `turn_end` saying you cut the turn short. The master's batch waits again. The reports and tells the turn took stay taken.
 
 ## Frontends
 
-Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `attached`, `transcript`, `conversation`, `follow`. Every rule lives in the daemon.
+Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `attached`, `transcript`, `conversation`, `follow`. Every rule lives in the daemon.
 
 A decision's `reserved` holds the reason it is a reserved action, such as `a force push`. Its `userOnly` marks an action on your list.
 
@@ -281,11 +306,15 @@ A session's `activity` shows what it does: `tool` with `arg`, the main argument 
 | `unpaused` | the user resumed the fleet | `text`: which turns resumed |
 | `model` | the user switched the master or the desk | `model`, `effort` |
 | `turn_end`, `exit` | worker `node` ended its turn, or stopped in it, other than by a kill | `text` |
+| `say` | the user typed into `node` | `text`, `via`, `error` |
+
+`via` is `supervisor` where the daemon presented the control key, and `resume` where it stopped or resumed the session instead. `error` says why the action failed.
 
 A `decision` entry's `by` is the role of the session that asks, or that sent the notice, and `bosun` for bosun's own notices. A `settled` entry says who settled the decision. `by` is `master`, `user`, `desk` with the quoted `words`, `session` for the session's own prompt, or `bosun`. `behavior` is a permission's `allow` or `deny`, and `text` a denial's message or a question's answer. A dismissed notice carries no `behavior` or `text`. A decision nobody answered carries `withdrawn`, and `cause` ends the sentence "withdrawn when …", such as `the pause stopped worker-a`. An entry's `decision` is the decision as it stood then, with each string of its input cut to 2000 characters and `…`.
 
 - `tell` goes to the desk, or to the master when there is no desk, and its result does not say which. During a pause it waits for `unpause`.
 - `model` switches the master or the desk, as `{"op":"model","name":"desk","model":"opus","effort":"high"}`. `name` is `master` or `desk`, and the master when empty. It needs `model`, `effort` or both, and refuses a switch to what the session runs at already, and any switch during a pause. The result comes once the copy has started, and for a busy desk that can take 30 seconds. The `sessions` event then shows the new `id`, `model` and `effort`.
+- `say` takes a node `name` and `text`, as `{"op":"say","name":"worker-a","text":"also run the linter"}`. It answers with a line in `text` that says what happened, such as `worker-a takes it in once its running tool call returns.`
 - `transcript` takes a node `name` and an optional `turns`, 3 by default, and returns that session's last turns in `text`.
 - `attach` clears a stale desk first, which can take most of a minute. A frontend must wait that long for the answer before it runs `claude attach`.
 - `attached` takes the `id` that `claude attach` runs on. A frontend sends it on a connection of its own and closes that connection once `claude attach` exits. The master's id holds without an answer until then, and any other gets an answer at once.
@@ -330,4 +359,8 @@ Each leads with the queue of decisions waiting on you, above the tree. The desk 
 - **The allowlist.** No real session has run it. Two things are unmeasured: whether an `ask` rule sends a call outside the sandbox to `PermissionRequest` in auto mode, and whether `Bash(nixos-rebuild:*)` matches a flake with a `#host` attribute. The gate finds a push's repository from the hook's `cwd`. In the 2.1.310 binary that is the session's working directory, which a `cd` in an earlier Bash call moves, but no real session has shown it.
 - **The lean worker.** The probe ran without bosun's MCP server, in a scratch directory, and its Bash call stopped at a permission prompt after its second request. Whether a worker given a plugin or connectors gets the servers once `--strict-mcp-config` is off, and whether the user's other MCP servers then join it, is unmeasured. So is the effect of a `.lsp.json` or `-lsp` plugin on a worker's size.
 - **The lean master.** Only haiku probe sessions measured it, in a scratch directory with the same flags and settings. No real master has run lean. The snapshot in a probe's transcript records the built-in tools' descriptions too, so a resume without a clear may send the old ones. That is unmeasured, as is whether `--strict-mcp-config` outlasts a resume. No plugin that claude.ai syncs has been seen, so whether `userPlugins` finds one is unknown.
-- **Inside a session.** The probes ran outside bosun. The supervisor's ops may change with any Claude Code build. Esc and Enter through the `attach` op are unmeasured, as are a subagent's records and where they land. Only a fake supervisor fed the probe's lines has run the daemon's `subscribe`. What a subscription sends when its session stops or resumes is unmeasured, as is where the socket lands when the supervisor runs with `TMPDIR` set.
+- **Inside a session.** The probes ran outside bosun. The supervisor's ops may change with any Claude Code build. A subagent's records, and where they land, are unmeasured. Only a fake supervisor fed the probe's lines has run the daemon's `subscribe`. What a subscription sends when its session stops or resumes is unmeasured, as is where the socket lands when the supervisor runs with `TMPDIR` set.
+- **Steering.** Only a fake supervisor has run `say`. A one-time live check, on a haiku worker under a real daemon, must show:
+  1. The socket path the daemon derives is the supervisor's, and its `ping` answers `proto` 1.
+  2. `say` reaches an idle worker and one in a Bash call as the `reply` table in "Inside a session" says, and answers the desk's `AskUserQuestion` by an option's label. The desk's `answer` takes a said text as your one message after its proposal.
+  3. A `reply` of `/btw`, which the binary marks to run at once, runs during a turn rather than after its `Stop`. `say` answers `runs it once its turn ends` for every command, which would then be wrong.

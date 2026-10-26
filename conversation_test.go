@@ -332,16 +332,9 @@ var fakeSocket struct {
 	name string
 }
 
-// fakeSupervisor answers on an abstract socket as Claude Code's supervisor does: serve gets each request's op and short, and returns the lines to answer with.
-func fakeSupervisor(t *testing.T, serve func(op, short string) []string) {
-	t.Helper()
-	name := fmt.Sprintf("@bosun-supervisor-%d-%s", os.Getpid(), t.Name())
-	ln, err := net.Listen("unix", name)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ln.Close() })
-	// A follow's goroutines outlive its test, so controlSocket changes once, and the socket it names changes under a lock.
+// useFakeSocket points controlSocket at name until the test ends.
+// A follow's goroutines outlive its test, so controlSocket changes once, and the socket it names changes under a lock.
+func useFakeSocket(t *testing.T, name string) {
 	fakeSocket.once.Do(func() {
 		controlSocket = func() (string, error) {
 			fakeSocket.mu.Lock()
@@ -360,6 +353,18 @@ func fakeSupervisor(t *testing.T, serve func(op, short string) []string) {
 		fakeSocket.name = ""
 		fakeSocket.mu.Unlock()
 	})
+}
+
+// fakeSupervisor answers on an abstract socket as Claude Code's supervisor does: serve gets each request's op and short, and returns the lines to answer with.
+func fakeSupervisor(t *testing.T, serve func(op, short string) []string) {
+	t.Helper()
+	name := fmt.Sprintf("@bosun-supervisor-%d-%s", os.Getpid(), t.Name())
+	ln, err := net.Listen("unix", name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	useFakeSocket(t, name)
 	go func() {
 		for {
 			conn, err := ln.Accept()
