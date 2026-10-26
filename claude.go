@@ -98,17 +98,30 @@ func (claudeExec) Remove(id, discard string) error {
 	return run("rm", id, "--discard-unpushed", discard)
 }
 
-// transcriptTail is what the transcript Claude Code keeps of a session tells of the session's last turn.
-type transcriptTail struct {
-	// text is the last text the session wrote in its own conversation, at is when it last wrote, and ended whether it then ended its turn.
+// transcript is what the transcript Claude Code keeps of a session tells: its last turns in its own conversation, the last text it wrote there, when it last wrote, and whether it then ended its turn.
+type transcript struct {
+	turns []turn
 	text  string
 	at    time.Time
 	ended bool
 }
 
-// readTranscript reads the transcript of Claude Code session sid.
-func readTranscript(sid string) (transcriptTail, error) {
-	var s transcriptTail
+// turn is the prompt that began a turn, then the session's text and a line for each of its tool calls, in order.
+type turn struct {
+	prompt string
+	steps  []string
+}
+
+// keptPrompt and keptText clip each prompt and each text of a turn, in runes.
+const (
+	keptPrompt = 1000
+	keptText   = 2000
+)
+
+// readTranscript reads the transcript of Claude Code session sid, with its last keep turns.
+// Every reader of a transcript goes through it, so a change in Claude Code's format breaks this function alone.
+func readTranscript(sid string, keep int) (transcript, error) {
+	var s transcript
 	if sid == "" {
 		return s, errors.New("bosun knows no Claude Code session id for it")
 	}
@@ -121,37 +134,141 @@ func readTranscript(sid string) (transcriptTail, error) {
 		return s, err
 	}
 	defer f.Close()
+	step := func(line string) {
+		if keep == 0 {
+			return
+		}
+		if len(s.turns) == 0 {
+			s.turns = append(s.turns, turn{})
+		}
+		t := &s.turns[len(s.turns)-1]
+		t.steps = append(t.steps, line)
+	}
 	r := bufio.NewReader(f)
 	for {
 		line, err := r.ReadBytes('\n')
 		var entry struct {
 			Type      string    `json:"type"`
 			Sidechain bool      `json:"isSidechain"`
+			Meta      bool      `json:"isMeta"`
 			Timestamp time.Time `json:"timestamp"`
 			Message   struct {
-				StopReason string `json:"stop_reason"`
-				Content    []struct {
-					Type string `json:"type"`
-					Text string `json:"text"`
-				} `json:"content"`
+				StopReason string          `json:"stop_reason"`
+				Content    json.RawMessage `json:"content"`
 			} `json:"message"`
+			Attachment struct {
+				Type   string          `json:"type"`
+				Prompt json.RawMessage `json:"prompt"`
+			} `json:"attachment"`
 		}
-		if json.Unmarshal(line, &entry) == nil && entry.Type == "assistant" && !entry.Sidechain {
+		switch {
+		case json.Unmarshal(line, &entry) != nil || entry.Sidechain:
+		case entry.Type == "assistant":
 			s.at, s.ended = entry.Timestamp, entry.Message.StopReason == "end_turn"
 			var parts []string
-			for _, c := range entry.Message.Content {
-				if c.Type == "text" {
+			for _, c := range contentBlocks(entry.Message.Content) {
+				switch c.Type {
+				case "text":
 					parts = append(parts, c.Text)
+					step(clip(c.Text, keptText))
+				case "tool_use":
+					detail, more := inputDetail(c.Input), ""
+					if i := strings.IndexByte(detail, '\n'); i >= 0 {
+						detail, more = detail[:i], " …"
+					}
+					step(fmt.Sprintf("[%s] %s%s", c.Name, detail, more))
 				}
 			}
 			if len(parts) > 0 {
 				s.text = strings.Join(parts, "\n")
+			}
+		// A user message that holds tool results, or that Claude Code adds itself, such as a skill's text, begins no turn.
+		case entry.Type == "user" && !entry.Meta && keep > 0:
+			switch prompt := promptText(entry.Message.Content); {
+			case prompt == "":
+			// Claude Code records the user's interruption of a turn as a prompt, which begins no turn.
+			case strings.HasPrefix(prompt, "[Request interrupted by user"):
+				step(quote(prompt))
+			default:
+				s.turns = append(s.turns, turn{prompt: clip(prompt, keptPrompt)})
+				s.turns = s.turns[max(0, len(s.turns)-keep):]
+			}
+		// What the user types while the session runs a tool reaches the turn between tool calls, as do other sessions' messages.
+		case entry.Type == "attachment" && entry.Attachment.Type == "queued_command":
+			if prompt := promptText(entry.Attachment.Prompt); prompt != "" {
+				step(quote(clip(prompt, keptPrompt)))
 			}
 		}
 		if err != nil {
 			return s, nil
 		}
 	}
+}
+
+// block is one block of a message's content.
+type block struct {
+	Type  string          `json:"type"`
+	Text  string          `json:"text"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
+}
+
+// contentBlocks reads a message's content, which is a string or a list of blocks.
+func contentBlocks(raw json.RawMessage) []block {
+	var text string
+	if json.Unmarshal(raw, &text) == nil {
+		return []block{{Type: "text", Text: text}}
+	}
+	var blocks []block
+	_ = json.Unmarshal(raw, &blocks)
+	return blocks
+}
+
+// commandName and commandArgs are how a transcript records a slash command the session ran, such as a skill or the /clear that begins a cleared conversation.
+var (
+	commandName = regexp.MustCompile(`<command-name>([^<]*)</command-name>`)
+	commandArgs = regexp.MustCompile(`<command-args>([^<]*)</command-args>`)
+)
+
+// promptText returns the text of a prompt's content, or the slash command it ran.
+func promptText(raw json.RawMessage) string {
+	var parts []string
+	for _, c := range contentBlocks(raw) {
+		if c.Type == "text" {
+			parts = append(parts, c.Text)
+		}
+	}
+	text := strings.TrimSpace(strings.Join(parts, "\n"))
+	if m := commandName.FindStringSubmatch(text); m != nil && strings.HasPrefix(text, "<command-") {
+		args := ""
+		if a := commandArgs.FindStringSubmatch(text); a != nil {
+			args = a[1]
+		}
+		return strings.TrimSpace(m[1] + " " + args)
+	}
+	return text
+}
+
+// quote marks each line of text as what the session was told.
+func quote(text string) string {
+	return "> " + strings.ReplaceAll(text, "\n", "\n> ")
+}
+
+// render lays out the turns: each prompt quoted, then the session's text and a line for each tool call.
+func (s transcript) render() string {
+	var b strings.Builder
+	for i, t := range s.turns {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		if t.prompt != "" {
+			b.WriteString(quote(t.prompt) + "\n")
+		}
+		for _, line := range t.steps {
+			b.WriteString(line + "\n")
+		}
+	}
+	return b.String()
 }
 
 func run(cmd, id string, args ...string) error {

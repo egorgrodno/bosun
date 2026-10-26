@@ -187,8 +187,20 @@ func describe(dec Decision) string {
 	case "notice":
 		return "notice"
 	}
+	s := fmt.Sprintf("%s: %s", dec.Tool, inputDetail(dec.Input))
+	if dec.Reserved != "" {
+		s += fmt.Sprintf("  [%s]", dec.Reserved)
+	}
+	if dec.Refused != "" {
+		s += "  [auto mode refused the last call: " + dec.Refused + "]"
+	}
+	return s
+}
+
+// inputDetail is the part of a tool call's input that says what it does, such as a command or a file, cut to 120 bytes.
+func inputDetail(input json.RawMessage) string {
 	var in map[string]any
-	_ = json.Unmarshal(dec.Input, &in)
+	_ = json.Unmarshal(input, &in)
 	detail := ""
 	for _, key := range []string{"command", "file_path", "notebook_path", "url", "pattern"} {
 		if v, ok := in[key].(string); ok {
@@ -197,17 +209,10 @@ func describe(dec Decision) string {
 		}
 	}
 	if detail == "" {
-		detail = compact(dec.Input)
+		detail = compact(input)
 	}
 	if len(detail) > 120 {
 		detail = detail[:117] + "..."
 	}
-	s := fmt.Sprintf("%s: %s", dec.Tool, detail)
-	if dec.Reserved != "" {
-		s += fmt.Sprintf("  [%s]", dec.Reserved)
-	}
-	if dec.Refused != "" {
-		s += "  [auto mode refused the last call: " + dec.Refused + "]"
-	}
-	return s
+	return detail
 }

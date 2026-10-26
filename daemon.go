@@ -308,7 +308,7 @@ func (d *daemon) load() error {
 			s.Heard = now
 		default:
 			// The transcript holds a turn whose start no daemon saw, as when it ran while none did.
-			if tail, err := readTranscript(s.SessionID); err == nil && tail.at.After(s.Heard) {
+			if tail, err := readTranscript(s.SessionID, 0); err == nil && tail.at.After(s.Heard) {
 				s.Turn = true
 			}
 		}
@@ -2441,7 +2441,7 @@ func (d *daemon) refresh(byID map[string]agent, listed time.Time) (masterMoved b
 			n.Turn = false
 		case missed:
 			d.heardLocked(n)
-			tail, err := readTranscript(n.SessionID)
+			tail, err := readTranscript(n.SessionID, 0)
 			switch {
 			case status == "idle" || err == nil && tail.ended:
 				if err != nil {
