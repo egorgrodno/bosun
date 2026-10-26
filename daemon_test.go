@@ -242,9 +242,14 @@ func hookEvent(event, toolUseID, tool string, input map[string]any) []byte {
 }
 
 func runHookAsync(node string, raw []byte) chan string {
+	return runHookAsyncFrom(node, "", raw)
+}
+
+// runHookAsyncFrom runs a hook of a session whose process has the messaging socket socket.
+func runHookAsyncFrom(node, socket string, raw []byte) chan string {
 	ch := make(chan string, 1)
 	go func() {
-		out := hookOutput(node, bytes.NewReader(raw))
+		out := hookOutput(node, socket, bytes.NewReader(raw))
 		data, _ := json.Marshal(out)
 		ch <- string(data)
 	}()
@@ -993,7 +998,7 @@ func staleMaster(t *testing.T, status string, written time.Time, keepWorker bool
 	fc.agents[0].SessionID = "s-m"
 	fc.cleared = func(name, sid string) {
 		raw, _ := json.Marshal(map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "source": "clear"})
-		hookOutput(name, bytes.NewReader(raw))
+		hookOutput(name, "", bytes.NewReader(raw))
 	}
 	fc.mu.Unlock()
 	fc.setStatus("00000001", status)
@@ -1132,27 +1137,57 @@ func TestSendMessage(t *testing.T) {
 		defer fc.mu.Unlock()
 		return len(fc.starts)
 	}
-	if out := send("master [c9e04b]"); !strings.Contains(out, `"permissionDecision":"deny"`) || !strings.Contains(out, "ask") {
+	denied := func(out string) bool { return strings.Contains(out, `"permissionDecision":"deny"`) }
+	if out := send("master [c9e04b]"); !denied(out) || !strings.Contains(out, "ask") {
 		t.Fatalf("a message to the master printed %s", out)
-	}
-	if out := send("bosun-cd"); out != "null" {
-		t.Fatalf("a message to a session outside bosun printed %s", out)
 	}
 
 	d.mu.Lock()
 	d.nodes["b"] = &Session{Node: "b", Parent: masterNode, Repo: "/repo", Dir: "/repo/.claude/worktrees/b", Depth: 1, ID: "bbbbbbbb", Status: "idle"}
 	d.mu.Unlock()
 	fc.add(agent{ID: "bbbbbbbb", SessionID: "s-b", Name: "b", Status: "idle"})
-	if out := send("b [09215d]"); out != "null" || starts() != 1 {
-		t.Fatalf("a message to an idle worker printed %s, and claude ran %d times", out, starts())
+	// Every hook of b's process carries its messaging socket.
+	receive(t, runHookAsyncFrom("b", "/run/user/1000/cc-socks/2.sock", hookEvent("PostToolUse", "t0", "Bash", bashTest)))
+	for _, to := range []string{"b", "uds:/run/user/1000/cc-socks/2.sock", "/run/user/1000/cc-socks/2.sock", "main", "a0123456789abcdef", "areviewer-0123456789abcdef"} {
+		if out := send(to); out != "null" {
+			t.Fatalf("a message to %q printed %s", to, out)
+		}
+	}
+	if starts() != 1 {
+		t.Fatalf("claude ran %d times for messages to a running worker", starts())
+	}
+	// SendMessage would take any of these to a session outside bosun: by its name, by a prefix of it, by a ref among sessions named b, or by its address.
+	for _, to := range []string{"bosun-cd", "B", "bosun", "b [09215d]", "uds:/run/user/1000/cc-socks/3.sock", "/run/user/1000/cc-socks/3.sock", "bridge:cse_0123", "did:web:x", " b"} {
+		if out := send(to); !denied(out) {
+			t.Fatalf("a message to %q printed %s", to, out)
+		}
+	}
+	// While bosun stops or resumes b, it has no inbox for a while.
+	d.mu.Lock()
+	d.nodes["b"].held = true
+	d.mu.Unlock()
+	if out := send("b"); !denied(out) {
+		t.Fatalf("a message to a worker bosun holds printed %s", out)
+	}
+	d.mu.Lock()
+	d.nodes["b"].held = false
+	d.mu.Unlock()
+
+	// b's process stopped, though no poll has seen it: its socket names that process alone.
+	fc.setStatus("bbbbbbbb", "")
+	if out := send("uds:/run/user/1000/cc-socks/2.sock"); !denied(out) || starts() != 1 {
+		t.Fatalf("a message to the socket of b's stopped process printed %s, and claude ran %d times", out, starts())
 	}
 	// A stopped session has no inbox, so it resumes idle before the message goes, though no poll has seen it stop.
-	fc.setStatus("bbbbbbbb", "")
 	if out := send("b"); out != "null" {
 		t.Fatalf("a message to a stopped worker printed %s", out)
 	}
 	if args := fc.lastStart(); !slices.Equal(args, []string{"--bg", "--resume", "s-b"}) {
 		t.Fatalf("claude ran with %q", args)
+	}
+	// Its stopped process's socket path may go to another session.
+	if out := send("uds:/run/user/1000/cc-socks/2.sock"); !denied(out) {
+		t.Fatalf("a message to the socket of b's stopped process printed %s", out)
 	}
 
 	fc.setStatus("bbbbbbbb", "")
@@ -1160,8 +1195,29 @@ func TestSendMessage(t *testing.T) {
 	d.nodes["b"].Killed = true
 	d.mu.Unlock()
 	before := starts()
-	if out := send("b"); !strings.Contains(out, `"permissionDecision":"deny"`) || starts() != before {
+	if out := send("b"); !denied(out) || starts() != before {
 		t.Fatalf("a message to a worker the user stopped printed %s, and claude ran %d more times", out, starts()-before)
+	}
+
+	d.mu.Lock()
+	d.nodes["b"].Killed, d.nodes["b"].Status = false, "exited"
+	d.mu.Unlock()
+	if out := send("b"); !denied(out) {
+		t.Fatalf("a message to a worker that exited printed %s", out)
+	}
+}
+
+func TestPollForgetsSocket(t *testing.T) {
+	d, fc := testDaemon(t)
+	fc.add(agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a", Status: "busy"})
+	receive(t, runHookAsyncFrom("a", "/run/user/1000/cc-socks/1.sock", hookEvent("UserPromptSubmit", "", "", nil)))
+	d.poll()
+	fc.setStatus("aaaaaaaa", "")
+	d.poll()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if s := d.nodes["a"].Socket; s != "" {
+		t.Fatalf("a stopped worker keeps the socket %s", s)
 	}
 }
 

@@ -109,6 +109,18 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 
 **Workers talk through Claude Code.** `SendMessage` reaches a running session by its `-n` name, so workers address each other by node name. Auto mode runs it without a permission request, so the master never decides on a message. A message arrives between tool calls, so one to a worker blocked in `ask` waits until the call returns. A message to an idle session starts a turn, and that turn's `Stop` reaches the master as a `turn_end`.
 
+**Messages stay in the tree.** The user's other sessions act on a peer's message in auto mode, without bosun's reserved check. So every session's `PreToolUse` checks the `to` of a `SendMessage`:
+
+| `to` | `SendMessage` reaches | The hook |
+|---|---|---|
+| a worker's name | the worker; while it has no inbox, a session whose name starts with it | resumes a stopped worker idle and allows it; denies a killed, exited or starting one |
+| a name and `[ref]` | one of several sessions of that name | denies it, since bosun cannot tell which |
+| `uds:` and a path, or a path ending in `.sock` | the session listening there | allows a worker's socket while its process runs |
+| `main`, a subagent's id | the sender's own session | allows it |
+| any other name, a prefix of a name, `bridge:`, `did:`, a Claude Desktop session id | a session bosun cannot match to a worker | denies it |
+
+The check covers only what a session sends: a message from outside bosun reaches a worker like typed text.
+
 **The daemon reads every message.** Each delivered message runs `UserPromptSubmit`, with the prompt in a `<cross-session-message>` tag that names the sender. The daemon shows it to the frontends. Unless the master sent it, the daemon also queues it as a `message` event. That event wakes no master and blocks no `Stop`, and reaches the master along with the next event the master must act on.
 
 **A stopped worker resumes for a message.** A stopped session has no inbox, so a `SendMessage` to it reports `No agent named '<name>' is reachable`. The sender's `PreToolUse` therefore resumes a stopped worker idle first, unless `bosun kill` stopped it. That is in time, since `SendMessage` looks up its recipient only after `PreToolUse` returns, and `claude --bg --resume` returns once the inbox exists. Only a node name resumes a stopped worker: the `uds:` address a message came from names the old process.

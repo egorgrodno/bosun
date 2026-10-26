@@ -400,7 +400,7 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	var err error
 	switch r.Op {
 	case "hook":
-		resp, err = d.hook(ctx, r.Node, r.Hook)
+		resp, err = d.hook(ctx, r.Node, r.Socket, r.Hook)
 	case "ask":
 		resp.Text, err = d.ask(ctx, r.Node, r.Text)
 	case "next_event":
@@ -462,8 +462,8 @@ type hookInput struct {
 	Reason      string          `json:"reason"`
 }
 
-// hook handles one hook event of a session. It blocks while a decision it opened waits, and answers with no behavior when the decision is withdrawn.
-func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Response, error) {
+// hook handles one hook event of a session, whose process has the messaging socket socket. It blocks while a decision it opened waits, and answers with no behavior when the decision is withdrawn.
+func (d *daemon) hook(ctx context.Context, node, socket string, raw json.RawMessage) (Response, error) {
 	resp := Response{Type: "result"}
 	var in hookInput
 	if err := json.Unmarshal(raw, &in); err != nil {
@@ -478,11 +478,16 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 	if n.SessionID == "" {
 		n.SessionID = in.SessionID
 	}
+	if socket != "" && socket != n.Socket {
+		n.Socket = socket
+		d.saveLocked()
+	}
 	d.stirred = true
 	var dec *Decision
 	var worktree string
-	// peer is the node and session id a SendMessage goes to, which must run to take it.
+	// peer is the node and session id a SendMessage goes to, which must run to take it, and peerSocket whether the message names its process's socket.
 	var peer, peerID string
+	var peerSocket bool
 	switch in.Event {
 	case "SessionStart":
 		if n.Repo != "" {
@@ -513,15 +518,27 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 		if in.ToolName != "SendMessage" {
 			break
 		}
-		switch to := d.nodes[recipient(in.ToolInput)]; {
+		var msg struct {
+			To string `json:"to"`
+		}
+		_ = json.Unmarshal(in.ToolInput, &msg)
+		to, refusal := d.recipientLocked(msg.To)
+		switch {
+		case refusal != "":
+			resp.Behavior, resp.Text = "deny", refusal
 		case to == nil:
 		case to.Node == masterNode:
 			// The master refuses messages, but SendMessage reports success all the same, and the refusal starts the sender's next turn.
 			resp.Behavior, resp.Text = "deny", "bosun: the master takes no messages. Ask it with ask, which waits for its answer."
 		case to.Killed:
 			resp.Behavior, resp.Text = "deny", fmt.Sprintf("bosun: the user stopped %s, so it takes no messages.", to.Node)
-		case to.ID != "" && to.Status != "exited":
-			peer, peerID = to.Node, to.ID
+		// SendMessage would take the name of a session without an inbox as a prefix of another session's name.
+		case to.Status == "exited":
+			resp.Behavior, resp.Text = "deny", fmt.Sprintf("bosun: %s has exited, so it takes no messages.", to.Node)
+		case to.ID == "" || to.held:
+			resp.Behavior, resp.Text = "deny", fmt.Sprintf("bosun: %s is %v, so send the message again in a moment.", to.Node, errStarting)
+		default:
+			peer, peerID, peerSocket = to.Node, to.ID, socketAddress(msg.To)
 		}
 	case "PermissionRequest":
 		holder := "master"
@@ -580,10 +597,20 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 			log.Printf("%s: .gitmodules: %v", node, err)
 		}
 	}
+	if peer != "" && peerSocket {
+		// A socket names one process, and a session that stopped comes back in another.
+		if _, a, err := d.listed(peerID); err != nil || a.Status == "" {
+			resp.Behavior, resp.Text = "deny", fmt.Sprintf("bosun: the process of %s at that address has stopped. Message it by its node name, which resumes it.", peer)
+		}
+		return resp, nil
+	}
 	if peer != "" {
 		// A stopped session has no inbox, and SendMessage looks for one only after this hook returns.
 		// The listing, which resumeIdle reads, may show a retirement that the last poll missed.
-		if err := d.resumeIdle(peerID); err != nil && !errors.Is(err, errStarting) {
+		switch err := d.resumeIdle(peerID); {
+		case errors.Is(err, errStarting):
+			resp.Behavior, resp.Text = "deny", fmt.Sprintf("bosun: %s is %v, so send the message again in a moment.", peer, errStarting)
+		case err != nil:
 			resp.Behavior, resp.Text = "deny", fmt.Sprintf("bosun: %s has stopped, and resuming it to take the message failed: %v", peer, err)
 		}
 		return resp, nil
@@ -659,8 +686,11 @@ func (n *Session) match(tool string, input json.RawMessage) string {
 var (
 	crossSession = regexp.MustCompile(`(?s)^<cross-session-message\b([^>]*)>\n(.*)\n</cross-session-message>$`)
 	attribute    = regexp.MustCompile(`([a-z-]+)="([^"]*)"`)
-	// ref is what ListAgents shows after each name, and SendMessage takes along with it.
+	// ref is what ListAgents shows after each name, and SendMessage takes along with it to pick one of the sessions of that name.
 	ref = regexp.MustCompile(` \[[0-9A-Za-z]+\]$`)
+	// subagentID and bareSocket are what SendMessage in Claude Code 2.1.310 takes for a subagent's id, which it looks up only among the sender's own subagents, and for a uds: address without its prefix.
+	subagentID = regexp.MustCompile(`^a(?:[\w-]{1,63}-)?[0-9a-f]{16}$`)
+	bareSocket = regexp.MustCompile(`^/\S*\.sock$`)
 )
 
 // peerMessage returns the sender and text of a prompt that Claude Code submits for another session's message.
@@ -676,13 +706,44 @@ func peerMessage(prompt string) (from, text string, ok bool) {
 	return cmp.Or(attrs["from-name"], attrs["from"]), m[2], true
 }
 
-// recipient returns the name a SendMessage addresses, which for a bosun session is its node.
-func recipient(input json.RawMessage) string {
-	var in struct {
-		To string `json:"to"`
+// socketAddress reports whether SendMessage takes to for a socket's path.
+func socketAddress(to string) bool {
+	return strings.HasPrefix(to, "uds:") || bareSocket.MatchString(to)
+}
+
+// recipientLocked returns the bosun session that a SendMessage's to addresses, by its node name or its socket, or nil for one of the sender's own subagents.
+// Any other recipient may be a session outside bosun, whose auto mode would act on the message without bosun's reserved check, so it returns why the message may not go.
+func (d *daemon) recipientLocked(to string) (*Session, string) {
+	switch {
+	case to == "main" || subagentID.MatchString(to):
+		return nil, ""
+	case socketAddress(to):
+		path := strings.TrimPrefix(to, "uds:")
+		for _, n := range d.nodes {
+			if n.Socket != "" && n.Socket == path {
+				return n, ""
+			}
+		}
+		return nil, fmt.Sprintf("bosun: %s is the address of no running bosun session. Message a worker by its node name.", to)
 	}
-	_ = json.Unmarshal(input, &in)
-	return ref.ReplaceAllString(in.To, "")
+	if n := d.nodes[to]; n != nil {
+		return n, ""
+	}
+	name := ref.ReplaceAllString(to, "")
+	if name == masterNode {
+		return d.nodes[name], ""
+	}
+	if name != to && d.nodes[name] != nil {
+		// SendMessage asks for a ref only when another session has the node's name, and bosun cannot tell which session a ref picks.
+		return nil, fmt.Sprintf("bosun: message %s by its bare node name, %q, without the ref. If SendMessage refuses the bare name because another session has it too, ask instead.", name, name)
+	}
+	var workers []string
+	for _, n := range d.sortedLocked() {
+		if n.Node != masterNode && !n.Killed && n.Status != "exited" {
+			workers = append(workers, n.Node)
+		}
+	}
+	return nil, fmt.Sprintf("bosun: %q is not a bosun worker, and workers message only each other, by node name: %s.", to, strings.Join(workers, ", "))
 }
 
 func compact(raw json.RawMessage) string {
@@ -1608,6 +1669,9 @@ func (d *daemon) restart(ctx context.Context, n *Session, id, dir, prompt string
 			return err
 		}
 	}
+	d.mu.Lock()
+	n.Socket = ""
+	d.mu.Unlock()
 	return d.resumeStopped(dir, id, a.SessionID, prompt)
 }
 
@@ -1651,7 +1715,7 @@ func (d *daemon) resumeIdle(id string) error {
 		d.mu.Unlock()
 		return fmt.Errorf("%s is %w", node, errStarting)
 	}
-	n.held = true
+	n.held, n.Socket = true, ""
 	dir := n.Dir
 	d.mu.Unlock()
 	err = d.resumeStopped(dir, id, a.SessionID, "")
@@ -1970,6 +2034,9 @@ func (d *daemon) refresh(byID map[string]agent) (masterMoved bool) {
 			log.Printf("%s %s in its turn", n.Node, status)
 		}
 		n.Status, n.State = status, state
+		if !listed || a.Status == "" {
+			n.Socket = ""
+		}
 		changed = true
 	}
 	if changed {

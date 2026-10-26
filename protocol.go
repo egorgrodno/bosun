@@ -12,15 +12,17 @@ import (
 )
 
 // Request is a line a client sends the daemon. Node names the calling session, and is empty for a frontend.
+// A hook's Socket is the messaging socket of the session's process, which other sessions address it by.
 type Request struct {
-	Op    string          `json:"op"`
-	Node  string          `json:"node,omitempty"`
-	ID    string          `json:"id,omitempty"`
-	Name  string          `json:"name,omitempty"`
-	Repo  string          `json:"repo,omitempty"`
-	Model string          `json:"model,omitempty"`
-	Text  string          `json:"text,omitempty"`
-	Hook  json.RawMessage `json:"hook,omitempty"`
+	Op     string          `json:"op"`
+	Node   string          `json:"node,omitempty"`
+	Socket string          `json:"socket,omitempty"`
+	ID     string          `json:"id,omitempty"`
+	Name   string          `json:"name,omitempty"`
+	Repo   string          `json:"repo,omitempty"`
+	Model  string          `json:"model,omitempty"`
+	Text   string          `json:"text,omitempty"`
+	Hook   json.RawMessage `json:"hook,omitempty"`
 }
 
 // Response is a line the daemon sends: a "result" for each request, and on a watch a "snapshot" followed by "event"s.
@@ -90,6 +92,8 @@ type Session struct {
 	Killed    bool   `json:"killed,omitempty"`
 	// Conversation is the one a clear began, which a copy of the session must name.
 	Conversation string `json:"conversation,omitempty"`
+	// Socket is the messaging socket of the session's running process, forgotten once the process stops, since another process may take the path.
+	Socket string `json:"socket,omitempty"`
 	// LimitedUntil is when the usage limit that stopped the session resets, and the daemon resumes it.
 	LimitedUntil *time.Time `json:"limitedUntil,omitempty"`
 

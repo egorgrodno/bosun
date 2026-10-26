@@ -11,14 +11,14 @@ import (
 )
 
 func runHook() {
-	if out := hookOutput(os.Getenv("BOSUN_NODE"), os.Stdin); out != nil {
+	if out := hookOutput(os.Getenv("BOSUN_NODE"), os.Getenv("CLAUDE_CODE_MESSAGING_SOCKET"), os.Stdin); out != nil {
 		_ = json.NewEncoder(os.Stdout).Encode(out)
 	}
 }
 
 // hookOutput relays a hook event to the daemon and returns what the hook prints, or nil to leave the call to Claude Code.
 // A PreToolUse that fails or times out lets the call through, so the reserved check denies on any error, an unreachable daemon included.
-func hookOutput(node string, stdin io.Reader) any {
+func hookOutput(node, socket string, stdin io.Reader) any {
 	raw, err := io.ReadAll(stdin)
 	var in struct {
 		Event string `json:"hook_event_name"`
@@ -34,7 +34,7 @@ func hookOutput(node string, stdin io.Reader) any {
 	defer cancel()
 	var resp Response
 	if err == nil {
-		resp, err = call(ctx, Request{Op: "hook", Node: node, Hook: raw})
+		resp, err = call(ctx, Request{Op: "hook", Node: node, Socket: socket, Hook: raw})
 	}
 	switch in.Event {
 	case "PreToolUse":
