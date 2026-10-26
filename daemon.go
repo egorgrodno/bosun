@@ -444,6 +444,7 @@ type hookInput struct {
 	Error       string          `json:"error"`
 	Prompt      string          `json:"prompt"`
 	Source      string          `json:"source"`
+	Reason      string          `json:"reason"`
 }
 
 // hook handles one hook event of a session. It blocks while a decision it opened waits, and answers with no behavior when the decision is withdrawn.
@@ -512,8 +513,11 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 		if node == masterNode {
 			holder = "user"
 		}
-		dec = &Decision{Kind: "permission", Node: node, Holder: holder, Tool: in.ToolName, Input: in.ToolInput, toolUseID: n.match(in.ToolName, in.ToolInput)}
+		dec = &Decision{Kind: "permission", Node: node, Holder: holder, Tool: in.ToolName, Input: in.ToolInput, Refused: n.refused, toolUseID: n.match(in.ToolName, in.ToolInput)}
+	case "PermissionDenied":
+		n.refused = cmp.Or(in.Reason, "it gave no reason")
 	case "PostToolUse", "PostToolUseFailure":
+		n.refused = ""
 		delete(n.pre, in.ToolUseID)
 		d.withdrawLocked(node, func(dec *Decision) bool { return dec.toolUseID == in.ToolUseID })
 	case "StopFailure":
@@ -1207,6 +1211,7 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 			"UserPromptSubmit":   quick,
 			"PreToolUse":         hold,
 			"PermissionRequest":  hold,
+			"PermissionDenied":   quick,
 			"PostToolUse":        quick,
 			"PostToolUseFailure": quick,
 			"Stop":               quick,

@@ -82,7 +82,7 @@ func tools(master bool) []tool {
 			"id":     str("The decision's id."),
 			"answer": str("The answer."),
 		})},
-		{"decide", "Allow or deny a worker's permission request: a tool call that its permission rules and auto mode did not approve. Allow it when the worker's task needs it and it can be undone. Deny it with a message that tells the worker what to do instead. Escalate what the user should judge, such as a call the task needs that cannot be undone.", object([]string{"id", "allow"}, map[string]any{
+		{"decide", "Allow or deny a worker's permission request: a tool call that its permission rules and auto mode did not approve. Allow it when the worker's task needs it and it can be undone. Deny it with a message that tells the worker what to do instead. Escalate what the user should judge, such as a call the task needs that cannot be undone. A request with refused set comes after auto mode refused the worker's last call, which says why: after a run of refusals, auto mode asks about a call instead of refusing it, so it likely judged this one risky too. Escalate it unless the user's instructions plainly cover it.", object([]string{"id", "allow"}, map[string]any{
 			"id":      str("The decision's id."),
 			"allow":   map[string]any{"type": "boolean", "description": "true to allow the tool call, false to deny it."},
 			"message": str("When denying, why. It reaches the worker verbatim, so tell it what to do instead."),

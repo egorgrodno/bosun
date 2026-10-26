@@ -60,6 +60,8 @@ type Decision struct {
 	Input    json.RawMessage `json:"input,omitempty"`
 	Question string          `json:"question,omitempty"`
 	Note     string          `json:"note,omitempty"`
+	// Refused is the reason auto mode gave for refusing the session's last call. After a run of refusals, it asks about a call instead of refusing it.
+	Refused string `json:"refused,omitempty"`
 
 	toolUseID string
 	answer    chan answer
@@ -97,6 +99,8 @@ type Session struct {
 	pre map[string]preCall
 	// held keeps poll, resume, merge and kill off the session while one of them stops or resumes it.
 	held bool
+	// refused is the reason auto mode gave for refusing the session's last call, until a call runs.
+	refused string
 }
 
 func socketPath() string {

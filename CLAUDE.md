@@ -66,6 +66,8 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Permissions reach the master once auto mode passes them up.** The daemon hands the permission to the master as an event. The master allows it, denies it, or escalates it to you. The master's own permissions go straight to you.
 
+**Auto mode refuses some calls and asks about others.** A call that auto mode's classifier refuses runs `PermissionDenied`, not `PermissionRequest`, and the session gets the classifier's reason. After a run of refusals, auto mode asks about a call instead of refusing it, so `PermissionRequest` runs and `PermissionDenied` does not. In the probe, that run was a hook's denial followed by two refusals. Such a request carries nothing of the refusals, so the daemon keeps the reason of each session's last refusal until one of its calls runs, and sends it with the permission as `refused`.
+
 **Waiting on you.** A hook's `timeout` may exceed the 600-second default, and the hook decides the call whenever it answers within it. Six seconds after the hook starts, the session also shows its own prompt, and `claude agents --json` reports it as `"status":"waiting","state":"blocked"`. After the `timeout`, only that prompt settles the call. The daemon then moves the decision out of its queue and shows the session as blocked in its own prompt.
 
 **An answer in the session wins.** Answering the session's own prompt through `claude attach` settles the call at once, and the hook keeps running. `PermissionRequest` carries no call id, so the daemon pairs it with the `PreToolUse` event before it, which carries `tool_use_id`. A `PostToolUse` or `PostToolUseFailure` for that id withdraws the decision. A denial in the session runs no tool, so the session's next `PreToolUse` or `Stop` withdraws it instead.
@@ -124,6 +126,5 @@ Each leads with the queue of decisions waiting on you, above the tree.
 
 ## Open questions
 
-- **Auto mode refusals.** It is untested whether an action the classifier refuses in a `--bg` session reaches `PermissionRequest`, or only `PermissionDenied` (#5).
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
 - **Turn ends below the master.** Only the master gets `turn_end`, so a worker cannot tell when its own child is ready to merge, and the master merges it instead. A worker could subscribe to its child with `SendMessage`'s `notify_when_idle`, which works between background sessions and whose notice starts the subscriber's next turn (#29).

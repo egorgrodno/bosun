@@ -308,6 +308,40 @@ func TestMasterAllowsPermission(t *testing.T) {
 	}
 }
 
+// After a run of refusals, auto mode asks about a call it would refuse, and the master hears why it refused the last one.
+func TestPermissionAfterRefusal(t *testing.T) {
+	testDaemon(t)
+	permission := func(toolUseID string) Decision {
+		t.Helper()
+		receive(t, runHookAsync("a", hookEvent("PreToolUse", toolUseID, "Bash", bashTest)))
+		hook := runHookAsync("a", hookEvent("PermissionRequest", "", "Bash", bashTest))
+		events := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events
+		if len(events) != 1 || events[0].Decision == nil {
+			t.Fatalf("events = %+v", events)
+		}
+		mustCall(t, Request{Op: "deny", Node: masterNode, ID: events[0].Decision.ID})
+		receive(t, hook)
+		return *events[0].Decision
+	}
+	receive(t, runHookAsync("a", hookEvent("PreToolUse", "t1", "Bash", bashTest)))
+	denied, _ := json.Marshal(map[string]any{"hook_event_name": "PermissionDenied", "tool_use_id": "t1", "tool_name": "Bash", "tool_input": bashTest, "reason": "judged dangerous"})
+	if out := receive(t, runHookAsync("a", denied)); out != "null" {
+		t.Fatalf("PermissionDenied printed %s", out)
+	}
+	if dec := permission("t2"); dec.Refused != "judged dangerous" {
+		t.Fatalf("the permission after a refusal = %+v", dec)
+	}
+	// A denial in the session ends no run of refusals, and a call that runs does.
+	if dec := permission("t3"); dec.Refused != "judged dangerous" {
+		t.Fatalf("the permission after a refusal and a denial = %+v", dec)
+	}
+	receive(t, runHookAsync("a", hookEvent("PreToolUse", "t4", "Read", nil)))
+	receive(t, runHookAsync("a", hookEvent("PostToolUse", "t4", "Read", nil)))
+	if dec := permission("t5"); dec.Refused != "" {
+		t.Fatalf("the permission after a call ran = %+v", dec)
+	}
+}
+
 func TestEscalatedPermissionWaitsOnUser(t *testing.T) {
 	testDaemon(t)
 	hook := runHookAsync("a", hookEvent("PermissionRequest", "", "Bash", bashTest))

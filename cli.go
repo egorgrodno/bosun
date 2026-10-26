@@ -180,5 +180,8 @@ func describe(dec Decision) string {
 	if dec.Reserved != "" {
 		s += fmt.Sprintf("  [%s]", dec.Reserved)
 	}
+	if dec.Refused != "" {
+		s += "  [auto mode refused the last call: " + dec.Refused + "]"
+	}
 	return s
 }
