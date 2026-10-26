@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"os/exec"
@@ -1644,6 +1645,57 @@ func TestMasterRefusesMessages(t *testing.T) {
 		}
 		if err := json.Unmarshal(data, &s); err != nil || s.Inbound != want {
 			t.Fatalf("%s's crossSessionInbound = %q, want %q: %v", node, s.Inbound, want, err)
+		}
+	}
+}
+
+func TestMasterRunsLean(t *testing.T) {
+	d, fc := testDaemon(t)
+	claude := os.Getenv("CLAUDE_CONFIG_DIR")
+	if err := os.MkdirAll(filepath.Join(claude, "plugins"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(claude, "plugins", "installed_plugins.json"), []byte(`{"version":2,"plugins":{"craft@egor":[{"scope":"user"}],"lsp@official":[]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(claude, "settings.json"), []byte(`{"enabledPlugins":{"craft@egor":true,"hint@builtin":true}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := d.ensureDesk(); err != nil {
+		t.Fatal(err)
+	}
+	fc.mu.Lock()
+	master, desk := fc.starts[0], fc.starts[1]
+	fc.mu.Unlock()
+	if !slices.Contains(master, "--strict-mcp-config") || slices.Contains(desk, "--strict-mcp-config") {
+		t.Fatalf("the master ran with %q and the desk with %q, want only the master's MCP config strict", master, desk)
+	}
+
+	type leanSettings struct {
+		Connectors  bool                `json:"disableClaudeAiConnectors"`
+		Plugins     map[string]bool     `json:"enabledPlugins"`
+		Permissions map[string][]string `json:"permissions"`
+	}
+	read := func(node string) leanSettings {
+		settings, _, err := d.writeConfig(&Session{Node: node, Dir: "/x"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := os.ReadFile(settings)
+		var s leanSettings
+		if err := json.Unmarshal(data, &s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	s := read(masterNode)
+	want := map[string]bool{"craft@egor": false, "lsp@official": false, "hint@builtin": false}
+	if !s.Connectors || !maps.Equal(s.Plugins, want) || !slices.Equal(s.Permissions["deny"], masterDenied) {
+		t.Fatalf("the master's settings = %+v, want the connectors off, the plugins %v off and %q denied", s, want, masterDenied)
+	}
+	for _, node := range []string{deskNode, "a"} {
+		if s := read(node); s.Connectors || s.Plugins != nil || slices.Contains(s.Permissions["deny"], "Skill") {
+			t.Fatalf("%s's settings = %+v, want its connectors, plugins and skills", node, s)
 		}
 	}
 }

@@ -1791,6 +1791,10 @@ func (d *daemon) start(n *Session, dir string, extra []string, system, prompt st
 	if n.Model != "" {
 		args = append(args, "--model", n.Model)
 	}
+	if n.Node == masterNode {
+		// The settings name the connectors and plugins they turn off, and this keeps out the MCP servers they cannot name.
+		args = append(args, "--strict-mcp-config")
+	}
 	args = append(args, "--settings", settings, "--mcp-config", mcp, "--append-system-prompt", system+"\n\n"+tempFiles(d.scratchDir(n.Node)), "--", prompt)
 	return d.claude.Start(dir, args)
 }
@@ -1874,6 +1878,16 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 		// The desk passes on to the master what it is told, so only bosun and the user reach it, and a session outside bosun cannot pose as the user.
 		settings["crossSessionInbound"] = "refuse"
 	}
+	if node == masterNode {
+		// Every request carries each tool the session holds, and a clear starts its new conversation from these settings.
+		permissions["deny"] = masterDenied
+		settings["disableClaudeAiConnectors"] = true
+		plugins := map[string]bool{}
+		for _, p := range userPlugins() {
+			plugins[p] = false
+		}
+		settings["enabledPlugins"] = plugins
+	}
 	mcp := map[string]any{"mcpServers": map[string]any{"bosun": map[string]any{
 		"type":       "stdio",
 		"command":    d.exe,
@@ -1887,6 +1901,49 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 		return "", "", err
 	}
 	return settingsPath, mcpPath, writeJSON(mcpPath, mcp)
+}
+
+// masterDenied are the built-in tools the master goes without. The desk and the workers keep them.
+var masterDenied = []string{
+	// Its listing of the user's skills rides on every request, and the desk does the work they serve.
+	// Without it, Artifact and Workflow take the guidance a skill would load into their own descriptions, so all three go together.
+	"Skill",
+	// It publishes pages for the user, whom the desk talks to.
+	"Artifact",
+	// It orchestrates subagents on the user's word, and the master orchestrates workers.
+	"Workflow",
+	// It drafts feedback on Claude Code for a person to send.
+	"SendFeedback",
+	// It paces /loop, and next_event wakes the master.
+	"ScheduleWakeup",
+	// It reports a code review that a skill runs.
+	"ReportFindings",
+	// The master works in no repository.
+	"EnterWorktree",
+	// Nobody watches the master, which reaches the user through escalate.
+	"AskUserQuestion",
+}
+
+// userPlugins lists the plugins of the user's Claude Code: those installed, and those the user's settings enable, built-in ones included.
+// A file that is missing or does not parse adds none.
+func userPlugins() []string {
+	var installed struct {
+		Plugins map[string]json.RawMessage `json:"plugins"`
+	}
+	var settings struct {
+		Enabled map[string]json.RawMessage `json:"enabledPlugins"`
+	}
+	for path, v := range map[string]any{
+		filepath.Join(claudeDir(), "plugins", "installed_plugins.json"): &installed,
+		filepath.Join(claudeDir(), "settings.json"):                     &settings,
+	} {
+		if data, err := os.ReadFile(path); err == nil {
+			_ = json.Unmarshal(data, v)
+		}
+	}
+	plugins := slices.Concat(slices.Collect(maps.Keys(installed.Plugins)), slices.Collect(maps.Keys(settings.Enabled)))
+	slices.Sort(plugins)
+	return slices.Compact(plugins)
 }
 
 // hiddenSockets lists the sockets, and folders of them, through which a sandboxed command could act outside the sandbox.
