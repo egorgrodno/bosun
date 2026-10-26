@@ -76,10 +76,24 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Reserved actions skip the master.** Only you can approve one:
 
-- any `git push`, force pushes included
+- a push that forces, deletes a ref or pushes every branch
+- a push to a URL, or to a name that `git remote` does not list in the repository the command runs in
+- a push with a git option other than `-C`, or with a push option the check does not know
 - deleting a branch
 - a write through a file tool outside the session's worktree, memory directory, temporary folder and `$CLAUDE_JOB_DIR/tmp`
-- a Bash command outside the sandbox, through `dangerouslyDisableSandbox`
+- a Bash command outside the sandbox, through `dangerouslyDisableSandbox`, unless it is on the allowlist
+
+**The allowlist lets a few commands outside the sandbox take the normal flow.** Each must be the whole command: plain words, with nothing chained, piped, substituted, redirected or assigned before it.
+
+- `nixos-rebuild test` or `build` with `--flake` on `/etc/nixos` or a worktree in `/etc/nixos/.claude/worktrees/`, optionally with a `#host` attribute and `--sudo`
+- `nxt` and `nxc`
+- a push that no reserved rule catches, from a repository whose git setup matches its record
+
+Auto mode decides a call outside the sandbox alone. The settings' `ask` rules send every `nixos-rebuild`, `nxt` and `nxc` to the master instead, inside the sandbox too. A push has no such rule, so auto mode decides it, and it reaches the master only when auto mode asks.
+
+**A push must run outside the sandbox.** Inside it, ssh refuses `~/.ssh/config`. That file is a home-manager link into the nix store, and the sandbox shows the store owned by nobody. Outside it, a push runs the repository's hooks and any command its config names, such as `core.sshCommand`. Its config also decides where the push goes. A worker's sandbox can write all of that in `.git`.
+
+**The daemon records each repository's git setup.** When a spawn finds no worker in a repository and no record of it, the daemon records the repository's own config, its hooks and its remotes' push URLs in `repos/` of the state directory. A push outside the sandbox passes only while the setup matches the record. A record stays until you delete it, and the next spawn into the repository without workers records it anew.
 
 Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved action before Claude Code's allow rules and auto mode. Auto mode approves even a force push when its task asks for one. The check waits for your answer and returns `allow` or `deny`. A `PreToolUse` hook that times out or fails lets the call through to the normal flow. So the check denies shortly before its `timeout`, and on any error, an unreachable daemon included.
 
@@ -158,3 +172,4 @@ Each leads with the queue of decisions waiting on you, above the tree.
 
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
 - **Restarts and pauses.** Only a fake `claude` has run the restart handling and the pause. No real reboot, crash or pause has been measured. The daemon reads transcripts in the 2.1.310 format. Whether `claude stop` runs the `Stop` hook is unmeasured, so the daemon ignores a `Stop` from a session that a pause stopped.
+- **The allowlist.** No real session has run it. Two things are unmeasured: whether an `ask` rule sends a call outside the sandbox to `PermissionRequest` in auto mode, and whether `Bash(nixos-rebuild:*)` matches a flake with a `#host` attribute. The gate finds a push's repository from the hook's `cwd`. In the 2.1.310 binary that is the session's working directory, which a `cd` in an earlier Bash call moves, but no real session has shown it.

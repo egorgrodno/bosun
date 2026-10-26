@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
@@ -421,6 +422,22 @@ func (d *daemon) scratchDir(node string) string {
 	return filepath.Join(d.tempDir(node), fmt.Sprintf("claude-%d", os.Getuid()))
 }
 
+// gate is the reserved check for node's calls that run in cwd, or nil for an unknown node.
+func (d *daemon) gate(node, cwd string) *gate {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	n := d.nodes[node]
+	if n == nil {
+		return nil
+	}
+	return &gate{cwd: cmp.Or(cwd, n.Dir), writable: d.writable(n), repos: d.repos()}
+}
+
+// repos holds the record of each repository's git setup from before bosun's first worker in it.
+func (d *daemon) repos() gitRepos {
+	return gitRepos{dir: filepath.Join(d.stateDir, "repos")}
+}
+
 // writable lists where the session's file tools write without the user: its worktree, its scratch folder, and the memory and job directories Claude Code's system prompt sends it to.
 func (d *daemon) writable(s *Session) []string {
 	dirs := []string{s.Dir, d.scratchDir(s.Node), s.memoryDir()}
@@ -556,6 +573,7 @@ type hookInput struct {
 	Prompt      string          `json:"prompt"`
 	Source      string          `json:"source"`
 	Reason      string          `json:"reason"`
+	Cwd         string          `json:"cwd"`
 }
 
 // hook handles one hook event of a session, whose process has the messaging socket socket, sent under key. It blocks while a decision it opened waits, and answers with no behavior when the decision is withdrawn.
@@ -564,6 +582,13 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 	var in hookInput
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return resp, fmt.Errorf("hook input: %w", err)
+	}
+	var reserved string
+	// The check may run git, which a worker's repository can hold up, so it runs outside the lock.
+	if in.Event == "PreToolUse" {
+		if g := d.gate(node, in.Cwd); g != nil {
+			reserved = g.reserved(in.ToolName, in.ToolInput)
+		}
 	}
 	d.mu.Lock()
 	n := d.nodes[node]
@@ -612,8 +637,8 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 			n.pre = map[string]preCall{}
 		}
 		n.pre[in.ToolUseID] = preCall{in.ToolName, compact(in.ToolInput)}
-		if reason := reservedAction(in.ToolName, in.ToolInput, d.writable(n)...); reason != "" {
-			dec = &Decision{Kind: "permission", Node: node, Holder: "user", Reserved: reason, Tool: in.ToolName, Input: in.ToolInput, toolUseID: in.ToolUseID, key: key}
+		if reserved != "" {
+			dec = &Decision{Kind: "permission", Node: node, Holder: "user", Reserved: reserved, Tool: in.ToolName, Input: in.ToolInput, toolUseID: in.ToolUseID, key: key}
 		}
 		if in.ToolName != "SendMessage" {
 			break
@@ -1482,6 +1507,8 @@ func (d *daemon) spawn(caller, name, repo, model, prompt string) (*Session, erro
 
 	d.mu.Lock()
 	err := d.admitLocked(caller, name)
+	// Once a worker runs in the repository, its sandbox may have changed the setup.
+	fresh := !slices.ContainsFunc(slices.Collect(maps.Values(d.nodes)), func(s *Session) bool { return s.Repo == root })
 	if err == nil {
 		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Base: dir, BaseBranch: branch, Model: cmp.Or(model, d.workerModel), Depth: d.nodes[caller].Depth + 1, Status: "starting", Heard: time.Now()}
 		d.started[name] = time.Now()
@@ -1490,6 +1517,11 @@ func (d *daemon) spawn(caller, name, repo, model, prompt string) (*Session, erro
 	d.mu.Unlock()
 	if err != nil {
 		return nil, err
+	}
+	if fresh {
+		if err := d.repos().record(root); err != nil {
+			log.Printf("recording the git setup of %s: %v", root, err)
+		}
 	}
 
 	id, err := d.start(n, dir, []string{"-w", name}, workerPrompt(name), prompt)
@@ -1568,7 +1600,7 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 	command := fmt.Sprintf("BOSUN_NODE=%s BOSUN_SOCKET=%s %s hook", node, shellQuote(d.socket), shellQuote(d.exe))
 	hold := []hookGroup{{Hooks: []hookCommand{{Type: "command", Command: command, Timeout: int(holdTimeout / time.Second)}}}}
 	quick := []hookGroup{{Hooks: []hookCommand{{Type: "command", Command: command}}}}
-	permissions := map[string][]string{"allow": {"mcp__bosun"}}
+	permissions := map[string][]string{"allow": {"mcp__bosun"}, "ask": rebuildRules}
 	if node != masterNode {
 		permissions["deny"] = []string{"AskUserQuestion"}
 	}

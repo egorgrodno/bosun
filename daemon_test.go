@@ -426,9 +426,9 @@ func TestMasterAnswersQuestion(t *testing.T) {
 
 func TestReservedSkipsMaster(t *testing.T) {
 	d, _ := testDaemon(t)
-	hook := runHookAsync("a", hookEvent("PreToolUse", "t1", "Bash", map[string]any{"command": "git push origin HEAD"}))
+	hook := runHookAsync("a", hookEvent("PreToolUse", "t1", "Bash", map[string]any{"command": "git push --force origin HEAD"}))
 	dec := openDecision(t, 1)
-	if dec.Holder != "user" || dec.Reserved != "git push" {
+	if dec.Holder != "user" || dec.Reserved != "a force push" {
 		t.Fatalf("decision = %+v", dec)
 	}
 	d.mu.Lock()
@@ -445,6 +445,58 @@ func TestReservedSkipsMaster(t *testing.T) {
 	want := `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}`
 	if out := receive(t, hook); out != want {
 		t.Fatalf("hook printed %s, want %s", out, want)
+	}
+}
+
+func TestUnsandboxedPush(t *testing.T) {
+	d, _ := testDaemon(t)
+	repo := t.TempDir()
+	git(t, repo, "init", "-q", "-b", "main")
+	git(t, repo, "remote", "add", "origin", "https://forge.example/x.git")
+	if err := d.repos().record(repo); err != nil {
+		t.Fatal(err)
+	}
+	push := func(toolUseID string) chan string {
+		raw, _ := json.Marshal(map[string]any{
+			"hook_event_name": "PreToolUse",
+			"session_id":      "s-a",
+			"tool_use_id":     toolUseID,
+			"tool_name":       "Bash",
+			"tool_input":      map[string]any{"command": "git push origin main", "dangerouslyDisableSandbox": true},
+			"cwd":             repo,
+		})
+		return runHookAsync("a", raw)
+	}
+	if out := receive(t, push("t1")); out != "null" {
+		t.Fatalf("PreToolUse of a push printed %s", out)
+	}
+
+	writeFile(t, filepath.Join(repo, ".git", "hooks", "pre-push"), "#!/bin/sh\n", 0o755)
+	hook := push("t2")
+	dec := openDecision(t, 1)
+	if dec.Holder != "user" || dec.Reserved != "a push outside the sandbox from a repository whose hook pre-push changed" {
+		t.Fatalf("decision = %+v", dec)
+	}
+	mustCall(t, Request{Op: "deny", ID: dec.ID})
+	receive(t, hook)
+}
+
+// The setup is recorded before the repository's first worker, and never once one runs there.
+func TestSpawnRecordsGitSetup(t *testing.T) {
+	d, _ := testDaemon(t)
+	repo := t.TempDir()
+	git(t, repo, "init", "-q", "-b", "main")
+	mustCall(t, Request{Op: "spawn", Node: masterNode, Name: "b", Repo: repo, Text: "x"})
+	record := d.repos().path(repo)
+	if _, err := os.Stat(record); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(record); err != nil {
+		t.Fatal(err)
+	}
+	mustCall(t, Request{Op: "spawn", Node: masterNode, Name: "c", Repo: repo, Text: "x"})
+	if _, err := os.Stat(record); err == nil {
+		t.Fatal("recorded the setup beside a worker")
 	}
 }
 
@@ -1435,7 +1487,7 @@ func TestSpawn(t *testing.T) {
 	if err := json.Unmarshal(data, &settings); err != nil {
 		t.Fatal(err)
 	}
-	if settings.Worktree["baseRef"] != "head" || !slices.Contains(settings.Permissions["deny"], "AskUserQuestion") {
+	if settings.Worktree["baseRef"] != "head" || !slices.Contains(settings.Permissions["deny"], "AskUserQuestion") || !slices.Equal(settings.Permissions["ask"], rebuildRules) {
 		t.Fatalf("settings = %s", data)
 	}
 	if want := (&Session{Repo: repo}).memoryDir(); settings.Memory != want {

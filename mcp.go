@@ -55,7 +55,9 @@ Workers message each other, so a turn_end does not always mean done. A worker ma
 
 A usage limit stops a worker without a turn_end, and bosun resumes it once the limit resets.
 
-bosun sends a git push, deleting a branch, a file write outside a session's own folders and a command outside the sandbox straight to the user, so none of them reaches you, and no answer of yours allows one.`
+These go straight to the user, never to you, and no answer of yours allows one: a push that forces, deletes a ref, pushes every branch, carries a git option other than -C, or goes to a URL or to a name that is not a remote of its repository; deleting a branch; a file write outside a session's own folders; and a command outside the sandbox. Two kinds of command outside the sandbox can still reach you, each only as a whole command, with nothing chained, piped or redirected:
+- nixos-rebuild test or build with --flake on /etc/nixos or a worktree of it, and nxt and nxc, which test and build /etc/nixos. Every nixos-rebuild, nxt and nxc reaches you, inside the sandbox too.
+- any other push, from a repository whose git config, hooks and remotes are as bosun recorded them while no worker was in it. Auto mode decides such a push, so it reaches you only when auto mode asks.`
 )
 
 func tools(master bool) []tool {
@@ -86,7 +88,7 @@ func tools(master bool) []tool {
 			"id":     str("The decision's id."),
 			"answer": str("The answer."),
 		})},
-		{"decide", "Allow or deny a worker's permission request: a tool call that its permission rules and auto mode did not approve. Allow it when the worker's task needs it and it can be undone. Deny it with a message that tells the worker what to do instead. Escalate what the user should judge, such as a call the task needs that cannot be undone. A request with refused set comes after auto mode refused the worker's last call, which says why: after a run of refusals, auto mode asks about a call instead of refusing it, so it likely judged this one risky too. Escalate it unless the user's instructions plainly cover it.", object([]string{"id", "allow"}, map[string]any{
+		{"decide", "Allow or deny a worker's permission request: a tool call that its permission rules and auto mode did not approve. Allow it when the worker's task needs it and it can be undone. Deny it with a message that tells the worker what to do instead. Escalate what the user should judge, such as a call the task needs that cannot be undone. A request with refused set comes after auto mode refused the worker's last call, which says why: after a run of refusals, auto mode asks about a call instead of refusing it, so it likely judged this one risky too. Escalate it unless the user's instructions plainly cover it. A push publishes its commits, and only a force push, which is the user's, takes them back: allow one only when the user's instructions or the worker's task ask for it. nixos-rebuild test, or nxt, runs the activation scripts of the configuration it names as root, and a reboot does not undo what they did. On /etc/nixos that configuration is what is checked out there. On a worktree under /etc/nixos/.claude/worktrees/ it is that worktree's files, whichever worker asks: first read git -C <worktree> diff <the branch it began from>, which includes uncommitted changes, and escalate if the change does anything its task does not need. nixos-rebuild build, or nxc, activates nothing.", object([]string{"id", "allow"}, map[string]any{
 			"id":      str("The decision's id."),
 			"allow":   map[string]any{"type": "boolean", "description": "true to allow the tool call, false to deny it."},
 			"message": str("When denying, why. It reaches the worker verbatim, so tell it what to do instead."),
