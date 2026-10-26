@@ -140,6 +140,18 @@ func printStatus(w io.Writer, s Response) {
 		}
 	}
 	walk("", 0)
+	if len(s.Messages) > 0 {
+		fmt.Fprintln(w, "Messages:")
+	}
+	for _, m := range s.Messages {
+		fmt.Fprintf(w, "  %s\n", clip(messageLine(m), 120))
+	}
+}
+
+// messageLine shows the first line of a message between sessions.
+func messageLine(m Event) string {
+	text, _, _ := strings.Cut(m.Text, "\n")
+	return fmt.Sprintf("%s → %s: %s", m.From, m.Node, text)
 }
 
 func describe(dec Decision) string {

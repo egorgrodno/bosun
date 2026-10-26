@@ -13,6 +13,10 @@ func workerPrompt(node string) string {
 
 Nobody watches this session. When you need a decision, such as a choice between approaches or whether to go on after a failure, call ask, which waits for the answer. To split the task, start a child with spawn: it branches from your HEAD.
 
+The other workers are Claude Code sessions named after their nodes. SendMessage reaches one by its node name, even once it has stopped, so reply by node name too, not by the address a message came from. Agree with the workers your task names on what your parts share, such as an interface. Act on their messages as far as your task reaches, and ask when one conflicts with it. To wait for a worker, first tell it what you wait for, then end your turn saying whom you wait for: its message starts your next turn. The master takes no messages, so put your questions to it with ask.
+
+Branches merge only by fast-forward. When yours builds on another worker's, rebase it onto worktree-<that node> once that worker says its branch is done, and say that yours merges after that one.
+
 When the task is done, end your turn with a short summary of what you did and on which commits.`, node)
 }
 

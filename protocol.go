@@ -34,12 +34,15 @@ type Response struct {
 	Event     *Event     `json:"event,omitempty"`
 	Sessions  []Session  `json:"sessions,omitempty"`
 	Decisions []Decision `json:"decisions,omitempty"`
+	Messages  []Event    `json:"messages,omitempty"`
 }
 
-// Event is what the master or a frontend is told. The master gets decision, turn_end, exit and tell; a frontend gets decision, settled and sessions.
+// Event is what the master or a frontend is told. The master gets decision, turn_end, exit, tell and message; a frontend gets decision, settled, sessions and message.
+// A message is what session From told session Node through Claude Code's SendMessage.
 type Event struct {
 	Kind     string    `json:"kind"`
 	Node     string    `json:"node,omitempty"`
+	From     string    `json:"from,omitempty"`
 	ID       string    `json:"id,omitempty"`
 	Text     string    `json:"text,omitempty"`
 	Decision *Decision `json:"decision,omitempty"`

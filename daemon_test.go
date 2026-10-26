@@ -909,6 +909,113 @@ func TestWakeMasterFails(t *testing.T) {
 	}
 }
 
+// peerPrompt is the UserPromptSubmit of a session that a message from session from reaches.
+func peerPrompt(from, text string) []byte {
+	raw, _ := json.Marshal(map[string]any{
+		"hook_event_name": "UserPromptSubmit",
+		"session_id":      "s-a",
+		"prompt":          fmt.Sprintf("<cross-session-message from=\"uds:/run/user/1000/cc-socks/1.sock\" from-name=\"%s\" from-mode=\"prompting\">\n%s\n</cross-session-message>", from, text),
+	})
+	return raw
+}
+
+// A message between workers needs nothing from the master, so it waits for an event that does.
+func TestMessageWaitsForEvent(t *testing.T) {
+	d, _ := testDaemon(t)
+	got := make(chan []Event, 1)
+	go func() {
+		resp, _ := call(context.Background(), Request{Op: "next_event", Node: masterNode})
+		got <- resp.Events
+	}()
+	receive(t, runHookAsync("a", peerPrompt("b", "b merges first.\nThen rebase onto worktree-b.")))
+	receive(t, runHookAsync("a", hookEvent("UserPromptSubmit", "", "", nil)))
+	select {
+	case evs := <-got:
+		t.Fatalf("next_event returned %+v for a message alone", evs)
+	case <-time.After(100 * time.Millisecond):
+	}
+	mustCall(t, Request{Op: "tell", Text: "x"})
+	evs := <-got
+	if len(evs) != 2 || evs[0].Kind != "message" || evs[0].Node != "a" || evs[0].From != "b" || evs[0].Text != "b merges first.\nThen rebase onto worktree-b." || evs[1].Kind != "tell" {
+		t.Fatalf("events = %+v", evs)
+	}
+
+	receive(t, runHookAsync("a", peerPrompt("c", "done")))
+	receive(t, runHookAsync("a", peerPrompt(masterNode, "carry on")))
+	if out := receive(t, runHookAsync(masterNode, hookEvent("Stop", "", "", nil))); out != "null" {
+		t.Fatalf("the master's Stop with a message waiting printed %s", out)
+	}
+	d.mu.Lock()
+	asleep, queued := d.asleep, len(d.events)
+	d.mu.Unlock()
+	if !asleep || queued != 1 {
+		t.Fatalf("asleep %v with %d events queued, want the master asleep and c's message kept", asleep, queued)
+	}
+	if m := mustCall(t, Request{Op: "status"}).Messages; len(m) != 3 || m[2].From != masterNode {
+		t.Fatalf("messages = %+v, want all three for the frontends", m)
+	}
+}
+
+func TestSendMessage(t *testing.T) {
+	d, fc := testDaemon(t)
+	send := func(to string) string {
+		return receive(t, runHookAsync("a", hookEvent("PreToolUse", "t1", "SendMessage", map[string]any{"to": to, "message": "hi"})))
+	}
+	starts := func() int {
+		fc.mu.Lock()
+		defer fc.mu.Unlock()
+		return len(fc.starts)
+	}
+	if out := send("master [c9e04b]"); !strings.Contains(out, `"permissionDecision":"deny"`) || !strings.Contains(out, "ask") {
+		t.Fatalf("a message to the master printed %s", out)
+	}
+	if out := send("bosun-cd"); out != "null" {
+		t.Fatalf("a message to a session outside bosun printed %s", out)
+	}
+
+	d.mu.Lock()
+	d.nodes["b"] = &Session{Node: "b", Parent: masterNode, Repo: "/repo", Dir: "/repo/.claude/worktrees/b", Depth: 1, ID: "bbbbbbbb", Status: "idle"}
+	d.mu.Unlock()
+	fc.add(agent{ID: "bbbbbbbb", SessionID: "s-b", Name: "b", Status: "idle"})
+	if out := send("b [09215d]"); out != "null" || starts() != 1 {
+		t.Fatalf("a message to an idle worker printed %s, and claude ran %d times", out, starts())
+	}
+	// A stopped session has no inbox, so it resumes idle before the message goes, though no poll has seen it stop.
+	fc.setStatus("bbbbbbbb", "")
+	if out := send("b"); out != "null" {
+		t.Fatalf("a message to a stopped worker printed %s", out)
+	}
+	if args := fc.lastStart(); !slices.Equal(args, []string{"--bg", "--resume", "s-b"}) {
+		t.Fatalf("claude ran with %q", args)
+	}
+
+	fc.setStatus("bbbbbbbb", "")
+	d.mu.Lock()
+	d.nodes["b"].Killed = true
+	d.mu.Unlock()
+	before := starts()
+	if out := send("b"); !strings.Contains(out, `"permissionDecision":"deny"`) || starts() != before {
+		t.Fatalf("a message to a worker the user stopped printed %s, and claude ran %d more times", out, starts()-before)
+	}
+}
+
+func TestMasterRefusesMessages(t *testing.T) {
+	d, _ := testDaemon(t)
+	for node, want := range map[string]string{masterNode: "refuse", "a": ""} {
+		settings, _, err := d.writeConfig(&Session{Node: node, Dir: "/x"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, _ := os.ReadFile(settings)
+		var s struct {
+			Inbound string `json:"crossSessionInbound"`
+		}
+		if err := json.Unmarshal(data, &s); err != nil || s.Inbound != want {
+			t.Fatalf("%s's crossSessionInbound = %q, want %q: %v", node, s.Inbound, want, err)
+		}
+	}
+}
+
 func TestSpawn(t *testing.T) {
 	d, fc := testDaemon(t)
 	t.Setenv("XDG_RUNTIME_DIR", "/run/user/1234")

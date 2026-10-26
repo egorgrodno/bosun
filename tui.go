@@ -23,6 +23,7 @@ import (
 type tui struct {
 	sessions  []Session
 	decisions []Decision
+	messages  []Event
 	connected bool
 	sel       int
 	// answering is the question an answer is being typed for, and answer the text so far.
@@ -80,10 +81,13 @@ func (t *tui) selected() tuiItem {
 func (t *tui) apply(r Response) {
 	switch {
 	case r.Type == "snapshot":
-		t.sessions, t.decisions, t.connected = r.Sessions, r.Decisions, true
+		t.sessions, t.decisions, t.messages, t.connected = r.Sessions, r.Decisions, r.Messages, true
 	case r.Event == nil:
 	case r.Event.Kind == "sessions":
 		t.sessions = r.Event.Sessions
+	case r.Event.Kind == "message":
+		t.messages = append(t.messages, *r.Event)
+		t.messages = t.messages[max(0, len(t.messages)-keptMessages):]
 	case r.Event.Kind == "decision" && r.Event.Decision != nil:
 		d := *r.Event.Decision
 		t.decisions = append(slices.DeleteFunc(t.decisions, func(o Decision) bool { return o.ID == d.ID }), d)
@@ -214,6 +218,13 @@ func (t *tui) render(width, height int) []string {
 			state += "/" + s.State
 		}
 		add("", fmt.Sprintf("  %s%-*s %-8s %-15s %s", strings.Repeat("  ", it.depth), max(1, 14-2*it.depth), s.Node, s.ID, state, s.Model), i == t.sel)
+	}
+	if len(t.messages) > 0 {
+		add("", "", false)
+		add(dim, "Messages", false)
+	}
+	for _, m := range t.messages {
+		add("", "  "+messageLine(m), false)
 	}
 
 	var foot []string

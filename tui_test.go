@@ -90,6 +90,12 @@ func TestTUIApply(t *testing.T) {
 	if !slices.Equal(ids, []string{"3", "4", "10"}) {
 		t.Fatalf("decisions %v", ids)
 	}
+
+	tu.apply(Response{Type: "event", Event: &Event{Kind: "message", Node: "a", From: "b", Text: "b merges first.\nThen rebase."}})
+	screen := strings.Join(tu.render(80, 30), "\n")
+	if !strings.Contains(screen, "b → a: b merges first.") || strings.Contains(screen, "Then rebase") {
+		t.Fatalf("the screen shows the message as:\n%s", screen)
+	}
 }
 
 func TestSplitKeys(t *testing.T) {

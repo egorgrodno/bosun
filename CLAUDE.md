@@ -99,6 +99,16 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 
 **Typing to the master.** Text typed into a sleeping master starts its turn. Text typed while a tool call runs waits until the call returns, so `next_event` must return empty within five minutes. A frontend's `tell` reaches the master as an event straight away.
 
+## Messages
+
+**Workers talk through Claude Code.** `SendMessage` reaches a running session by its `-n` name, so workers address each other by node name. Auto mode runs it without a permission request, so the master never decides on a message. A message arrives between tool calls, so one to a worker blocked in `ask` waits until the call returns. A message to an idle session starts a turn, and that turn's `Stop` reaches the master as a `turn_end`.
+
+**The daemon reads every message.** Each delivered message runs `UserPromptSubmit`, with the prompt in a `<cross-session-message>` tag that names the sender. The daemon shows it to the frontends. Unless the master sent it, the daemon also queues it as a `message` event. That event wakes no master and blocks no `Stop`, and reaches the master along with the next event the master must act on.
+
+**A stopped worker resumes for a message.** A stopped session has no inbox, so a `SendMessage` to it reports `No agent named '<name>' is reachable`. The sender's `PreToolUse` therefore resumes a stopped worker idle first, unless `bosun kill` stopped it. That is in time, since `SendMessage` looks up its recipient only after `PreToolUse` returns, and `claude --bg --resume` returns once the inbox exists. Only a node name resumes a stopped worker: the `uds:` address a message came from names the old process.
+
+**The master takes no messages.** Its settings set `crossSessionInbound` to `refuse`, and a worker's `PreToolUse` denies a `SendMessage` to it, pointing the worker to `ask`.
+
 ## Frontends
 
 Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `model`, `attach`. Every rule lives in the daemon.
@@ -112,4 +122,4 @@ Each leads with the queue of decisions waiting on you, above the tree.
 
 - **Auto mode refusals.** It is untested whether an action the classifier refuses in a `--bg` session reaches `PermissionRequest`, or only `PermissionDenied` (#5).
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
-- **Turn ends below the master.** Only the master gets `turn_end`, so a worker cannot tell when its own child is ready to merge, and the master merges it instead.
+- **Turn ends below the master.** Only the master gets `turn_end`, so a worker cannot tell when its own child is ready to merge, and the master merges it instead. A worker could subscribe to its child with `SendMessage`'s `notify_when_idle`, which works between background sessions and whose notice starts the subscriber's next turn (#29).

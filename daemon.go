@@ -41,6 +41,8 @@ const (
 	quietPollEvery = time.Minute
 	// startGrace covers a session `claude --bg` started that `claude agents --json` does not list yet.
 	startGrace = 30 * time.Second
+
+	keptMessages = 10
 )
 
 // idleWait bounds how long resume waits for a worker to be listed idle, which it is not until its Stop hook returns.
@@ -68,7 +70,7 @@ type daemon struct {
 	workerModel string
 	claude      claudeCLI
 
-	// masterLock is held while the master is woken, switched or readied for an attach, so that no two of them resume it at once.
+	// masterLock is held while the master is woken, switched or resumed idle, so that no two of them resume it at once.
 	masterLock sync.Mutex
 	mu         sync.Mutex
 	nodes      map[string]*Session
@@ -78,6 +80,8 @@ type daemon struct {
 	events     []Event
 	wake       chan struct{}
 	watchers   map[*watcher]bool
+	// messages holds the latest messages between sessions, for a frontend's snapshot.
+	messages []Event
 	// stopBlocked holds from a block of the master's Stop until its next call to next_event.
 	// Claude Code's stop_hook_active cannot stand in: it stays true for the rest of the turn a block continued.
 	stopBlocked bool
@@ -401,7 +405,7 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	case "resume":
 		err = d.resume(ctx, r.Node, r.Name, r.Text)
 	case "attach":
-		err = d.attach(r.ID)
+		err = d.resumeIdle(r.ID)
 	case "kill":
 		err = d.kill(r.Name)
 	case "merge":
@@ -430,6 +434,7 @@ type hookInput struct {
 	ToolUseID   string          `json:"tool_use_id"`
 	LastMessage string          `json:"last_assistant_message"`
 	Error       string          `json:"error"`
+	Prompt      string          `json:"prompt"`
 }
 
 // hook handles one hook event of a session. It blocks while a decision it opened waits, and answers with no behavior when the decision is withdrawn.
@@ -451,10 +456,16 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 	d.stirred = true
 	var dec *Decision
 	var worktree string
+	// peer is the node and session id a SendMessage goes to, which must run to take it.
+	var peer, peerID string
 	switch in.Event {
 	case "SessionStart":
 		if n.Repo != "" {
 			worktree = n.Dir
+		}
+	case "UserPromptSubmit":
+		if from, text, ok := peerMessage(in.Prompt); ok {
+			d.messageLocked(Event{Kind: "message", Node: node, From: from, Text: text})
 		}
 	case "PreToolUse":
 		// A permission still open from an earlier call was denied in the session's own prompt, which runs no tool.
@@ -465,6 +476,19 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 		n.pre[in.ToolUseID] = preCall{in.ToolName, compact(in.ToolInput)}
 		if reason := reservedAction(in.ToolName, in.ToolInput, d.writable(n)...); reason != "" {
 			dec = &Decision{Kind: "permission", Node: node, Holder: "user", Reserved: reason, Tool: in.ToolName, Input: in.ToolInput, toolUseID: in.ToolUseID}
+		}
+		if in.ToolName != "SendMessage" {
+			break
+		}
+		switch to := d.nodes[recipient(in.ToolInput)]; {
+		case to == nil:
+		case to.Node == masterNode:
+			// The master refuses messages, but SendMessage reports success all the same, and the refusal starts the sender's next turn.
+			resp.Behavior, resp.Text = "deny", "bosun: the master takes no messages. Ask it with ask, which waits for its answer."
+		case to.Killed:
+			resp.Behavior, resp.Text = "deny", fmt.Sprintf("bosun: the user stopped %s, so it takes no messages.", to.Node)
+		case to.ID != "" && to.Status != "exited":
+			peer, peerID = to.Node, to.ID
 		}
 	case "PermissionRequest":
 		holder := "master"
@@ -499,7 +523,7 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 		switch {
 		case node != masterNode:
 			d.pushLocked(Event{Kind: "turn_end", Node: node, Text: in.LastMessage})
-		case len(d.pendingLocked()) == 0:
+		case !needsMaster(d.pendingLocked()):
 			d.asleep = true
 			log.Print("the master sleeps until the next event")
 		case !d.stopBlocked:
@@ -519,6 +543,14 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 		if err := standInGitmodules(worktree); err != nil {
 			log.Printf("%s: .gitmodules: %v", node, err)
 		}
+	}
+	if peer != "" {
+		// A stopped session has no inbox, and SendMessage looks for one only after this hook returns.
+		// The listing, which resumeIdle reads, may show a retirement that the last poll missed.
+		if err := d.resumeIdle(peerID); err != nil && !errors.Is(err, errStarting) {
+			resp.Behavior, resp.Text = "deny", fmt.Sprintf("bosun: %s has stopped, and resuming it to take the message failed: %v", peer, err)
+		}
+		return resp, nil
 	}
 	if dec == nil {
 		return resp, nil
@@ -586,6 +618,35 @@ func (n *Session) match(tool string, input json.RawMessage) string {
 		return id
 	}
 	return ""
+}
+
+var (
+	crossSession = regexp.MustCompile(`(?s)^<cross-session-message\b([^>]*)>\n(.*)\n</cross-session-message>$`)
+	attribute    = regexp.MustCompile(`([a-z-]+)="([^"]*)"`)
+	// ref is what ListAgents shows after each name, and SendMessage takes along with it.
+	ref = regexp.MustCompile(` \[[0-9A-Za-z]+\]$`)
+)
+
+// peerMessage returns the sender and text of a prompt that Claude Code submits for another session's message.
+func peerMessage(prompt string) (from, text string, ok bool) {
+	m := crossSession.FindStringSubmatch(strings.TrimSpace(prompt))
+	if m == nil {
+		return "", "", false
+	}
+	attrs := map[string]string{}
+	for _, a := range attribute.FindAllStringSubmatch(m[1], -1) {
+		attrs[a[1]] = a[2]
+	}
+	return cmp.Or(attrs["from-name"], attrs["from"]), m[2], true
+}
+
+// recipient returns the name a SendMessage addresses, which for a bosun session is its node.
+func recipient(input json.RawMessage) string {
+	var in struct {
+		To string `json:"to"`
+	}
+	_ = json.Unmarshal(input, &in)
+	return ref.ReplaceAllString(in.To, "")
 }
 
 func compact(raw json.RawMessage) string {
@@ -739,6 +800,22 @@ func (d *daemon) tell(text string) error {
 	return nil
 }
 
+// messageLocked shows the frontends a message between sessions, and queues it for the master without waking it.
+func (d *daemon) messageLocked(ev Event) {
+	d.messages = append(d.messages, ev)
+	d.messages = d.messages[max(0, len(d.messages)-keptMessages):]
+	d.broadcastLocked(ev)
+	if ev.From != masterNode {
+		d.events = append(d.events, ev)
+	}
+	log.Printf("message from %s to %s", ev.From, ev.Node)
+}
+
+// needsMaster reports whether evs hold an event for the master to act on. A message waits for one, and comes along with it.
+func needsMaster(evs []Event) bool {
+	return slices.ContainsFunc(evs, func(ev Event) bool { return ev.Kind != "message" })
+}
+
 func (d *daemon) pushLocked(ev Event) {
 	d.events = append(d.events, ev)
 	close(d.wake)
@@ -768,7 +845,7 @@ func (d *daemon) wakeMaster() {
 
 // sleepLocked lets the master sleep until the next event, or wakes it now when events already wait, since only a new event wakes it.
 func (d *daemon) sleepLocked() {
-	d.asleep = len(d.pendingLocked()) == 0
+	d.asleep = !needsMaster(d.pendingLocked())
 	if !d.asleep {
 		go d.wakeMaster()
 	}
@@ -788,7 +865,7 @@ func (d *daemon) pendingLocked() []Event {
 	return evs
 }
 
-// nextEvent waits for the master's events and returns them all.
+// nextEvent waits for an event the master acts on, and returns it with every other event waiting.
 func (d *daemon) nextEvent(ctx context.Context) []Event {
 	timer := time.NewTimer(idleReturn)
 	defer timer.Stop()
@@ -801,10 +878,14 @@ func (d *daemon) nextEvent(ctx context.Context) []Event {
 	for {
 		d.mu.Lock()
 		evs := d.pendingLocked()
+		ready := needsMaster(evs)
 		d.events = nil
+		if !ready {
+			d.events = evs
+		}
 		wake := d.wake
 		d.mu.Unlock()
-		if len(evs) > 0 {
+		if ready {
 			return evs
 		}
 		select {
@@ -869,6 +950,7 @@ func (d *daemon) snapshotLocked() Response {
 	for _, dec := range d.decisions {
 		resp.Decisions = append(resp.Decisions, *dec)
 	}
+	resp.Messages = slices.Clone(d.messages)
 	slices.SortFunc(resp.Decisions, func(a, b Decision) int {
 		x, _ := strconv.Atoi(a.ID)
 		y, _ := strconv.Atoi(b.ID)
@@ -1052,6 +1134,10 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 			"Stop":               quick,
 			"StopFailure":        quick,
 		},
+	}
+	if node == masterNode {
+		// A message would start a turn outside the next_event loop, or wait unread until next_event returns, so workers reach the master through ask.
+		settings["crossSessionInbound"] = "refuse"
 	}
 	mcp := map[string]any{"mcpServers": map[string]any{"bosun": map[string]any{
 		"type":       "stdio",
@@ -1439,9 +1525,9 @@ func (d *daemon) release(n *Session) {
 	n.held = false
 }
 
-// attach readies session id for a frontend about to run `claude attach` on it, by resuming it idle if it stopped.
+// resumeIdle resumes session id idle if it stopped, for a frontend about to run `claude attach` on it, or for a message to it.
 // claude attach would resume it itself, and with no supervisor running, start Claude Code's supervisor in the frontend's terminal.
-func (d *daemon) attach(id string) error {
+func (d *daemon) resumeIdle(id string) error {
 	node, a, err := d.listed(id)
 	if err != nil || a.Status != "" {
 		return err
@@ -1468,7 +1554,7 @@ func (d *daemon) attach(id string) error {
 	n.held = false
 	d.stirred = true
 	if err == nil {
-		log.Printf("resumed %s (%s) for an attach", node, id)
+		log.Printf("resumed %s (%s) idle", node, id)
 	}
 	return err
 }

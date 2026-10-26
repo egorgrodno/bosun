@@ -30,6 +30,7 @@ func str(description string) map[string]any {
 
 const (
 	nameHelp  = "Node name: lowercase letters, digits and hyphens, unique in the repository. It names the session, its worktree and its branch worktree-<name>."
+	peersHelp = " Workers message each other by node name. When several share one feature, name in each worker's prompt the other workers' nodes and what each one builds, and start them all before any needs another."
 	modelHelp = "The session's model, such as fable, opus, sonnet or haiku. Leave it out unless the user named one for this task: the user sets the default."
 
 	nextEventHelp = `Wait up to four minutes for events from the workers and the user. Returns them as JSON, or says there were none.
@@ -42,6 +43,9 @@ The events:
 - decision of kind permission: a worker wants to run a tool. Settle it with decide or escalate.
 - turn_end: a worker finished a turn, and its last message says what it did, or that the turn failed on an API error. To give it more to do, such as a fix after review or another try, call resume. Once its work is right, call merge.
 - exit: a worker's session stopped. Either it stopped in the middle of a turn, so no turn_end follows, and resume carries it on, or the user stopped it, as the event's text says, and resume refuses it.
+- message: what a session told a worker through Claude Code's SendMessage, such as an interface two workers agreed on or the order their branches merge in. The worker gets it without you: a message to a worker between turns starts a turn, so never resume a worker to pass one on. A message needs nothing from you, so it comes along with the next event that does.
+
+Workers message each other, so a turn_end does not always mean done. A worker may end its turn to wait for another worker's message, and a turn that a message started also ends in a turn_end. The turn_end's text says which. Merge workers in the order they agreed on. When workers wait only on each other, none starts again: resume one of them and tell it to send its part first.
 
 A usage limit stops a worker without a turn_end, and bosun resumes it once the limit resets.
 
@@ -51,7 +55,7 @@ bosun sends a git push, deleting a branch, a file write outside a session's own 
 func tools(master bool) []tool {
 	if !master {
 		return []tool{
-			{"spawn", "Start a child session in its own git worktree, branched from your HEAD, with prompt as its task.", object([]string{"name", "prompt"}, map[string]any{
+			{"spawn", "Start a child session in its own git worktree, branched from your HEAD, with prompt as its task." + peersHelp, object([]string{"name", "prompt"}, map[string]any{
 				"name":   str(nameHelp),
 				"prompt": str("The child's task. It sees nothing else, so say everything it needs."),
 				"model":  str(modelHelp),
@@ -65,7 +69,7 @@ func tools(master bool) []tool {
 		}
 	}
 	return []tool{
-		{"spawn", "Start a worker session in its own git worktree, branched from the repository's checked-out HEAD, with prompt as its task.", object([]string{"name", "repo", "prompt"}, map[string]any{
+		{"spawn", "Start a worker session in its own git worktree, branched from the repository's checked-out HEAD, with prompt as its task." + peersHelp, object([]string{"name", "repo", "prompt"}, map[string]any{
 			"name":   str(nameHelp),
 			"repo":   str("Path to a git repository Claude Code trusts."),
 			"prompt": str("The worker's task. It sees nothing else, so say everything it needs."),
