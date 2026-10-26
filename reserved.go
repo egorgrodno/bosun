@@ -123,12 +123,14 @@ func (g gate) git(args, dirs []string) string {
 		}
 	case "branch":
 		for _, a := range rest {
-			if a == "--delete" || len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.ContainsAny(a, "dD") {
+			// git takes any unambiguous prefix of a long option, such as --del.
+			if len(a) > 2 && strings.HasPrefix("--delete", a) || len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.ContainsAny(a, "dD") {
 				return "deleting a branch"
 			}
 		}
 	case "update-ref":
-		if slices.Contains(rest, "-d") {
+		// --stdin reads commands that may delete any ref.
+		if slices.Contains(rest, "-d") || slices.ContainsFunc(rest, func(a string) bool { return len(a) > 2 && strings.HasPrefix("--stdin", a) }) {
 			return "deleting a branch"
 		}
 	}
