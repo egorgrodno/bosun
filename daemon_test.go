@@ -216,12 +216,7 @@ func testDaemon(t *testing.T) (*daemon, *fakeClaude) {
 	processAlive = fc.alive
 	t.Cleanup(func() { processAlive = alive })
 	d := newDaemon("/bin/bosun", sock, filepath.Join(dir, "state"), filepath.Join(dir, "master"), fc)
-	ln, err := listen(sock)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { ln.Close() })
-	go d.serve(ln)
+	serve(t, d)
 	if err := d.ensureMaster(); err != nil {
 		t.Fatal(err)
 	}
@@ -490,6 +485,8 @@ func TestMemoryDir(t *testing.T) {
 
 func TestReservedDeniedWithoutDaemon(t *testing.T) {
 	t.Setenv("BOSUN_SOCKET", filepath.Join(t.TempDir(), "missing"))
+	reconnectWait = 0
+	t.Cleanup(func() { reconnectWait = 30 * time.Second })
 	out := receive(t, runHookAsync("a", hookEvent("PreToolUse", "t1", "Bash", bashTest)))
 	if !strings.Contains(out, `"permissionDecision":"deny"`) {
 		t.Fatalf("hook printed %s", out)

@@ -1,12 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // agent is one entry of `claude agents --json`.
@@ -91,6 +96,62 @@ func (claudeExec) Remove(id, discard string) error {
 		return run("rm", id)
 	}
 	return run("rm", id, "--discard-unpushed", discard)
+}
+
+// transcriptTail is what the transcript Claude Code keeps of a session tells of the session's last turn.
+type transcriptTail struct {
+	// text is the last text the session wrote in its own conversation, at is when it last wrote, and ended whether it then ended its turn.
+	text  string
+	at    time.Time
+	ended bool
+}
+
+// readTranscript reads the transcript of Claude Code session sid.
+func readTranscript(sid string) (transcriptTail, error) {
+	var s transcriptTail
+	if sid == "" {
+		return s, errors.New("bosun knows no Claude Code session id for it")
+	}
+	paths, _ := filepath.Glob(filepath.Join(claudeDir(), "projects", "*", sid+".jsonl"))
+	if len(paths) == 0 {
+		return s, fmt.Errorf("Claude Code keeps no transcript of session %s", sid)
+	}
+	f, err := os.Open(paths[0])
+	if err != nil {
+		return s, err
+	}
+	defer f.Close()
+	r := bufio.NewReader(f)
+	for {
+		line, err := r.ReadBytes('\n')
+		var entry struct {
+			Type      string    `json:"type"`
+			Sidechain bool      `json:"isSidechain"`
+			Timestamp time.Time `json:"timestamp"`
+			Message   struct {
+				StopReason string `json:"stop_reason"`
+				Content    []struct {
+					Type string `json:"type"`
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"message"`
+		}
+		if json.Unmarshal(line, &entry) == nil && entry.Type == "assistant" && !entry.Sidechain {
+			s.at, s.ended = entry.Timestamp, entry.Message.StopReason == "end_turn"
+			var parts []string
+			for _, c := range entry.Message.Content {
+				if c.Type == "text" {
+					parts = append(parts, c.Text)
+				}
+			}
+			if len(parts) > 0 {
+				s.text = strings.Join(parts, "\n")
+			}
+		}
+		if err != nil {
+			return s, nil
+		}
+	}
 }
 
 func run(cmd, id string, args ...string) error {

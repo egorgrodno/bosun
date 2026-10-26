@@ -34,7 +34,7 @@ func hookOutput(node, socket string, stdin io.Reader) any {
 	defer cancel()
 	var resp Response
 	if err == nil {
-		resp, err = call(ctx, Request{Op: "hook", Node: node, Socket: socket, Hook: raw})
+		resp, err = callAgain(ctx, Request{Op: "hook", Node: node, Socket: socket, Hook: raw})
 	}
 	switch in.Event {
 	case "PreToolUse":

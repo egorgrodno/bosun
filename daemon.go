@@ -46,6 +46,9 @@ const (
 // idleWait bounds how long resume waits for a worker to be listed idle, which it is not until its Stop hook returns.
 var idleWait = 30 * time.Second
 
+// promptAfter is how long a permission waits on the master or the user before the daemon leaves it to the session's own prompt, ahead of the hook giving up.
+var promptAfter = holdTimeout - 2*holdMargin
+
 // stopWait bounds how long a resume waits for the process of the session it stopped to exit.
 const stopWait = 10 * time.Second
 
@@ -105,6 +108,14 @@ type daemon struct {
 	// masterPID is the master's process when the daemon last checked the supervisor, and foreign the cgroup of a supervisor it last told the user of.
 	masterPID int
 	foreign   string
+	// taken is the batch of events that next_event, called with takenKey, last handed the master, which its next call or Stop acknowledges.
+	taken    []Event
+	takenKey string
+	// orphans holds by id the decisions of an earlier run until orphansUntil, for the hooks and asks that wait on them to send their requests again.
+	orphans      map[string]*Decision
+	orphansUntil time.Time
+	// stopping holds once the daemon shuts down.
+	stopping bool
 }
 
 type watcher struct {
@@ -119,8 +130,21 @@ type preCall struct {
 }
 
 type savedState struct {
-	NextID   int        `json:"nextId"`
-	Sessions []*Session `json:"sessions"`
+	NextID    int             `json:"nextId"`
+	Sessions  []*Session      `json:"sessions"`
+	Events    []Event         `json:"events,omitempty"`
+	Taken     []Event         `json:"taken,omitempty"`
+	TakenKey  string          `json:"takenKey,omitempty"`
+	Decisions []savedDecision `json:"decisions,omitempty"`
+}
+
+// savedDecision is a decision with what the protocol leaves out of it.
+type savedDecision struct {
+	Decision
+	ToolUseID string    `json:"toolUseId,omitempty"`
+	Key       string    `json:"key,omitempty"`
+	Opened    time.Time `json:"opened"`
+	Prompt    bool      `json:"prompt,omitempty"`
 }
 
 func newDaemon(exe, socket, stateDir, masterDir string, claude claudeCLI) *daemon {
@@ -135,6 +159,7 @@ func newDaemon(exe, socket, stateDir, masterDir string, claude claudeCLI) *daemo
 		nodes:       map[string]*Session{},
 		started:     map[string]time.Time{},
 		decisions:   map[string]*Decision{},
+		orphans:     map[string]*Decision{},
 		wake:        make(chan struct{}),
 		watchers:    map[*watcher]bool{},
 	}
@@ -208,12 +233,17 @@ func runDaemon(args []string) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// The connections that close as the process exits must not withdraw the saved decisions.
+			d.mu.Lock()
+			d.stopping = true
+			d.mu.Unlock()
 			return nil
 		case <-tick.C:
 			if d.pollDue(time.Now()) {
 				d.poll()
 			}
 			d.recoverLimited(time.Now())
+			d.expireOrphans(time.Now())
 		}
 	}
 }
@@ -241,7 +271,8 @@ func linkExe(dir, exe string) (string, error) {
 	return link, os.Rename(link+".new", link)
 }
 
-// load adopts the sessions of an earlier run, and rewrites their settings for this build, which each reads when its process next starts.
+// load adopts the sessions, events and decisions of an earlier run, and rewrites the sessions' settings for this build, which each reads when its process next starts.
+// The first poll then reports each turn that ended or stopped while no daemon ran.
 func (d *daemon) load() error {
 	data, err := os.ReadFile(filepath.Join(d.stateDir, "state.json"))
 	if errors.Is(err, fs.ErrNotExist) {
@@ -255,32 +286,88 @@ func (d *daemon) load() error {
 		return fmt.Errorf("state.json: %w", err)
 	}
 	d.nextID = st.NextID
+	now := time.Now()
 	for _, s := range st.Sessions {
 		d.nodes[s.Node] = s
+		if s.Status == "starting" {
+			d.started[s.Node] = now
+		}
 		if _, _, err := d.writeConfig(s); err != nil {
 			log.Printf("%s: %v", s.Node, err)
 		}
+		switch {
+		case s.Node == masterNode || s.Killed:
+		case s.Heard.IsZero():
+			// An earlier build kept no such time, and told the master of every turn it saw end.
+			s.Heard = now
+		default:
+			// The transcript holds a turn whose start no daemon saw, as when it ran while none did.
+			if tail, err := readTranscript(s.SessionID); err == nil && tail.at.After(s.Heard) {
+				s.Turn = true
+			}
+		}
 	}
+	d.events, d.taken, d.takenKey = st.Events, st.Taken, st.TakenKey
+	for _, sd := range st.Decisions {
+		dec := sd.Decision
+		dec.toolUseID, dec.key, dec.opened, dec.prompt = sd.ToolUseID, sd.Key, sd.Opened, sd.Prompt
+		dec.answer = make(chan answer, 1)
+		d.decisions[dec.ID] = &dec
+		if dec.Kind != "notice" {
+			d.orphans[dec.ID] = &dec
+		}
+	}
+	d.orphansUntil = now.Add(reconnectWait)
 	return nil
 }
 
+// saveLocked writes the daemon's state, which must survive a power loss, as the next start reports what it lost.
 func (d *daemon) saveLocked() {
-	st := savedState{NextID: d.nextID}
+	if d.stopping {
+		return
+	}
+	st := savedState{NextID: d.nextID, Events: d.events, Taken: d.taken, TakenKey: d.takenKey}
 	for _, n := range d.sortedLocked() {
 		st.Sessions = append(st.Sessions, n)
 	}
+	for _, dec := range d.snapshotLocked().Decisions {
+		o := d.decisions[dec.ID]
+		st.Decisions = append(st.Decisions, savedDecision{Decision: dec, ToolUseID: o.toolUseID, Key: o.key, Opened: o.opened, Prompt: o.prompt})
+	}
 	data, _ := json.MarshalIndent(st, "", "  ")
-	path := filepath.Join(d.stateDir, "state.json")
-	err := os.MkdirAll(d.stateDir, 0o700)
+	if err := writeDurably(filepath.Join(d.stateDir, "state.json"), data); err != nil {
+		log.Printf("saving state: %v", err)
+	}
+}
+
+// writeDurably replaces the file at path with data, which a crash or power loss leaves whole, old or new.
+func writeDurably(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path+".tmp", os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(data)
 	if err == nil {
-		err = os.WriteFile(path+".tmp", data, 0o600)
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
 	}
 	if err == nil {
 		err = os.Rename(path+".tmp", path)
 	}
 	if err != nil {
-		log.Printf("saving state: %v", err)
+		return err
 	}
+	if df, err := os.Open(dir); err == nil {
+		_ = df.Sync()
+		df.Close()
+	}
+	return nil
 }
 
 func (d *daemon) sortedLocked() []*Session {
@@ -400,14 +487,14 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	var err error
 	switch r.Op {
 	case "hook":
-		resp, err = d.hook(ctx, r.Node, r.Socket, r.Hook)
+		resp, err = d.hook(ctx, r.Node, r.Socket, r.Key, r.Hook)
 	case "ask":
-		resp.Text, err = d.ask(ctx, r.Node, r.Text)
+		resp.Text, err = d.ask(ctx, r.Node, r.Key, r.Text)
 	case "next_event":
 		if r.Node != masterNode {
 			err = errors.New("only the master waits for events")
 		} else {
-			resp.Events = d.nextEvent(ctx)
+			resp.Events = d.nextEvent(ctx, r.Key)
 		}
 	case "approve":
 		err = d.answer(r.Node, r.ID, "permission", answer{behavior: "allow"})
@@ -462,8 +549,8 @@ type hookInput struct {
 	Reason      string          `json:"reason"`
 }
 
-// hook handles one hook event of a session, whose process has the messaging socket socket. It blocks while a decision it opened waits, and answers with no behavior when the decision is withdrawn.
-func (d *daemon) hook(ctx context.Context, node, socket string, raw json.RawMessage) (Response, error) {
+// hook handles one hook event of a session, whose process has the messaging socket socket, sent under key. It blocks while a decision it opened waits, and answers with no behavior when the decision is withdrawn.
+func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.RawMessage) (Response, error) {
 	resp := Response{Type: "result"}
 	var in hookInput
 	if err := json.Unmarshal(raw, &in); err != nil {
@@ -483,6 +570,10 @@ func (d *daemon) hook(ctx context.Context, node, socket string, raw json.RawMess
 		d.saveLocked()
 	}
 	d.stirred = true
+	switch in.Event {
+	case "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "PostToolUseFailure":
+		d.turnLocked(n)
+	}
 	var dec *Decision
 	var worktree string
 	// peer is the node and session id a SendMessage goes to, which must run to take it, and peerSocket whether the message names its process's socket.
@@ -513,7 +604,7 @@ func (d *daemon) hook(ctx context.Context, node, socket string, raw json.RawMess
 		}
 		n.pre[in.ToolUseID] = preCall{in.ToolName, compact(in.ToolInput)}
 		if reason := reservedAction(in.ToolName, in.ToolInput, d.writable(n)...); reason != "" {
-			dec = &Decision{Kind: "permission", Node: node, Holder: "user", Reserved: reason, Tool: in.ToolName, Input: in.ToolInput, toolUseID: in.ToolUseID}
+			dec = &Decision{Kind: "permission", Node: node, Holder: "user", Reserved: reason, Tool: in.ToolName, Input: in.ToolInput, toolUseID: in.ToolUseID, key: key}
 		}
 		if in.ToolName != "SendMessage" {
 			break
@@ -545,7 +636,7 @@ func (d *daemon) hook(ctx context.Context, node, socket string, raw json.RawMess
 		if node == masterNode {
 			holder = "user"
 		}
-		dec = &Decision{Kind: "permission", Node: node, Holder: holder, Tool: in.ToolName, Input: in.ToolInput, Refused: n.refused, toolUseID: n.match(in.ToolName, in.ToolInput)}
+		dec = &Decision{Kind: "permission", Node: node, Holder: holder, Tool: in.ToolName, Input: in.ToolInput, Refused: n.refused, toolUseID: n.match(in.ToolName, in.ToolInput), key: key}
 	case "PermissionDenied":
 		n.refused = cmp.Or(in.Reason, "it gave no reason")
 	case "PostToolUse", "PostToolUseFailure":
@@ -556,6 +647,12 @@ func (d *daemon) hook(ctx context.Context, node, socket string, raw json.RawMess
 		// The turn ended on an API error, and Stop does not run.
 		n.pre = nil
 		d.withdrawLocked(node, func(*Decision) bool { return true })
+		if node == masterNode {
+			n.Turn = false
+			d.requeueLocked()
+		} else {
+			d.heardLocked(n)
+		}
 		switch {
 		case in.Error == "rate_limit":
 			d.limitLocked(n, in.LastMessage)
@@ -581,8 +678,10 @@ func (d *daemon) hook(ctx context.Context, node, socket string, raw json.RawMess
 			d.saveLocked()
 		case node != masterNode:
 			n.Taken = nil
+			d.heardLocked(n)
 			d.reportLocked(Event{Kind: "turn_end", Node: node, Text: in.LastMessage})
 		case !needsMaster(d.pendingLocked()):
+			d.endMasterTurnLocked()
 			d.asleep = true
 			log.Print("the master sleeps until the next event")
 		case !d.stopBlocked:
@@ -590,12 +689,13 @@ func (d *daemon) hook(ctx context.Context, node, socket string, raw json.RawMess
 			d.stopBlocked = true
 		default:
 			// The block did not send the master back to next_event, and blocking it again might never end.
+			d.endMasterTurnLocked()
 			d.asleep = true
 			d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("The master ended its turn twice in a row while events waited, so it has not read them. claude attach %s shows why, and the next event resumes it.", n.ID)})
 		}
 	}
 	if dec != nil {
-		d.openLocked(dec)
+		dec = d.adoptLocked(dec)
 	}
 	d.mu.Unlock()
 	if worktree != "" {
@@ -760,7 +860,7 @@ func compact(raw json.RawMessage) string {
 	return b.String()
 }
 
-func (d *daemon) ask(ctx context.Context, node, question string) (string, error) {
+func (d *daemon) ask(ctx context.Context, node, key, question string) (string, error) {
 	if question == "" {
 		return "", errors.New("the question is empty")
 	}
@@ -769,8 +869,7 @@ func (d *daemon) ask(ctx context.Context, node, question string) (string, error)
 		d.mu.Unlock()
 		return "", errors.New("only a worker asks")
 	}
-	dec := &Decision{Kind: "question", Node: node, Holder: "master", Question: question}
-	d.openLocked(dec)
+	dec := d.adoptLocked(&Decision{Kind: "question", Node: node, Holder: "master", Question: question, key: key})
 	d.mu.Unlock()
 	a, ok := d.wait(ctx, dec)
 	if !ok {
@@ -779,9 +878,23 @@ func (d *daemon) ask(ctx context.Context, node, question string) (string, error)
 	return a.text, nil
 }
 
+// adoptLocked opens dec, unless a decision of an earlier run waits for the request that sends dec again under its key, and returns the decision to wait on.
+func (d *daemon) adoptLocked(dec *Decision) *Decision {
+	for id, o := range d.orphans {
+		if dec.key != "" && o.key == dec.key {
+			delete(d.orphans, id)
+			log.Printf("decision %s: taken up again by %s", id, o.Node)
+			return o
+		}
+	}
+	d.openLocked(dec)
+	return dec
+}
+
 func (d *daemon) openLocked(dec *Decision) {
 	d.nextID++
 	dec.ID = strconv.Itoa(d.nextID)
+	dec.opened = time.Now()
 	dec.answer = make(chan answer, 1)
 	d.decisions[dec.ID] = dec
 	d.saveLocked()
@@ -794,9 +907,28 @@ func (d *daemon) openLocked(dec *Decision) {
 }
 
 func (d *daemon) wait(ctx context.Context, dec *Decision) (answer, bool) {
+	var expired <-chan time.Time
+	if dec.Kind == "permission" && dec.Reserved == "" {
+		t := time.NewTimer(time.Until(dec.opened.Add(promptAfter)))
+		defer t.Stop()
+		expired = t.C
+	}
 	select {
 	case a := <-dec.answer:
 		return a, !a.withdrawn
+	case <-expired:
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.decisions[dec.ID] != dec {
+			a := <-dec.answer
+			return a, !a.withdrawn
+		}
+		id := ""
+		if n := d.nodes[dec.Node]; n != nil {
+			id = n.ID
+		}
+		d.promptLocked(dec, fmt.Sprintf("%s has waited for permission to run %s as long as bosun can hold a permission, so only its own prompt can answer it now: bosun attach %s", dec.Node, describe(*dec), id))
+		return answer{}, false
 	case <-ctx.Done():
 		d.mu.Lock()
 		if d.decisions[dec.ID] == dec {
@@ -810,6 +942,7 @@ func (d *daemon) wait(ctx context.Context, dec *Decision) (answer, bool) {
 func (d *daemon) settleLocked(dec *Decision, a answer) {
 	delete(d.decisions, dec.ID)
 	dec.answer <- a
+	d.saveLocked()
 	d.broadcastLocked(Event{Kind: "settled", ID: dec.ID})
 	switch {
 	case a.withdrawn:
@@ -821,10 +954,37 @@ func (d *daemon) settleLocked(dec *Decision, a answer) {
 	}
 }
 
-// withdrawLocked settles the node's open permissions that match, except reserved ones, whose hook still blocks the call.
+// withdrawLocked settles the node's open permissions that match, except reserved ones, whose hook still blocks the call, and the notices that match of a permission waiting in the node's own prompt.
 func (d *daemon) withdrawLocked(node string, match func(*Decision) bool) {
 	for _, dec := range d.decisions {
-		if dec.Node == node && dec.Kind == "permission" && dec.Reserved == "" && match(dec) {
+		if dec.Node == node && (dec.Kind == "permission" && dec.Reserved == "" || dec.prompt) && match(dec) {
+			d.settleLocked(dec, answer{withdrawn: true})
+		}
+	}
+}
+
+// promptLocked settles permission dec, whose hook can no longer answer it, and opens in its place a notice for the user, with note, until the session moves on.
+func (d *daemon) promptLocked(dec *Decision, note string) {
+	d.settleLocked(dec, answer{withdrawn: true})
+	d.openLocked(&Decision{Kind: "notice", Node: dec.Node, Holder: "user", Note: note, toolUseID: dec.toolUseID, prompt: true})
+}
+
+// expireOrphans settles each decision of an earlier run whose hook or ask did not send its request again by orphansUntil, and so no longer waits on bosun.
+// A permission whose session is still waiting then waits in the session's own prompt.
+func (d *daemon) expireOrphans(now time.Time) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.orphans) == 0 || now.Before(d.orphansUntil) {
+		return
+	}
+	for id, dec := range d.orphans {
+		delete(d.orphans, id)
+		n := d.nodes[dec.Node]
+		switch {
+		case d.decisions[id] != dec:
+		case dec.Kind == "permission" && dec.Reserved == "" && n != nil && n.Status == "waiting":
+			d.promptLocked(dec, fmt.Sprintf("bosun restarted while %s waited for permission to run %s, and the request did not come back, so only its own prompt can answer it now: bosun attach %s", dec.Node, describe(*dec), n.ID))
+		default:
 			d.settleLocked(dec, answer{withdrawn: true})
 		}
 	}
@@ -873,6 +1033,7 @@ func (d *daemon) escalate(caller, id, note string) error {
 		return fmt.Errorf("decision %s already waits on the user", id)
 	}
 	dec.Holder, dec.Note = "user", note
+	d.saveLocked()
 	c := *dec
 	d.broadcastLocked(Event{Kind: "decision", Decision: &c})
 	log.Printf("decision %s: escalated", id)
@@ -910,6 +1071,7 @@ func (d *daemon) messageLocked(ev Event) {
 	d.broadcastLocked(ev)
 	if ev.From != masterNode {
 		d.events = append(d.events, ev)
+		d.saveLocked()
 	}
 	log.Printf("message from %s to %s", ev.From, ev.Node)
 }
@@ -921,6 +1083,7 @@ func needsMaster(evs []Event) bool {
 
 func (d *daemon) pushLocked(ev Event) {
 	d.events = append(d.events, ev)
+	d.saveLocked()
 	close(d.wake)
 	d.wake = make(chan struct{})
 	// A master that a usage limit stopped wakes once the limit resets.
@@ -1008,6 +1171,43 @@ func childReport(evs []Event) string {
 	}
 	b.WriteString("\n\nOnce a child's work is right, merge it. To give it more to do, send it a message.")
 	return b.String()
+}
+
+// requeueLocked puts the events the master took back in front of its queue, marked again, as the turn that took them was cut short.
+func (d *daemon) requeueLocked() {
+	if len(d.taken) == 0 {
+		return
+	}
+	for i := range d.taken {
+		d.taken[i].Again = true
+	}
+	d.events = append(d.taken, d.events...)
+	log.Printf("the master's turn was cut short, so %d events it took wait again", len(d.taken))
+	d.taken, d.takenKey = nil, ""
+	d.saveLocked()
+	close(d.wake)
+	d.wake = make(chan struct{})
+}
+
+// endMasterTurnLocked notes that the master ended its turn of itself, having handled the events it took.
+func (d *daemon) endMasterTurnLocked() {
+	d.nodes[masterNode].Turn = false
+	d.taken, d.takenKey = nil, ""
+	d.saveLocked()
+}
+
+// heardLocked notes that worker n's parent has heard the end of its turn, which a restart then need not find in n's transcript.
+func (d *daemon) heardLocked(n *Session) {
+	n.Turn, n.Heard = false, time.Now()
+}
+
+// turnLocked notes a hook of n's turn, and saves the turn's start, which a power loss must not lose.
+func (d *daemon) turnLocked(n *Session) {
+	n.turnAt = time.Now()
+	if !n.Turn {
+		n.Turn = true
+		d.saveLocked()
+	}
 }
 
 // wakeMaster resumes the master asleep. A master found in a turn, as one is once the user types into it, or starting needs no waking: it reads the events before its turn ends.
@@ -1110,10 +1310,20 @@ func (d *daemon) pendingLocked() []Event {
 }
 
 // nextEvent waits for an event the master acts on, and returns it with every other event waiting.
-func (d *daemon) nextEvent(ctx context.Context) []Event {
+// The call acknowledges the events the last call took, unless it is that call sent again under its key, which gets them again.
+func (d *daemon) nextEvent(ctx context.Context, key string) []Event {
 	timer := time.NewTimer(idleReturn)
 	defer timer.Stop()
 	d.mu.Lock()
+	if key != "" && key == d.takenKey {
+		evs := d.taken
+		d.mu.Unlock()
+		return evs
+	}
+	if d.taken != nil {
+		d.taken, d.takenKey = nil, ""
+		d.saveLocked()
+	}
 	d.stopBlocked, d.asleep = false, false
 	if m := d.nodes[masterNode]; m != nil {
 		m.LimitedUntil = nil
@@ -1126,6 +1336,9 @@ func (d *daemon) nextEvent(ctx context.Context) []Event {
 		d.events = nil
 		if !ready {
 			d.events = evs
+		} else {
+			d.taken, d.takenKey = evs, key
+			d.saveLocked()
 		}
 		wake := d.wake
 		d.mu.Unlock()
@@ -1246,7 +1459,7 @@ func (d *daemon) spawn(caller, name, repo, model, prompt string) (*Session, erro
 	d.mu.Lock()
 	err := d.admitLocked(caller, name)
 	if err == nil {
-		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Base: dir, BaseBranch: branch, Model: cmp.Or(model, d.workerModel), Depth: d.nodes[caller].Depth + 1, Status: "starting"}
+		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Base: dir, BaseBranch: branch, Model: cmp.Or(model, d.workerModel), Depth: d.nodes[caller].Depth + 1, Status: "starting", Heard: time.Now()}
 		d.started[name] = time.Now()
 	}
 	n := d.nodes[name]
@@ -1443,6 +1656,9 @@ func (d *daemon) kill(name string) error {
 		id, killed, held = n.ID, n.Killed, n.held
 		// Marked first, so that a poll that sees the worker stopped tells its parent nothing of its own.
 		n.Killed = killed || (id != "" && !held && name != masterNode)
+		if n.Killed {
+			d.heardLocked(n)
+		}
 	}
 	d.stirred = true
 	d.mu.Unlock()
@@ -1910,7 +2126,7 @@ func (d *daemon) awaitIdle(ctx context.Context, name, id string) (agent, error) 
 }
 
 // ensureMaster adopts the master of an earlier run while Claude Code still lists it, and starts one otherwise.
-// An adopted master that ended its turn, as one does once its calls to a stopped daemon fail, or that stopped, sleeps until the next event.
+// An adopted master that ended its turn, as one does once its calls to a stopped daemon fail, or that stopped, sleeps until the next event, or wakes for the events already waiting.
 func (d *daemon) ensureMaster() error {
 	agents, err := d.claude.Agents()
 	if err != nil {
@@ -1919,9 +2135,14 @@ func (d *daemon) ensureMaster() error {
 	d.mu.Lock()
 	if m := d.nodes[masterNode]; m != nil {
 		if i := slices.IndexFunc(agents, func(a agent) bool { return a.ID == m.ID }); i >= 0 {
-			d.asleep = agents[i].Status == "idle" || agents[i].Status == ""
 			// A saved "starting" would keep wakeMaster from resuming it until the first poll.
 			m.Status, m.State = cmp.Or(agents[i].Status, "stopped"), agents[i].State
+			if betweenTurns(m.Status) {
+				// Its turn ended while no daemon ran, and the events it took may still wait, as may events the earlier run saved.
+				m.Turn = false
+				d.requeueLocked()
+				d.sleepLocked()
+			}
 			d.mu.Unlock()
 			return nil
 		}
@@ -2050,7 +2271,7 @@ func (d *daemon) pollDue(now time.Time) bool {
 		return true
 	}
 	for _, n := range d.nodes {
-		if n.ID == "" || n.held || !betweenTurns(n.Status) {
+		if n.ID == "" || n.held || n.Turn || !betweenTurns(n.Status) {
 			return true
 		}
 	}
@@ -2068,6 +2289,7 @@ func (d *daemon) poll() {
 	d.mu.Lock()
 	d.stirred = false
 	d.mu.Unlock()
+	listed := time.Now()
 	agents, err := d.claude.Agents()
 	if err != nil {
 		log.Print(err)
@@ -2080,13 +2302,28 @@ func (d *daemon) poll() {
 	for _, a := range agents {
 		byID[a.ID] = a
 	}
-	if d.refresh(byID) {
+	if d.refresh(byID, listed) {
 		d.checkSupervisor()
 	}
 }
 
-// refresh updates each session from its listing, and reports whether the master runs in a new process, which a new supervisor may have started.
-func (d *daemon) refresh(byID map[string]agent) (masterMoved bool) {
+// cutLocked tells the parent of worker n, which status shows stopped or gone, that it stopped in its turn, and puts back the reports of its children that the turn took.
+func (d *daemon) cutLocked(n *Session, status string) {
+	text := ""
+	if status == "exited" {
+		text = "Its session is gone, so nothing resumes it."
+	}
+	n.Events, n.Taken = append(n.Taken, n.Events...), nil
+	d.reportLocked(Event{Kind: "exit", Node: n.Node, Text: text})
+	log.Printf("%s %s in its turn", n.Node, status)
+}
+
+// turnSettle is how long after a hook of a turn the daemon trusts a listing that shows the session between turns, which Claude Code may update only after the hook.
+const turnSettle = 10 * time.Second
+
+// refresh updates each session from its listing, taken at listed, and tells the master of each turn that ended or stopped without its knowing, a turn of the daemon's earlier run included.
+// It reports whether the master runs in a new process, which a new supervisor may have started.
+func (d *daemon) refresh(byID map[string]agent, listed time.Time) (masterMoved bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.lastPoll = time.Now()
@@ -2096,40 +2333,63 @@ func (d *daemon) refresh(byID map[string]agent) (masterMoved bool) {
 			continue
 		}
 		status, state := "exited", ""
-		a, listed := byID[n.ID]
-		if listed {
+		a, ok := byID[n.ID]
+		if ok {
 			// The listing outranks a hook, which a stopped session may still send after a switch.
 			n.SessionID = cmp.Or(a.SessionID, n.SessionID)
 		}
 		switch {
-		case listed && a.Status != "":
+		case ok && a.Status != "":
 			status, state = a.Status, a.State
 		case n.Status == "starting" && time.Since(d.started[n.Node]) < startGrace:
 			continue
-		case listed:
+		case ok:
 			status = "stopped"
 		}
 		// A deliver that found the session in its turn or held put its reports back, and only this retries it.
 		if betweenTurns(status) && status != "exited" && len(n.Events) > 0 {
 			go d.deliver(n.Node)
 		}
-		if status == n.Status && state == n.State {
+		if betweenTurns(status) {
+			d.withdrawLocked(n.Node, func(dec *Decision) bool { return dec.prompt })
+		}
+		// The turn's hooks ran, but not its Stop: the daemon was away, or the user interrupted the turn.
+		missed := n.Turn && betweenTurns(status) && n.turnAt.Before(listed.Add(-turnSettle))
+		if !missed && status == n.Status && state == n.State {
 			continue
 		}
 		switch {
-		case n.Node == masterNode && status == "stopped" && !d.asleep:
-			d.sleepLocked()
-		// Claude Code stops a worker idle for an hour, which has sent its turn_end and still resumes, so only a worker stopped in its turn is news.
-		case (status == "stopped" || status == "exited") && !betweenTurns(n.Status) && n.Node != masterNode && !n.Killed:
-			text := ""
-			if status == "exited" {
-				text = "Its session is gone, so nothing resumes it."
+		case n.Node == masterNode:
+			if missed {
+				n.Turn = false
+				d.requeueLocked()
 			}
-			d.reportLocked(Event{Kind: "exit", Node: n.Node, Text: text})
-			log.Printf("%s %s in its turn", n.Node, status)
+			if missed || status == "stopped" && !d.asleep {
+				d.sleepLocked()
+			}
+		case n.Killed:
+			n.Turn = false
+		case missed:
+			d.heardLocked(n)
+			tail, err := readTranscript(n.SessionID)
+			switch {
+			case status == "idle" || err == nil && tail.ended:
+				if err != nil {
+					tail.text = fmt.Sprintf("Its turn ended, and bosun could not read its last message: %v", err)
+				}
+				n.Taken = nil
+				d.reportLocked(Event{Kind: "turn_end", Node: n.Node, Text: tail.text})
+				log.Printf("%s ended its turn without a Stop that reached bosun", n.Node)
+			default:
+				d.cutLocked(n, status)
+			}
+		// Claude Code stops a worker idle for an hour, which has sent its turn_end and still resumes, so only a worker stopped in its turn is news.
+		case (status == "stopped" || status == "exited") && !betweenTurns(n.Status):
+			d.heardLocked(n)
+			d.cutLocked(n, status)
 		}
 		n.Status, n.State = status, state
-		if !listed || a.Status == "" {
+		if !ok || a.Status == "" {
 			n.Socket = ""
 		}
 		// A worker the user stopped handed its children over then.

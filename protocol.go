@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -23,6 +26,8 @@ type Request struct {
 	Model  string          `json:"model,omitempty"`
 	Text   string          `json:"text,omitempty"`
 	Hook   json.RawMessage `json:"hook,omitempty"`
+	// Key names a request that its client sends again, unchanged, once the daemon is back from a restart.
+	Key string `json:"key,omitempty"`
 }
 
 // Response is a line the daemon sends: a "result" for each request, and on a watch a "snapshot" followed by "event"s.
@@ -41,6 +46,7 @@ type Response struct {
 
 // Event is what the master or a frontend is told. The master gets decision, turn_end, exit, tell and message; a frontend gets decision, settled, sessions and message.
 // A message is what session From told session Node through Claude Code's SendMessage.
+// Again marks an event the master took once already, in a turn that was cut short.
 type Event struct {
 	Kind     string    `json:"kind"`
 	Node     string    `json:"node,omitempty"`
@@ -49,6 +55,7 @@ type Event struct {
 	Text     string    `json:"text,omitempty"`
 	Decision *Decision `json:"decision,omitempty"`
 	Sessions []Session `json:"sessions,omitempty"`
+	Again    bool      `json:"again,omitempty"`
 }
 
 // Decision is a permission or a question waiting on its holder, the master or the user, or a notice from the master waiting on the user. A notice's text is its Note.
@@ -66,7 +73,12 @@ type Decision struct {
 	Refused string `json:"refused,omitempty"`
 
 	toolUseID string
-	answer    chan answer
+	// key is the Key of the request that waits on the decision.
+	key    string
+	opened time.Time
+	// prompt marks a notice that a permission waits in its session's own prompt, which the session moving on withdraws.
+	prompt bool
+	answer chan answer
 }
 
 type answer struct {
@@ -77,19 +89,22 @@ type answer struct {
 
 // Session is a node of the tree. Status and State come from `claude agents --json --all`, with Status "stopped" while it lists the session without a process, and "exited" once it lists the session no more.
 // An empty Model is the user's default. Killed marks a worker the user stopped, which the master may not resume.
+// Turn marks a turn whose end the master has not heard of, and Heard is when the master last heard the end of one.
 // A worker's branch began at the HEAD of BaseBranch, checked out in Base, which merge fast-forwards.
 type Session struct {
-	Node      string `json:"node"`
-	Parent    string `json:"parent,omitempty"`
-	Repo      string `json:"repo,omitempty"`
-	Dir       string `json:"dir"`
-	ID        string `json:"id,omitempty"`
-	SessionID string `json:"sessionId,omitempty"`
-	Model     string `json:"model,omitempty"`
-	Depth     int    `json:"depth"`
-	Status    string `json:"status"`
-	State     string `json:"state,omitempty"`
-	Killed    bool   `json:"killed,omitempty"`
+	Node      string    `json:"node"`
+	Parent    string    `json:"parent,omitempty"`
+	Repo      string    `json:"repo,omitempty"`
+	Dir       string    `json:"dir"`
+	ID        string    `json:"id,omitempty"`
+	SessionID string    `json:"sessionId,omitempty"`
+	Model     string    `json:"model,omitempty"`
+	Depth     int       `json:"depth"`
+	Status    string    `json:"status"`
+	State     string    `json:"state,omitempty"`
+	Killed    bool      `json:"killed,omitempty"`
+	Turn      bool      `json:"turn,omitempty"`
+	Heard     time.Time `json:"heard,omitzero"`
 	// Conversation is the one a clear began, which a copy of the session must name.
 	Conversation string `json:"conversation,omitempty"`
 	// Socket is the messaging socket of the session's running process, forgotten once the process stops, since another process may take the path.
@@ -104,6 +119,8 @@ type Session struct {
 	BaseBranch string `json:"baseBranch,omitempty"`
 
 	pre map[string]preCall
+	// turnAt is when a hook of the session's turn last ran.
+	turnAt time.Time
 	// held keeps poll, resume, merge and kill off the session while one of them stops or resumes it.
 	held bool
 	// refused is the reason auto mode gave for refusing the session's last call, until a call runs.
@@ -143,4 +160,38 @@ func call(ctx context.Context, req Request) (Response, error) {
 		return resp, errors.New(resp.Error)
 	}
 	return resp, nil
+}
+
+// reconnectWait bounds how long callAgain waits for a daemon that went away, as one does while it restarts.
+var reconnectWait = 30 * time.Second
+
+// callAgain sends req as call does, and sends it again under the same Key while the daemon is away, for up to reconnectWait since the daemon last took it.
+func callAgain(ctx context.Context, req Request) (Response, error) {
+	if req.Key == "" {
+		b := make([]byte, 16)
+		_, _ = rand.Read(b)
+		req.Key = hex.EncodeToString(b)
+	}
+	until := time.Now().Add(reconnectWait)
+	for {
+		resp, err := call(ctx, req)
+		var op *net.OpError
+		switch {
+		case err == nil || ctx.Err() != nil:
+			return resp, err
+		case errors.As(err, &op) && op.Op == "dial":
+		case op != nil || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
+			until = time.Now().Add(reconnectWait)
+		default:
+			return resp, err
+		}
+		if time.Now().After(until) {
+			return resp, err
+		}
+		select {
+		case <-ctx.Done():
+			return resp, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }

@@ -49,6 +49,8 @@ The events:
 
 A worker's own children report their turn_end and exit to it, not to you, and it merges them. One reaches you only when the user stopped its parent or the parent is gone, and is then yours to merge.
 
+An event with again set reached you before, in a turn of yours that was cut short, so you may have acted on it already. Act on it as on any other: a tool refuses what is already done, such as a merge of a worker that is gone or an answer to a settled decision, and such a refusal needs nothing more.
+
 Workers message each other, so a turn_end does not always mean done. A worker may end its turn to wait for another worker's message, and a turn that a message started also ends in a turn_end. The turn_end's text says which. Merge workers in the order they agreed on. When workers wait only on each other, none starts again: resume one of them and tell it to send its part first.
 
 A usage limit stops a worker without a turn_end, and bosun resumes it once the limit resets.
@@ -302,7 +304,12 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	case "notify":
 		req.Text = args.Message
 	}
-	resp, err := call(ctx, req)
+	send := call
+	if name == "ask" || name == "next_event" {
+		// Each may block across a restart of the daemon, which loads its decision or its batch of events again.
+		send = callAgain
+	}
+	resp, err := send(ctx, req)
 	if err != nil {
 		return "", err
 	}

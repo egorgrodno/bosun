@@ -68,7 +68,7 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Auto mode refuses some calls and asks about others.** A call that auto mode's classifier refuses runs `PermissionDenied`, not `PermissionRequest`, and the session gets the classifier's reason. After a run of refusals, auto mode asks about a call instead of refusing it, so `PermissionRequest` runs and `PermissionDenied` does not. In the probe, that run was a hook's denial followed by two refusals. Such a request carries nothing of the refusals, so the daemon keeps the reason of each session's last refusal until one of its calls runs, and sends it with the permission as `refused`.
 
-**Waiting on you.** A hook's `timeout` may exceed the 600-second default, and the hook decides the call whenever it answers within it. Six seconds after the hook starts, the session also shows its own prompt, and `claude agents --json` reports it as `"status":"waiting","state":"blocked"`. After the `timeout`, only that prompt settles the call. The daemon then moves the decision out of its queue and shows the session as blocked in its own prompt.
+**Waiting on you.** A hook's `timeout` may exceed the 600-second default, and the hook decides the call whenever it answers within it. Six seconds after the hook starts, the session also shows its own prompt, and `claude agents --json` reports it as `"status":"waiting","state":"blocked"`. A minute before the `timeout`, the daemon stops holding the call. From then on only the session's own prompt settles it, and a notice for you replaces the decision. The notice goes once the session moves past the call.
 
 **An answer in the session wins.** Answering the session's own prompt through `claude attach` settles the call at once, and the hook keeps running. `PermissionRequest` carries no call id, so the daemon pairs it with the `PreToolUse` event before it, which carries `tool_use_id`. A `PostToolUse` or `PostToolUseFailure` for that id withdraws the decision. A denial in the session runs no tool, so the session's next `PreToolUse` or `Stop` withdraws it instead.
 
@@ -99,7 +99,7 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 
 **A parent hears of its children.** A worker's `turn_end` and `exit` go to its parent. The master gets them only for its own children, and for the children of a worker that `bosun kill` stopped or that has exited. A worker runs no `next_event`, so the daemon queues the reports. A parent in its turn gets them at its `Stop`, which the daemon blocks with the reports as its reason. The daemon resumes a parent between turns with the reports as its prompt. `SendMessage`'s `notify_when_idle` cannot replace this queue: the child's process holds the subscription, so a stop or resume of the child voids it, and it fires only once.
 
-**An idle master sleeps.** Once `next_event` returns empty, the master ends its turn, and the next event resumes it. So an idle master spends no turns. The daemon blocks a `Stop` that comes while events wait, which sends the master back to `next_event`. If the master stops again before calling `next_event`, the daemon lets it, queues a notice for you, and the next event resumes it. While the daemon is stopped, the master's calls fail and its turn ends. On start, the daemon adopts an idle or stopped master as asleep.
+**An idle master sleeps.** Once `next_event` returns empty, the master ends its turn, and the next event resumes it. So an idle master spends no turns. The daemon blocks a `Stop` that comes while events wait, which sends the master back to `next_event`. If the master stops again before calling `next_event`, the daemon lets it, queues a notice for you, and the next event resumes it. On start, the daemon adopts an idle or stopped master as asleep, unless an event waits for it.
 
 **A stale master wakes cleared.** A wake past the prompt cache's hour re-reads the master's whole transcript uncached. So once the tree holds no worker and the master's transcript has gone an hour unwritten, the daemon resumes the master with `/clear` before it wakes it. What the master must keep across a clear lives in its memory directory.
 
@@ -129,6 +129,18 @@ The check covers only what a session sends: a message from outside bosun reaches
 
 **The master takes no messages.** Its settings set `crossSessionInbound` to `refuse`, and a worker's `PreToolUse` denies a `SendMessage` to it, pointing the worker to `ask`.
 
+## Restarts
+
+A worker's parent must hear of every turn of it that ends or stops.
+
+**The daemon's state survives a power loss.** `state.json` holds the sessions, the master's queue and the open decisions, and each save syncs it to disk.
+
+**Blocked calls outlast a restart.** While the daemon is away, a hook, `ask` and `next_event` send their request again under the same `key`. A hook does so within its own timeout, and `ask` and `next_event` for 30 seconds after they last reached the daemon. The restarted daemon hands each the decision or batch it waited on, and an escalated decision stays with you. A decision whose request has not come back 30 seconds after the start is settled. If its session still waits in its own prompt, a permission then becomes a notice, as it does a minute before the `timeout`. A call that gives up falls back: a `PreToolUse` denies its call, a `PermissionRequest` leaves it to the session's own prompt, and `ask` and `next_event` fail.
+
+**Missed turn ends.** Each hook of a session's turn marks it in a turn, and the daemon saves the mark. `Stop` and `StopFailure` clear it. A marked worker still listed between turns ten seconds after its last hook ended its turn unheard. Either the daemon was away, or the user interrupted the turn. An idle one reaches its parent as a `turn_end` with the last message of its transcript. A stopped one reaches it as an `exit`, or as a `turn_end` if its transcript shows the turn finished. On start, a worker counts as marked when its transcript holds a message newer than the last turn end its parent heard. That covers a turn that ran while no daemon did.
+
+**The master's batch.** The events `next_event` returns stay with the daemon until the master's next `next_event`, or a `Stop` that ends its turn. When its turn ends any other way, such as by a crash, a kill, an API error or a restart, the daemon puts the batch back in front of the queue with `again` set. A worker that stops in its turn likewise gets back the reports of its children that the turn took.
+
 ## Frontends
 
 Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `model`, `attach`. Every rule lives in the daemon.
@@ -141,3 +153,4 @@ Each leads with the queue of decisions waiting on you, above the tree.
 ## Open questions
 
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
+- **Restarts.** Only a fake `claude` has run the restart handling. No real reboot or crash has been measured. The daemon reads transcripts in the 2.1.310 format.
