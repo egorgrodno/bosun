@@ -27,6 +27,8 @@ import (
 
 const (
 	masterNode = "master"
+	// deskNode is the front desk, the session the user talks to, which reads the fleet and acts on it only through the master.
+	deskNode = "desk"
 
 	// holdTimeout is the timeout of the PreToolUse and PermissionRequest hooks, so how long a decision waits.
 	// The hook gives up holdMargin before it, while Claude Code still reads what it prints.
@@ -70,12 +72,18 @@ const eventsWaiting = "Events are waiting: call next_event."
 
 var nodeName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,39}$`)
 
+// isWorker reports whether node is a worker rather than the master or the desk, which the daemon starts itself and which no parent hears of.
+func isWorker(node string) bool {
+	return node != masterNode && node != deskNode
+}
+
 type daemon struct {
 	exe         string
 	socket      string
 	stateDir    string
 	masterDir   string
 	masterModel string
+	deskModel   string
 	workerModel string
 	// maxDepth caps the depth of the tree, where the master's children are at depth 1, and maxChildren the live children of each session.
 	maxDepth    int
@@ -84,6 +92,8 @@ type daemon struct {
 
 	// masterLock is held while the master is woken, switched or resumed idle, so that no two of them resume it at once.
 	masterLock sync.Mutex
+	// deskLock is held while the desk is handed what waits for it or readied for claude attach, each of which may clear it first.
+	deskLock sync.Mutex
 	// pauseLock is held through a pause or an unpause, each of which stops or resumes one session after another.
 	pauseLock sync.Mutex
 	mu        sync.Mutex
@@ -101,8 +111,8 @@ type daemon struct {
 	stopBlocked bool
 	// asleep holds from a Stop that ends the master's turn with no events waiting until the next event resumes it.
 	asleep bool
-	// cleared closes once the master's SessionStart reports the conversation that a clear began.
-	cleared chan struct{}
+	// cleared holds by node a channel that closes once the session's SessionStart reports the conversation that a clear began.
+	cleared map[string]chan struct{}
 	// recovering holds while the daemon resumes the sessions that a usage limit stopped, and limitNotice is the last notice of a limit.
 	recovering  bool
 	limitNotice string
@@ -166,6 +176,7 @@ func newDaemon(exe, socket, stateDir, masterDir string, claude claudeCLI) *daemo
 		started:     map[string]time.Time{},
 		decisions:   map[string]*Decision{},
 		orphans:     map[string]*Decision{},
+		cleared:     map[string]chan struct{}{},
 		wake:        make(chan struct{}),
 		watchers:    map[*watcher]bool{},
 	}
@@ -200,6 +211,7 @@ func runDaemon(args []string) error {
 	flags := flag.NewFlagSet("daemon", flag.ExitOnError)
 	masterDir := flags.String("master-dir", filepath.Join(stateDir(), "master"), "directory the master runs in, which Claude Code must trust")
 	masterModel := flags.String("master-model", "", "model of a master the daemon starts, such as fable, opus or sonnet; the user's default when empty")
+	deskModel := flags.String("desk-model", "", "model of a front desk the daemon starts; the user's default when empty")
 	workerModel := flags.String("worker-model", "", "model of a worker started without one; the user's default when empty")
 	maxDepth := flags.Int("max-depth", defaultMaxDepth, "deepest level of the tree, where the master's children are at level 1")
 	maxChildren := flags.Int("max-children", defaultMaxChildren, "most children each session runs at once, a stopped one included until it is killed")
@@ -212,7 +224,7 @@ func runDaemon(args []string) error {
 		return err
 	}
 	d := newDaemon(exe, socketPath(), stateDir(), *masterDir, claudeExec{})
-	d.masterModel, d.workerModel = *masterModel, *workerModel
+	d.masterModel, d.deskModel, d.workerModel = *masterModel, *deskModel, *workerModel
 	d.maxDepth, d.maxChildren = *maxDepth, *maxChildren
 	if err := d.fitsSockets(masterNode); err != nil {
 		return fmt.Errorf("the state path %s is too long, so set BOSUN_STATE to a shorter one: %w", d.stateDir, err)
@@ -231,6 +243,12 @@ func runDaemon(args []string) error {
 	go d.serve(ln)
 	if err := d.ensureMaster(); err != nil {
 		return err
+	}
+	if err := d.ensureDesk(); err != nil {
+		log.Printf("starting the desk: %v", err)
+		d.mu.Lock()
+		d.openLocked(&Decision{Kind: "notice", Node: deskNode, Holder: "user", Note: fmt.Sprintf("The front desk could not start: %v. Until a restart of the daemon starts it, bosun tell goes to the master.", err)})
+		d.mu.Unlock()
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -302,7 +320,7 @@ func (d *daemon) load() error {
 			log.Printf("%s: %v", s.Node, err)
 		}
 		switch {
-		case s.Node == masterNode || s.Killed || s.Paused:
+		case !isWorker(s.Node) || s.Killed || s.Paused:
 		case s.Heard.IsZero():
 			// An earlier build kept no such time, and told the master of every turn it saw end.
 			s.Heard = now
@@ -393,10 +411,28 @@ func (s *Session) public() Session {
 
 var notAlnum = regexp.MustCompile(`[^a-zA-Z0-9]`)
 
-// memoryDir is the auto memory directory Claude Code picks for the session's repository, or for its directory outside one, which the user's own sessions there share.
+// projectDir is the folder of Claude Code's config directory for the session's repository, or for its directory outside one: the transcripts of a session outside a repository land there.
 // Claude Code adds a hash to a name over 200 characters and this does not, so such a repository's sessions keep memory apart from the user's.
+func (s *Session) projectDir() string {
+	return filepath.Join(claudeDir(), "projects", notAlnum.ReplaceAllString(cmp.Or(s.Repo, s.Dir), "-"))
+}
+
+// memoryDir is the auto memory directory Claude Code picks for the session, which the user's own sessions in the same repository or directory share.
 func (s *Session) memoryDir() string {
-	return filepath.Join(claudeDir(), "projects", notAlnum.ReplaceAllString(cmp.Or(s.Repo, s.Dir), "-"), "memory")
+	return filepath.Join(s.projectDir(), "memory")
+}
+
+// memoryDir is the auto memory directory of session s: the master's for the desk, which shares it, and Claude Code's own pick for every other session.
+func (d *daemon) memoryDir(s *Session) string {
+	if s.Node == deskNode {
+		return (&Session{Dir: d.masterDir}).memoryDir()
+	}
+	return s.memoryDir()
+}
+
+// deskDir is where the desk runs. Claude Code trusts a directory outside a repository when it trusts one that holds it, so the master's trust covers it.
+func (d *daemon) deskDir() string {
+	return filepath.Join(d.masterDir, deskNode)
 }
 
 // tempDir is the node's TMPDIR.
@@ -440,7 +476,7 @@ func (d *daemon) repos() gitRepos {
 
 // writable lists where the session's file tools write without the user: its worktree, its scratch folder, and the memory and job directories Claude Code's system prompt sends it to.
 func (d *daemon) writable(s *Session) []string {
-	dirs := []string{s.Dir, d.scratchDir(s.Node), s.memoryDir()}
+	dirs := []string{s.Dir, d.scratchDir(s.Node), d.memoryDir(s)}
 	if s.ID != "" {
 		dirs = append(dirs, filepath.Join(claudeDir(), "jobs", s.ID, "tmp"))
 	}
@@ -531,13 +567,15 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	case "dismiss":
 		err = d.answer(r.Node, r.ID, "notice", answer{})
 	case "tell":
-		err = d.tell(r.Text)
+		err = d.tell(r.Node, r.Text)
+	case "transcript":
+		resp.Text, err = d.transcript(r.Name, r.Turns)
 	case "spawn":
 		resp.Session, err = d.spawn(r.Node, r.Name, r.Repo, r.Model, r.Text)
 	case "resume":
 		err = d.resume(ctx, r.Node, r.Name, r.Text)
 	case "attach":
-		err = d.resumeIdle(r.ID)
+		err = d.attach(r.ID)
 	case "kill":
 		err = d.kill(r.Name)
 	case "merge":
@@ -618,12 +656,12 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 		if n.Repo != "" {
 			worktree = n.Dir
 		}
-		if in.Source == "clear" && node == masterNode {
+		if in.Source == "clear" && !isWorker(node) {
 			n.Conversation = in.SessionID
 			d.saveLocked()
-			if d.cleared != nil {
-				close(d.cleared)
-				d.cleared = nil
+			if ch := d.cleared[node]; ch != nil {
+				close(ch)
+				delete(d.cleared, node)
 			}
 		}
 	case "UserPromptSubmit":
@@ -652,6 +690,12 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 		case refusal != "":
 			resp.Behavior, resp.Text = "deny", refusal
 		case to == nil:
+		case node == deskNode:
+			resp.Behavior, resp.Text = "deny", "bosun: the desk changes nothing in the fleet itself, and a message would start a session's turn. Pass the user's instruction to the master with tell_master."
+		case to.Node == deskNode && node == masterNode:
+			resp.Behavior, resp.Text = "deny", "bosun: the desk takes no messages. Answer it with tell_desk."
+		case to.Node == deskNode:
+			resp.Behavior, resp.Text = "deny", "bosun: the desk takes no messages from workers. Put questions to the master with ask."
 		case to.Node == masterNode:
 			// The master refuses messages, but SendMessage reports success all the same, and the refusal starts the sender's next turn.
 			resp.Behavior, resp.Text = "deny", "bosun: the master takes no messages. Ask it with ask, which waits for its answer."
@@ -667,7 +711,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 		}
 	case "PermissionRequest":
 		holder := "master"
-		if node == masterNode {
+		if !isWorker(node) {
 			holder = "user"
 		}
 		dec = &Decision{Kind: "permission", Node: node, Holder: holder, Tool: in.ToolName, Input: in.ToolInput, Refused: n.refused, toolUseID: n.match(in.ToolName, in.ToolInput), key: key}
@@ -694,6 +738,13 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 			if node == masterNode {
 				d.asleep = true
 			}
+			// The master may run on another model, which the limit spares.
+			if node == deskNode {
+				d.strandLocked(n, "stopped at a usage limit")
+			}
+		case node == deskNode:
+			// The user may have told the desk through bosun tell, and so not be watching it.
+			d.openLocked(&Decision{Kind: "notice", Node: deskNode, Holder: "user", Note: fmt.Sprintf("The front desk's turn failed on an API error, %s: %s. bosun attach %s shows what it was doing.", in.Error, in.LastMessage, n.ID)})
 		case node != masterNode:
 			d.reportLocked(Event{Kind: "turn_end", Node: node, Text: fmt.Sprintf("Its turn failed on an API error, %s: %s", in.Error, in.LastMessage)})
 		default:
@@ -708,6 +759,13 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 		switch {
 		case n.Paused && d.paused:
 			// The pause stopped the session in its turn, which unpausing resumes.
+		case node == deskNode && len(n.Events) > 0:
+			resp.Behavior, resp.Text = "block", deskReport(n.Events)
+			n.Events, n.Unseen = nil, true
+			d.saveLocked()
+		case node == deskNode:
+			n.Turn = false
+			d.saveLocked()
 		case node != masterNode && len(n.Events) > 0:
 			// A worker runs no next_event, so news of its children waits for the end of its turn, which goes on with it.
 			resp.Behavior, resp.Text = "block", childReport(n.Events)
@@ -873,7 +931,7 @@ func (d *daemon) recipientLocked(to string) (*Session, string) {
 		return n, ""
 	}
 	name := ref.ReplaceAllString(to, "")
-	if name == masterNode {
+	if !isWorker(name) && d.nodes[name] != nil {
 		return d.nodes[name], ""
 	}
 	if name != to && d.nodes[name] != nil {
@@ -882,7 +940,7 @@ func (d *daemon) recipientLocked(to string) (*Session, string) {
 	}
 	var workers []string
 	for _, n := range d.sortedLocked() {
-		if n.Node != masterNode && !n.Killed && n.Status != "exited" {
+		if isWorker(n.Node) && !n.Killed && n.Status != "exited" {
 			workers = append(workers, n.Node)
 		}
 	}
@@ -902,7 +960,7 @@ func (d *daemon) ask(ctx context.Context, node, key, question string) (string, e
 		return "", errors.New("the question is empty")
 	}
 	d.mu.Lock()
-	if d.nodes[node] == nil || node == masterNode {
+	if d.nodes[node] == nil || !isWorker(node) {
 		d.mu.Unlock()
 		return "", errors.New("only a worker asks")
 	}
@@ -1091,14 +1149,68 @@ func (d *daemon) notify(caller, text string) error {
 	return nil
 }
 
-func (d *daemon) tell(text string) error {
+// tell passes on text from caller: the user's from a frontend to the desk, the desk's to the master, and the master's to the desk.
+// When the desk could not start, its session is gone or a usage limit stopped it, the user's goes to the master and the master's to the user.
+func (d *daemon) tell(caller, text string) error {
 	if text == "" {
 		return errors.New("nothing to tell")
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.pushLocked(Event{Kind: "tell", Text: text})
+	desk := d.nodes[deskNode]
+	if desk != nil && (desk.Status == "exited" || desk.LimitedUntil != nil) {
+		desk = nil
+	}
+	switch {
+	case caller == deskNode:
+		d.pushLocked(Event{Kind: "tell", From: deskNode, Text: text})
+	case caller == masterNode && desk == nil:
+		d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: "The master answers: " + text})
+	case caller == masterNode:
+		d.queueLocked(desk, Event{Kind: "tell", From: masterNode, Text: text})
+	case caller != "":
+		return errors.New("only the user, the desk and the master tell")
+	case desk == nil:
+		d.pushLocked(Event{Kind: "tell", Text: text})
+	default:
+		d.queueLocked(desk, Event{Kind: "tell", Text: text})
+	}
 	return nil
+}
+
+// deskReport is what bosun hands the desk: the user's tells and the master's answers.
+func deskReport(evs []Event) string {
+	var parts []string
+	for _, ev := range evs {
+		if ev.From == masterNode {
+			parts = append(parts, "bosun: the master answers:\n"+ev.Text)
+		} else {
+			parts = append(parts, "bosun: the user sent this through bosun tell, so they may not be watching this session:\n"+ev.Text)
+		}
+	}
+	return strings.Join(parts, "\n\n")
+}
+
+// strandLocked hands on what waits for the desk, which cannot take it: the user's tells go to the master, and the master's answers to the user.
+func (d *daemon) strandLocked(desk *Session, why string) {
+	if len(desk.Events) == 0 {
+		return
+	}
+	note := fmt.Sprintf("The front desk %s.", why)
+	told := false
+	for _, ev := range desk.Events {
+		if ev.From == masterNode {
+			note += "\n\nThe master answered: " + ev.Text
+		} else {
+			d.pushLocked(Event{Kind: "tell", Text: ev.Text})
+			told = true
+		}
+	}
+	if told {
+		note += "\n\nThe master got instead what you told the desk through bosun tell."
+	}
+	desk.Events = nil
+	d.openLocked(&Decision{Kind: "notice", Node: deskNode, Holder: "user", Note: note})
 }
 
 // messageLocked shows the frontends a message between sessions, and queues it for the master without waking it.
@@ -1141,11 +1253,16 @@ func (d *daemon) reportLocked(ev Event) {
 		d.pushLocked(ev)
 		return
 	}
-	p.Events = append(p.Events, ev)
+	d.queueLocked(p, ev)
+}
+
+// queueLocked holds ev for n, a worker parent or the desk, which runs no next_event: n gets it at the end of its turn, or between turns in a new one.
+func (d *daemon) queueLocked(n *Session, ev Event) {
+	n.Events = append(n.Events, ev)
 	d.saveLocked()
-	log.Printf("%s of %s, for %s", ev.Kind, ev.Node, p.Node)
-	if betweenTurns(p.Status) {
-		go d.deliver(p.Node)
+	log.Printf("%s of %s, for %s", ev.Kind, cmp.Or(ev.Node, ev.From, "the user"), n.Node)
+	if betweenTurns(n.Status) {
+		go d.deliver(n.Node)
 	}
 }
 
@@ -1164,9 +1281,21 @@ func (d *daemon) orphanLocked(n *Session) {
 	}
 }
 
-// deliver starts a turn of worker name, between turns, that hands it its children's reports.
-// While it cannot start one, its next Stop, or the poll that finds it between turns, hands them over. When starting one fails, the master gets them.
+// deliver starts a turn of name, a worker or the desk, between turns, that hands it what waits for it: a worker's children's reports, or the desk's tells.
+// While it cannot start one, its next Stop, or the poll that finds it between turns, hands them over. When starting one fails, the master gets a worker's reports, and strandLocked the desk's tells.
+// A stale desk moves to a new conversation first, as clearStaleDesk allows.
 func (d *daemon) deliver(name string) {
+	if name == deskNode {
+		d.deskLock.Lock()
+		defer d.deskLock.Unlock()
+		d.mu.Lock()
+		n := d.nodes[name]
+		waiting := n != nil && len(n.Events) > 0
+		d.mu.Unlock()
+		if waiting {
+			d.clearStaleDesk()
+		}
+	}
 	d.mu.Lock()
 	n := d.nodes[name]
 	if n == nil || n.Killed || n.LimitedUntil != nil || d.paused || len(n.Events) == 0 {
@@ -1176,14 +1305,24 @@ func (d *daemon) deliver(name string) {
 	evs := n.Events
 	n.Events = nil
 	d.mu.Unlock()
-	err := d.carryOn(context.Background(), name, childReport(evs))
+	report := childReport(evs)
+	if name == deskNode {
+		report = deskReport(evs)
+	}
+	err := d.carryOn(context.Background(), name, report)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	switch {
+	case err == nil && name == deskNode:
+		n.Unseen = true
 	case err == nil:
 		n.Taken = append(n.Taken, evs...)
 	case errors.Is(err, errInTurn) || errors.Is(err, errStarting) || errors.Is(err, errPaused):
 		n.Events = append(evs, n.Events...)
+	case name == deskNode:
+		log.Printf("handing the desk its tells: %v", err)
+		n.Events = append(evs, n.Events...)
+		d.strandLocked(n, fmt.Sprintf("could not be resumed: %v", err))
 	default:
 		log.Printf("telling %s of its children: %v", name, err)
 		n.Events = append(evs, n.Events...)
@@ -1260,8 +1399,8 @@ func (d *daemon) wakeMaster() {
 		return
 	}
 	d.mu.Unlock()
-	if d.stale(time.Now()) {
-		if err := d.clearMaster(context.Background()); err != nil {
+	if d.stale(masterNode, time.Now()) {
+		if err := d.clear(context.Background(), masterNode); err != nil {
 			log.Printf("clearing the master's conversation: %v", err)
 		}
 	}
@@ -1277,15 +1416,18 @@ func (d *daemon) wakeMaster() {
 	d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("Waking the master failed, so its events wait unread: %v. The next event tries again. If it keeps failing, `claude rm %s` and a restart of the daemon start a new master, without the old one's conversation.", err, id)})
 }
 
-// stale reports whether the master should wake in a new conversation: no worker is left for it to remember, and it has outlasted its prompt cache, so its next turn would read the whole transcript uncached.
-func (d *daemon) stale(now time.Time) bool {
+// stale reports whether node, the master or the desk, should wake in a new conversation: it has outlasted its prompt cache, so its next turn would read the whole transcript uncached.
+// The master also needs no worker left for it to remember.
+// Each runs in a directory of its own, outside any repository, so the transcripts in its project folder are its own.
+func (d *daemon) stale(node string, now time.Time) bool {
 	d.mu.Lock()
-	m := d.nodes[masterNode]
-	if m == nil || m.ID == "" || len(d.nodes) > 1 {
+	n := d.nodes[node]
+	busy := node == masterNode && slices.ContainsFunc(slices.Collect(maps.Keys(d.nodes)), isWorker)
+	if n == nil || n.ID == "" || busy {
 		d.mu.Unlock()
 		return false
 	}
-	dir := filepath.Dir(m.memoryDir())
+	dir := n.projectDir()
 	d.mu.Unlock()
 	last, ok := lastWrite(dir)
 	return ok && now.Sub(last) >= cacheLife
@@ -1303,32 +1445,36 @@ func lastWrite(dir string) (time.Time, bool) {
 	return last, !last.IsZero()
 }
 
-// clearMaster moves the master to a new conversation in the same session, as /clear does, and leaves it idle.
-func (d *daemon) clearMaster(ctx context.Context) error {
+// clear moves node, the master or the desk, to a new conversation in the same session, as /clear does, and leaves it idle.
+func (d *daemon) clear(ctx context.Context, node string) error {
 	cleared := make(chan struct{})
 	d.mu.Lock()
-	m := d.nodes[masterNode]
-	id, dir := m.ID, m.Dir
-	d.cleared = cleared
+	n := d.nodes[node]
+	if n == nil {
+		d.mu.Unlock()
+		return fmt.Errorf("no node %q", node)
+	}
+	id, dir := n.ID, n.Dir
+	d.cleared[node] = cleared
 	d.mu.Unlock()
 	defer func() {
 		d.mu.Lock()
-		if d.cleared == cleared {
-			d.cleared = nil
+		if d.cleared[node] == cleared {
+			delete(d.cleared, node)
 		}
 		d.mu.Unlock()
 	}()
-	if err := d.restart(ctx, m, id, dir, "/clear"); err != nil {
+	if err := d.restart(ctx, n, id, dir, "/clear"); err != nil {
 		return err
 	}
 	timer := time.NewTimer(clearWait)
 	defer timer.Stop()
 	select {
 	case <-cleared:
-		log.Print("cleared the master's conversation")
+		log.Printf("cleared %s's conversation", node)
 		return nil
 	case <-timer.C:
-		return fmt.Errorf("the master began no new conversation within %v of /clear", clearWait)
+		return fmt.Errorf("%s began no new conversation within %v of /clear", node, clearWait)
 	}
 }
 
@@ -1464,8 +1610,11 @@ func (d *daemon) snapshotLocked() Response {
 // spawn starts a child of caller, or of the master when a frontend asks. A child of the master needs repo; a deeper one branches from its parent's worktree.
 func (d *daemon) spawn(caller, name, repo, model, prompt string) (*Session, error) {
 	caller = cmp.Or(caller, masterNode)
-	if !nodeName.MatchString(name) || name == masterNode {
-		return nil, fmt.Errorf("invalid node name %q: use lowercase letters, digits and hyphens", name)
+	if caller == deskNode {
+		return nil, errors.New("the desk starts no sessions: pass the user's instruction to the master with tell_master")
+	}
+	if !nodeName.MatchString(name) || !isWorker(name) {
+		return nil, fmt.Errorf("invalid node name %q: use lowercase letters, digits and hyphens, other than master and desk", name)
 	}
 	if err := d.fitsSockets(name); err != nil {
 		return nil, fmt.Errorf("node name %q is too long: %w", name, err)
@@ -1601,7 +1750,7 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 	hold := []hookGroup{{Hooks: []hookCommand{{Type: "command", Command: command, Timeout: int(holdTimeout / time.Second)}}}}
 	quick := []hookGroup{{Hooks: []hookCommand{{Type: "command", Command: command}}}}
 	permissions := map[string][]string{"allow": {"mcp__bosun"}, "ask": rebuildRules}
-	if node != masterNode {
+	if isWorker(node) {
 		permissions["deny"] = []string{"AskUserQuestion"}
 	}
 	excludes := filepath.Join(dir, "gitignore")
@@ -1610,8 +1759,9 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 	}
 	settings := map[string]any{
 		"worktree": map[string]string{"baseRef": "head"},
-		// Claude Code's default, set so that the reserved check spares exactly the directory the session writes.
-		"autoMemoryDirectory": n.memoryDir(),
+		// Claude Code's default, or the master's for the desk, set so that the reserved check spares exactly the directory the session writes.
+		// Claude Code reads it from --settings, which only managed settings outrank.
+		"autoMemoryDirectory": d.memoryDir(n),
 		"permissions":         permissions,
 		"env": map[string]string{
 			// Claude Code moves an MCP call still running after 120 seconds to the background, so ask and next_event would stop blocking the turn.
@@ -1649,8 +1799,9 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 			"StopFailure":        quick,
 		},
 	}
-	if node == masterNode {
+	if !isWorker(node) {
 		// A message would start a turn outside the next_event loop, or wait unread until next_event returns, so workers reach the master through ask.
+		// The desk passes on to the master what it is told, so only bosun and the user reach it, and a session outside bosun cannot pose as the user.
 		settings["crossSessionInbound"] = "refuse"
 	}
 	mcp := map[string]any{"mcpServers": map[string]any{"bosun": map[string]any{
@@ -1702,7 +1853,7 @@ func shellQuote(s string) string {
 }
 
 // kill stops a session. Claude Code lists a stopped worker just as it lists one it retired, so the daemon marks it, and the master may not resume it.
-// The master stays stopped only until it has events to read, as poll finds.
+// The master stays stopped only until it has events to read, as poll finds, and the desk until a tell or an answer waits for it.
 func (d *daemon) kill(name string) error {
 	d.mu.Lock()
 	n := d.nodes[name]
@@ -1711,7 +1862,7 @@ func (d *daemon) kill(name string) error {
 	if n != nil {
 		id, killed, held = n.ID, n.Killed, n.held
 		// Marked first, so that a poll that sees the worker stopped tells its parent nothing of its own.
-		n.Killed = killed || (id != "" && !held && name != masterNode)
+		n.Killed = killed || (id != "" && !held && isWorker(name))
 		if n.Killed {
 			d.heardLocked(n)
 			n.Paused = false
@@ -1799,7 +1950,7 @@ var errGone = errors.New("gone")
 func (d *daemon) mergeableLocked(caller, name string) error {
 	n := d.nodes[name]
 	switch {
-	case n == nil || name == masterNode:
+	case n == nil || !isWorker(name):
 		return fmt.Errorf("no worker %q", name)
 	case caller != n.Parent && caller != masterNode:
 		return fmt.Errorf("%s is %s's child, not yours", name, n.Parent)
@@ -1965,7 +2116,7 @@ func (d *daemon) resume(ctx context.Context, caller, name, prompt string) error 
 	if prompt == "" {
 		return errors.New("the prompt is empty")
 	}
-	if name == masterNode {
+	if !isWorker(name) {
 		return fmt.Errorf("no worker %q", name)
 	}
 	return d.carryOn(ctx, name, prompt)
@@ -2060,6 +2211,71 @@ func (d *daemon) release(n *Session) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	n.held = false
+}
+
+// attach readies session id for a frontend about to run `claude attach` on it. A stale desk moves to a new conversation first, as clearStaleDesk allows, since the user's next word would read its old one uncached.
+// The user then sees whatever the desk replied, which no longer holds off its clear.
+func (d *daemon) attach(id string) error {
+	d.mu.Lock()
+	desk := d.nodes[deskNode]
+	isDesk := desk != nil && id != "" && desk.ID == id
+	d.mu.Unlock()
+	if !isDesk {
+		return d.resumeIdle(id)
+	}
+	d.deskLock.Lock()
+	defer d.deskLock.Unlock()
+	var err error
+	if !d.clearStaleDesk() {
+		err = d.resumeIdle(id)
+	}
+	if err == nil {
+		d.mu.Lock()
+		desk.Unseen = false
+		d.saveLocked()
+		d.mu.Unlock()
+	}
+	return err
+}
+
+// clearStaleDesk clears the desk once it is stale, and reports whether it did. It spares a desk holding answers that the user has not opened it to read since bosun handed it a tell. Its caller holds deskLock.
+func (d *daemon) clearStaleDesk() bool {
+	d.mu.Lock()
+	desk := d.nodes[deskNode]
+	unseen := desk != nil && desk.Unseen
+	d.mu.Unlock()
+	if unseen || !d.stale(deskNode, time.Now()) {
+		return false
+	}
+	if err := d.clear(context.Background(), deskNode); err != nil {
+		log.Printf("clearing the desk's conversation: %v", err)
+		return false
+	}
+	return true
+}
+
+// transcript shows the last turns of session name's current conversation.
+func (d *daemon) transcript(name string, turns int) (string, error) {
+	if turns <= 0 {
+		turns = 3
+	}
+	d.mu.Lock()
+	n := d.nodes[name]
+	if n == nil {
+		d.mu.Unlock()
+		return "", fmt.Errorf("no session %q", name)
+	}
+	sid, state := cmp.Or(n.Conversation, n.SessionID), sessionState(n.public())
+	d.mu.Unlock()
+	t, err := readTranscript(sid, turns)
+	if err != nil {
+		return "", err
+	}
+	text := t.render()
+	if text == "" {
+		return fmt.Sprintf("%s is %s, and its conversation holds no turn yet.", name, state), nil
+	}
+	return fmt.Sprintf("%s is %s. Its last turns, oldest first:\n\n%s", name, state, text), nil
 }
 
 // resumeIdle resumes session id idle if it stopped, for a frontend about to run `claude attach` on it, or for a message to it.
@@ -2228,6 +2444,55 @@ func (d *daemon) ensureMaster() error {
 	d.saveLocked()
 	d.broadcastSessionsLocked()
 	log.Printf("started the master (%s) in %s", id, d.masterDir)
+	return nil
+}
+
+// ensureDesk adopts the desk of an earlier run while Claude Code still lists it, and starts one otherwise, with the tells that waited for the old one.
+// An adopted desk between turns gets what waits for it.
+func (d *daemon) ensureDesk() error {
+	agents, err := d.claude.Agents()
+	if err != nil {
+		return err
+	}
+	d.mu.Lock()
+	old := d.nodes[deskNode]
+	if old != nil {
+		if i := slices.IndexFunc(agents, func(a agent) bool { return a.ID == old.ID }); i >= 0 {
+			old.Status, old.State = cmp.Or(agents[i].Status, "stopped"), agents[i].State
+			if betweenTurns(old.Status) {
+				old.Turn = false
+				if len(old.Events) > 0 {
+					go d.deliver(deskNode)
+				}
+			}
+			d.mu.Unlock()
+			return nil
+		}
+	}
+	n := &Session{Node: deskNode, Dir: d.deskDir(), Model: d.deskModel, Status: "starting"}
+	if old != nil {
+		n.Events = old.Events
+	}
+	d.nodes[deskNode] = n
+	d.started[deskNode] = time.Now()
+	d.mu.Unlock()
+	err = os.MkdirAll(n.Dir, 0o700)
+	var id string
+	if err == nil {
+		id, err = d.start(n, n.Dir, nil, deskPrompt, deskStart)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if err != nil {
+		delete(d.nodes, deskNode)
+		d.strandLocked(n, "could not start")
+		d.saveLocked()
+		return fmt.Errorf("starting the desk in %s, which Claude Code must trust: %w", n.Dir, err)
+	}
+	n.ID = id
+	d.saveLocked()
+	d.broadcastSessionsLocked()
+	log.Printf("started the desk (%s) in %s", id, n.Dir)
 	return nil
 }
 
@@ -2437,6 +2702,9 @@ func (d *daemon) refresh(byID map[string]agent, listed time.Time) (masterMoved b
 			if missed || status == "stopped" && !d.asleep {
 				d.sleepLocked()
 			}
+		case n.Node == deskNode:
+			// Nobody hears of the desk's turns.
+			n.Turn = n.Turn && !missed
 		case n.Killed || n.Paused:
 			n.Turn = false
 		case missed:
@@ -2463,8 +2731,11 @@ func (d *daemon) refresh(byID map[string]agent, listed time.Time) (masterMoved b
 			n.Socket = ""
 		}
 		// A worker the user stopped handed its children over then.
-		if status == "exited" && n.Node != masterNode && !n.Killed {
+		if status == "exited" && isWorker(n.Node) && !n.Killed {
 			d.orphanLocked(n)
+		}
+		if status == "exited" && n.Node == deskNode {
+			d.strandLocked(n, "is gone, so bosun tell goes to the master until a restart of the daemon starts a new desk")
 		}
 		changed = true
 	}

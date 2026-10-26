@@ -56,6 +56,10 @@ func (t *tui) items() []tuiItem {
 	}
 	children := map[string][]int{}
 	for i, s := range t.sessions {
+		if s.Node == deskNode {
+			children[""] = append([]int{i}, children[""]...)
+			continue
+		}
 		children[s.Parent] = append(children[s.Parent], i)
 	}
 	var walk func(parent string, depth int)

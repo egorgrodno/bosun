@@ -1,13 +1,14 @@
 # CLAUDE.md
 
-bosun orchestrates Claude Code background sessions: one master and a tree of workers. [README.md](README.md) holds the scope. This file holds the design. Its Claude Code behaviour and timings were measured against 2.1.310.
+bosun orchestrates Claude Code background sessions: one master, a front desk and a tree of workers. [README.md](README.md) holds the scope. This file holds the design. Its Claude Code behaviour and timings were measured against 2.1.310.
 
 ## Shape
 
 ```text
 Quickshell panel ─┐                              ┌─ claude --bg          master
-                  ├─ unix socket ─ bosun daemon ─┼─ claude --bg -w a     worker
-bosun tui ────────┘                              │    └─ claude --bg -w b
+                  ├─ unix socket ─ bosun daemon ─┼─ claude --bg          desk
+bosun tui ────────┘                              ├─ claude --bg -w a     worker
+                                                 │    └─ claude --bg -w b
                                                  └─ claude --bg -w c
               hook and MCP calls from every session ──▶ bosun daemon
 ```
@@ -16,7 +17,7 @@ One binary carries every part:
 
 | Command | Runs as |
 |---|---|
-| `bosun daemon` | a systemd user service in the NixOS configuration's `modules/claude/`, which starts the master |
+| `bosun daemon` | a systemd user service in the NixOS configuration's `modules/claude/`, which starts the master and the desk |
 | `bosun mcp` | the stdio MCP server each session starts, relaying to the daemon |
 | `bosun hook` | every hook each session runs |
 | `bosun tui` | the terminal frontend |
@@ -30,7 +31,7 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Resuming.** A stopped `--bg` session keeps its options, model included. `claude --bg --resume <session-id>` without flags continues it under the same id. A prompt after `--` starts its next turn. With any flag, the command starts a copy of the conversation under a new id. So does a resume of a session still running. A session still runs for a moment after `claude stop` returns, until its process exits, though `claude agents` already lists it as stopped.
 
-**Clearing.** A resume whose prompt after `--` is `/clear` clears a stopped session in place and runs no turn. The session keeps its short `id` and saved options, and its conversation starts over under a new session id, which the `SessionStart` with `source` `clear` carries. While the session runs, the listing's `sessionId` is the new id. Once it stops, the listing shows the original id. Only the original session id resumes the session: a resume of the new id without flags starts a separate session that lacks the saved options. A copy, which a resume with flags makes, gets the conversation of the id it names, so a copy of the conversation since the clear must name the new id.
+**Clearing.** A resume whose prompt after `--` is `/clear` clears a stopped session in place and runs no turn. The session keeps its short `id` and saved options, and its conversation starts over under a new session id, which the `SessionStart` with `source` `clear` carries. The clear writes the new conversation's transcript at once. While the session runs, the listing's `sessionId` is the new id. Once it stops, the listing shows the original id. Only the original session id resumes the session: a resume of the new id without flags starts a separate session that lacks the saved options. A copy, which a resume with flags makes, gets the conversation of the id it names, so a copy of the conversation since the clear must name the new id.
 
 **Retiring.** Claude Code's supervisor stops a background session that has sat idle for an hour. `claude agents --json --all` keeps listing it without a `pid` or `status` until `claude rm`, the same as a session that `claude stop` stopped. Either resumes like an idle session, so stopped does not mean done. The listing cannot tell a kill from a retirement, so the daemon marks each worker that `bosun kill` stops, and `resume` refuses it.
 
@@ -42,17 +43,17 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Supervisor.** A `claude --bg` that finds no supervisor starts Claude Code's supervisor in its own cgroup. The supervisor runs every background session and exits after the last one. Each session takes the supervisor's cgroup and environment, not those of its own `claude --bg`. So when the daemon starts the supervisor, every session runs in the daemon's cgroup. When a terminal started it, every session takes the terminal's environment, and the daemon queues a notice for you. `claude attach` resumes a stopped session itself, so a frontend sends `attach` first, which resumes the session idle, and runs `claude attach` only once that succeeds.
 
-**Models.** The daemon's `-master-model` and `-worker-model` pick the models, and `spawn` can pick one for a worker. `bosun model` switches the master by resuming it with `--model`, and the daemon follows the new id. Workers block on the daemon, not on the master, so they keep running through the switch.
+**Models.** The daemon's `-master-model`, `-desk-model` and `-worker-model` pick the models, and `spawn` can pick one for a worker. `bosun model` switches the master by resuming it with `--model`, and the daemon follows the new id. Workers block on the daemon, not on the master, so they keep running through the switch.
 
 **Identity.** `--bg` ignores `--session-id` and picks its own. bosun knows a session by its node name, set in the environment of its hook commands and its MCP server. Each hook event carries Claude Code's `session_id`, which `claude agents --json` reports as `sessionId`, beside a short `id`.
 
-**Trust.** `claude --bg` refuses a directory the user has not trusted. A first-level worker starts only in a trusted repository, and the master's own directory needs trust too. Every directory inside a trusted repository, worktrees included, shares its trust. A repository nested inside it needs trust of its own.
+**Trust.** `claude --bg` refuses a directory the user has not trusted. A first-level worker starts only in a trusted repository, and the master's own directory needs trust too. Every directory inside a trusted repository, worktrees included, shares its trust. A repository nested inside it needs trust of its own. Outside a repository, trust in a directory covers each directory inside it, so the master's trust covers the desk's.
 
 **Sandbox.** Every session runs its Bash commands in Claude Code's sandbox, so a command writes only inside the session's directory, its repository's `.git`, its own temporary folder, `~/.cache/go-build`, `~/.cache/nix` and `~/.cache/treefmt`. `sudo` fails inside it. The sandbox allows every unix socket, since nix needs its daemon's. bosun hides by path the sockets that reach outside the sandbox, its own included. A socket missing from that list stays open. Claude Code's system prompt sends scratch files to `$CLAUDE_JOB_DIR/tmp`, which is read-only inside the sandbox. bosun's prompt sends them to the session's temporary folder instead. The sandbox refuses an unlisted host. The model then retries with the host in the Bash call's `allowed_domains`, and auto mode decides that retry.
 
 **The tree.** Every session has `spawn`, so a worker can add a level. The daemon's `-max-depth` and `-max-children` cap depth and fan-out.
 
-**Worktrees.** `spawn` runs a child from its parent's worktree, so the child's branch `worktree-<node>` begins at the parent's `HEAD`. Every worktree sits directly in the repository's `.claude/worktrees/`, whatever its depth, so a node name must be unique within its repository. The master works in no repository.
+**Worktrees.** `spawn` runs a child from its parent's worktree, so the child's branch `worktree-<node>` begins at the parent's `HEAD`. Every worktree sits directly in the repository's `.claude/worktrees/`, whatever its depth, so a node name must be unique within its repository. The master and the desk work in no repository.
 
 **Cleanup.** A child's parent, or the master, lands the child with `merge`. The daemon fast-forwards the branch the child began from, and then removes the child, its worktree and its branch with `claude rm`. For the master's children that branch is checked out in a repository the master's sandbox cannot write. A session deleting a branch would also trip the reserved check. `claude rm` refuses a worktree whose branch has unpushed commits, and a branch merged locally still has them, so the daemon passes `--discard-unpushed` with the `<commit>@<worktree-id>` that the refusing `claude rm` printed. That flag also discards uncommitted changes, so `merge` refuses a child whose worktree has any. `claude rm` also refuses the empty `.gitmodules` the daemon writes on `SessionStart`, so the daemon deletes it first. `claude stop` and `claude rm` take the short `id`, not the `-n` name.
 
@@ -66,7 +67,7 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **The permission hook is `PermissionRequest`.** It receives `session_id`, `tool_name` and `tool_input`. It answers with `hookSpecificOutput.decision.behavior` set to `allow` or `deny`, and a deny's `message` reaches the model verbatim. Auto mode approves a call without running the hook, unless an `ask` rule matches the call.
 
-**Permissions reach the master once auto mode passes them up.** The daemon hands the permission to the master as an event. The master allows it, denies it, or escalates it to you. The master's own permissions go straight to you.
+**Permissions reach the master once auto mode passes them up.** The daemon hands the permission to the master as an event. The master allows it, denies it, or escalates it to you. The master's and the desk's own permissions go straight to you.
 
 **Auto mode refuses some calls and asks about others.** A call that auto mode's classifier refuses runs `PermissionDenied`, not `PermissionRequest`, and the session gets the classifier's reason. After a run of refusals, auto mode asks about a call instead of refusing it, so `PermissionRequest` runs and `PermissionDenied` does not. In the probe, that run was a hook's denial followed by two refusals. Such a request carries nothing of the refusals, so the daemon keeps the reason of each session's last refusal until one of its calls runs, and sends it with the permission as `refused`.
 
@@ -101,10 +102,14 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 
 | MCP tool | Held by | Does |
 |---|---|---|
-| `spawn` | every session | starts a child session |
-| `merge` | every session | lands a finished worker's branch and removes the worker |
+| `spawn` | the master and workers | starts a child session |
+| `merge` | the master and workers | lands a finished worker's branch and removes the worker |
 | `ask` | workers | sends a question to the master and blocks until the answer |
-| `next_event` | master | blocks until a worker asks or needs a permission, a child of the master ends a turn or exits, or a frontend sends `tell` |
+| `tell_master` | desk | queues the user's instruction for the master |
+| `status` | desk | shows what `bosun status` shows, with each decision and message in full |
+| `transcript` | desk | shows a session's last turns: each prompt, its text and a line per tool call |
+| `tell_desk` | master | answers the desk, or the user when there is no desk |
+| `next_event` | master | blocks until a worker asks or needs a permission, a child of the master ends a turn or exits, or a `tell` comes from the desk, or from a frontend when there is no desk |
 | `reply` | master | answers a question |
 | `decide` | master | allows or denies a permission |
 | `resume` | master | gives a worker that ended its turn, or stopped in it, a new prompt |
@@ -121,7 +126,7 @@ Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved acti
 
 **Blocking tools send progress.** Claude Code aborts a stdio tool call that sends nothing for 30 seconds. While `next_event` or `ask` blocks, it sends `notifications/progress` on the call's `progressToken` every 10 seconds. Claude Code also moves a call still running after 120 seconds to the background, unless the settings' `env` sets `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` to `0`.
 
-**Typing to the master.** Text typed into a sleeping master starts its turn. Text typed while a tool call runs waits until the call returns, so `next_event` must return empty within five minutes. A frontend's `tell` reaches the master as an event straight away.
+**Typing to the master.** Text typed into a sleeping master starts its turn. Text typed while a tool call runs waits until the call returns, so `next_event` must return empty within five minutes.
 
 ## Messages
 
@@ -143,13 +148,27 @@ The check covers only what a session sends: a message from outside bosun reaches
 
 **A stopped worker resumes for a message.** A stopped session has no inbox, so a `SendMessage` to it reports `No agent named '<name>' is reachable`. The sender's `PreToolUse` therefore resumes a stopped worker idle first, unless `bosun kill` stopped it. That is in time, since `SendMessage` looks up its recipient only after `PreToolUse` returns, and `claude --bg --resume` returns once the inbox exists. Only a node name resumes a stopped worker: the `uds:` address a message came from names the old process.
 
-**The master takes no messages.** Its settings set `crossSessionInbound` to `refuse`, and a worker's `PreToolUse` denies a `SendMessage` to it, pointing the worker to `ask`.
+**The master and the desk take no messages.** Their settings set `crossSessionInbound` to `refuse`. The master acts on what the desk relays as the user's word, so a session that could message the desk could pose as the user. Every session's `PreToolUse` denies a `SendMessage` to either. A worker's denial points it to `ask`, and the master's, for the desk, to `tell_desk`. The desk's own `PreToolUse` denies its `SendMessage` to any bosun session, since a message starts a turn.
+
+## The front desk
+
+**The desk is the session the user talks to.** The daemon starts it beside the master as node `desk`. It reads the fleet, files issues and reads repositories, and only the master changes the fleet. It passes the user's instructions to the master with `tell_master`, and the master answers with `tell_desk`. It does not answer decisions.
+
+**It shares the master's memory, not its transcripts.** It runs in `desk` inside the master's directory, so Claude Code files its transcripts apart from the master's. Its settings point `autoMemoryDirectory` at the master's memory directory.
+
+**The daemon carries tells both ways.** A frontend's `tell` and the master's `tell_desk` queue text for the desk. The desk gets its queue the way a worker parent gets its children's reports. In a turn, the daemon blocks its `Stop` with the queue as the reason. Between turns, the daemon resumes it with the queue as the prompt, and a stopped desk resumes like an idle one. The desk's `tell_master` reaches the master as a `tell` event with `from` set to `desk`.
+
+**Without a desk, tells go to the master.** When the desk could not start, its session is gone or a usage limit stopped it, a `tell` goes to the master and a `tell_desk` reaches you as a notice. The master may run on a model the limit spares. A desk that the daemon fails to resume, or that a limit stops, hands on its queue the same way.
+
+**A stale desk wakes cleared.** The daemon clears the desk as it clears the master: before it resumes the desk with its queue, and before a frontend's `attach` readies it. The desk is stale once its transcript has gone an hour unwritten, whatever the workers do. A clear would hide a reply you have not read, so a desk handed a tell since you last opened it through `attach` stays uncleared. A `claude attach` that skips `bosun attach` finds it uncleared.
 
 ## Restarts
 
 A worker's parent must hear of every turn of it that ends or stops, unless a pause stopped it.
 
 **The daemon's state survives a power loss.** `state.json` holds the sessions, the master's queue and the open decisions, and each save syncs it to disk.
+
+**The desk outlasts a restart.** On start the daemon adopts the desk while Claude Code lists it, and otherwise starts a new one that gets the old one's queue. A desk that cannot start leaves a notice.
 
 **Blocked calls outlast a restart.** While the daemon is away, a hook, `ask` and `next_event` send their request again under the same `key`. A hook does so within its own timeout, and `ask` and `next_event` for 30 seconds after they last reached the daemon. The restarted daemon hands each the decision or batch it waited on, and an escalated decision stays with you. A decision whose request has not come back 30 seconds after the start is settled. If its session still waits in its own prompt, a permission then becomes a notice, as it does a minute before the `timeout`. A call that gives up falls back: a `PreToolUse` denies its call, a `PermissionRequest` leaves it to the session's own prompt, and `ask` and `next_event` fail.
 
@@ -159,11 +178,17 @@ A worker's parent must hear of every turn of it that ends or stops, unless a pau
 
 ## Frontends
 
-Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`. Every rule lives in the daemon.
+Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `transcript`. Every rule lives in the daemon.
 
 The snapshot's `paused`, and the `paused` and `unpaused` events, show a pause. A session's `paused` marks a turn that `unpause` resumes.
 
-Each leads with the queue of decisions waiting on you, above the tree.
+In the snapshot and the `sessions` event, the desk is the session whose `node` is `desk`. Like the master, it has no `parent`.
+
+- `tell` goes to the desk, or to the master when there is no desk, and its result does not say which. During a pause it waits for `unpause`.
+- `transcript` takes a node `name` and an optional `turns`, 3 by default, and returns that session's last turns in `text`.
+- `attach` clears a stale desk first, which can take most of a minute. A frontend must wait that long for the answer before it runs `claude attach`.
+
+Each leads with the queue of decisions waiting on you, above the tree. The desk is its own row above the master's tree.
 
 - **Quickshell panel.** It lives in the NixOS configuration's `modules/quickshell/`, as the `Agents` bar module and `BosunPanel`, and reads the protocol through `bosun watch`. Opening a session runs `bosun attach <id>` in a new kitty window. `quickshell ipc call bosun toggle` opens it.
 - **`bosun tui`.** Opening a session runs `claude attach` in the TUI's terminal. `Ctrl+Z` exits `claude attach` with status 0, leaving the session running.
@@ -172,4 +197,5 @@ Each leads with the queue of decisions waiting on you, above the tree.
 
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
 - **Restarts and pauses.** Only a fake `claude` has run the restart handling and the pause. No real reboot, crash or pause has been measured. The daemon reads transcripts in the 2.1.310 format. Whether `claude stop` runs the `Stop` hook is unmeasured, so the daemon ignores a `Stop` from a session that a pause stopped.
+- **The desk.** No real desk has run. A probe session inside the master's directory measured the desk's trust, `autoMemoryDirectory` from `--settings` and the clear's transcript, and nothing more. Handing an idle desk its queue stops and resumes it, as waking the master does. Whether a `claude attach` open on it survives that is unmeasured.
 - **The allowlist.** No real session has run it. Two things are unmeasured: whether an `ask` rule sends a call outside the sandbox to `PermissionRequest` in auto mode, and whether `Bash(nixos-rebuild:*)` matches a flake with a `#host` attribute. The gate finds a push's repository from the hook's `cwd`. In the 2.1.310 binary that is the session's working directory, which a `cd` in an earlier Bash call moves, but no real session has shown it.

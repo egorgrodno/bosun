@@ -33,7 +33,8 @@ func runAttach(args []string) error {
 // attachSession hands the terminal to claude attach on session id until it exits, as Ctrl+Z makes it do, once the daemon has readied the session.
 // It stops at a daemon error: claude attach would resume a stopped session itself, starting Claude Code's supervisor in this terminal.
 func attachSession(id string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	// Readying a stale desk clears it, which can take as long as the stop, the resume and its new conversation's SessionStart together.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	if _, err := call(ctx, Request{Op: "attach", ID: id}); err != nil {
 		if op := (*net.OpError)(nil); errors.As(err, &op) {
@@ -140,6 +141,10 @@ func printStatus(w io.Writer, s Response) {
 	}
 	children := map[string][]Session{}
 	for _, n := range s.Sessions {
+		if n.Node == deskNode {
+			children[""] = append([]Session{n}, children[""]...)
+			continue
+		}
 		children[n.Parent] = append(children[n.Parent], n)
 	}
 	fmt.Fprintln(w, "Sessions:")

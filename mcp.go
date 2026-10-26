@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -33,6 +34,24 @@ const (
 	peersHelp = " Workers message each other by node name. When several share one feature, name in each worker's prompt the other workers' nodes and what each one builds, and start them all before any needs another."
 	modelHelp = "The session's model, such as fable, opus, sonnet or haiku. Leave it out unless the user named one for this task: the user sets the default."
 
+	statusHelp = `Show the fleet as bosun status shows it: the decisions waiting on the user and on the master, the tree of sessions with their ids, states and models, and the latest messages between sessions. Each decision and each message then follows in full.
+
+Read it before you answer a question about the run. desk is you, and master is the session that runs the workers.
+
+You do not answer decisions. When the user asks you to approve, deny or answer one, show it in full, with its id and the whole tool call or question, and point the user at the bosun panel, bosun tui, or bosun approve ID, bosun deny ID MESSAGE and bosun reply ID ANSWER. A decision waiting on the master is the master's to settle: tell the master what the user wants done with it, with tell_master.`
+
+	transcriptHelp = `Show the last turns of a session's conversation: the prompt that began each turn, the session's text, and a line for each tool call, oldest first. Use it to answer what a session is doing or did, after status names the sessions. A turn's tool results do not show.`
+
+	tellMasterHelp = `Pass an instruction of the user's on to the master, the session that runs the fleet: it spawns, resumes, merges and stops workers, and settles their decisions. Call it for everything the user asks that would change the fleet or a repository, and never do any of that yourself, by SendMessage to a session or otherwise.
+
+Write it as a spec the master can act on without asking back: what to do, in which repository, what done looks like, and what the user said that settles open choices. The master takes it as the user's own instruction, so pass on only what the user asked for, and ask the user first when you are unsure they want it done.
+
+The master answers once it knows the outcome, which may take a while, since it handles one thing at a time. bosun hands you the answer at the end of your turn, or in a new turn when you have ended yours, as a prompt that begins "bosun: the master answers:". Pass it on to the user. When the user asks for news of an instruction before then, read status and the transcripts of the sessions it concerns.
+
+bosun also hands you what the user sends through bosun tell, such as from the bosun panel, as a prompt that begins "bosun: the user sent this through bosun tell". Treat it as the user's own word, and remember that they may not be watching this session, so your answer waits here for them.
+
+Once you have sat an hour idle, bosun clears your conversation before your next turn. Whenever you learn something that must outlast a clear, such as how the user wants things done, write it to your memory directory then.`
+
 	nextEventHelp = `Wait up to four minutes for events from the workers and the user. Returns them as JSON, or says there were none.
 
 Work in a loop: call next_event, handle every event it returns, and call it again. When it returns no events, end your turn: the next event starts a new one.
@@ -40,7 +59,7 @@ Work in a loop: call next_event, handle every event it returns, and call it agai
 Once you have merged every worker and an hour has passed since your last turn, bosun clears your conversation before the next event wakes you, so you wake with no earlier conversation. Whenever you learn something that must outlast a clear, such as how the user wants decisions handled, write it to your memory directory then.
 
 The events:
-- tell: a message from the user. Act on it, usually by starting workers with spawn.
+- tell: an instruction from the user. Act on it, usually by starting workers with spawn. With from set to desk, the front desk relays it: the desk is the session the user talks to, which reads the fleet but changes nothing in it, so it passes the user's instructions to you. Act on such a tell as on the user's own. Once you know what became of a tell, whatever its from, answer it with tell_desk, which is how the user hears of it.
 - decision of kind question: a worker asks something. Settle it with reply or escalate.
 - decision of kind permission: a worker wants to run a tool. Settle it with decide or escalate.
 - turn_end: a worker finished a turn, and its last message says what it did, or that the turn failed on an API error. To give it more to do, such as a fix after review or another try, call resume. Once its work is right, call merge.
@@ -60,8 +79,20 @@ These go straight to the user, never to you, and no answer of yours allows one: 
 - any other push, from a repository whose git config, hooks and remotes are as bosun recorded them while no worker was in it. Auto mode decides such a push, so it reaches you only when auto mode asks.`
 )
 
-func tools(master bool) []tool {
-	if !master {
+func tools(node string) []tool {
+	if node == deskNode {
+		return []tool{
+			{"tell_master", tellMasterHelp, object([]string{"text"}, map[string]any{
+				"text": str("The instruction, as a spec the master can act on alone."),
+			})},
+			{"status", statusHelp, object([]string{}, map[string]any{})},
+			{"transcript", transcriptHelp, object([]string{"name"}, map[string]any{
+				"name":  str("The session's node name, as status shows it."),
+				"turns": map[string]any{"type": "integer", "description": "How many of its last turns to show. 3 when left out."},
+			})},
+		}
+	}
+	if node != masterNode {
 		return []tool{
 			{"spawn", "Start a child session in its own git worktree, branched from your HEAD, with prompt as its task. Each time it ends its turn or stops in the middle of one, bosun tells you: when you next end your turn, or in a new turn once you have ended yours. So to wait for your children, end your turn." + peersHelp, object([]string{"name", "prompt"}, map[string]any{
 				"name":   str(nameHelp),
@@ -106,6 +137,9 @@ func tools(master bool) []tool {
 		})},
 		{"notify", "Tell the user about a problem that is not a decision. Call it whenever something fails that you cannot fix, such as a spawn that Claude Code refuses: the user hears of it no other way. It waits in bosun until the user dismisses it, and nobody waits on it.", object([]string{"message"}, map[string]any{
 			"message": str("What happened, and what the user can do about it."),
+		})},
+		{"tell_desk", "Answer a tell: tell the front desk, the session the user talks to, what became of an instruction, such as which worker took it, what merged, or what failed and waits on the user. The desk passes it on to the user, and when there is no desk, the user gets it as a notice. Keep it short, and say which instruction it answers. The desk takes no messages, so answer it only with this.", object([]string{"text"}, map[string]any{
+			"text": str("The answer."),
 		})},
 	}
 }
@@ -182,7 +216,7 @@ func (s *mcpServer) serve(r io.Reader) error {
 		case "ping":
 			s.send(rpcOut{ID: msg.ID, Result: map[string]any{}})
 		case "tools/list":
-			s.send(rpcOut{ID: msg.ID, Result: map[string]any{"tools": tools(s.node == masterNode)}})
+			s.send(rpcOut{ID: msg.ID, Result: map[string]any{"tools": tools(s.node)}})
 		case "tools/call":
 			ctx, cancel := context.WithCancel(context.Background())
 			s.mu.Lock()
@@ -271,6 +305,8 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		Allow    bool   `json:"allow"`
 		Message  string `json:"message"`
 		Note     string `json:"note"`
+		Text     string `json:"text"`
+		Turns    int    `json:"turns"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &args); err != nil {
@@ -278,7 +314,7 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		}
 	}
 	known := false
-	for _, t := range tools(s.node == masterNode) {
+	for _, t := range tools(s.node) {
 		known = known || t.Name == name
 	}
 	if !known {
@@ -305,6 +341,11 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		req.Text = args.Note
 	case "notify":
 		req.Text = args.Message
+	case "tell_master", "tell_desk":
+		// The daemon passes a tell on by who sends it.
+		req.Op, req.Text = "tell", args.Text
+	case "transcript":
+		req.Name, req.Turns = args.Name, args.Turns
 	}
 	send := call
 	if name == "ask" || name == "next_event" {
@@ -318,8 +359,14 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	switch name {
 	case "spawn":
 		return fmt.Sprintf("Started %s, session %s, in %s.", resp.Session.Node, resp.Session.ID, resp.Session.Dir), nil
-	case "ask", "merge":
+	case "ask", "merge", "transcript":
 		return resp.Text, nil
+	case "status":
+		return fleetStatus(resp), nil
+	case "tell_master":
+		return "The master has it. Its answer comes to you through bosun.", nil
+	case "tell_desk":
+		return "The user will hear of it through the desk.", nil
 	case "next_event":
 		if len(resp.Events) == 0 {
 			return "No events. End your turn: the next event starts a new one.", nil
@@ -332,4 +379,23 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		return "The user will see it.", nil
 	}
 	return "Done.", nil
+}
+
+// fleetStatus is what the desk's status tool shows: bosun status, then each decision and message in full.
+func fleetStatus(s Response) string {
+	var b strings.Builder
+	messages := s.Messages
+	s.Messages = nil
+	printStatus(&b, s)
+	if len(s.Decisions) > 0 {
+		data, _ := json.MarshalIndent(s.Decisions, "", "  ")
+		fmt.Fprintf(&b, "\nThe decisions in full:\n%s\n", data)
+	}
+	if len(messages) > 0 {
+		b.WriteString("\nThe latest messages between sessions, oldest first:\n")
+	}
+	for _, m := range messages {
+		fmt.Fprintf(&b, "\n%s → %s:\n%s\n", m.From, m.Node, m.Text)
+	}
+	return b.String()
 }

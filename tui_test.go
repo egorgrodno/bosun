@@ -13,6 +13,7 @@ func testTUI() *tui {
 			{Node: "a", Parent: masterNode, ID: "aaaaaaaa", Status: "idle", Depth: 1},
 			{Node: masterNode, ID: "mmmmmmmm", Status: "busy"},
 			{Node: "b", Parent: "a", ID: "bbbbbbbb", Status: "stopped", Depth: 2},
+			{Node: deskNode, ID: "dddddddd", Status: "idle"},
 		},
 		decisions: []Decision{
 			{ID: "2", Kind: "question", Node: "a", Holder: "master", Question: "X or Y?"},
@@ -31,8 +32,8 @@ func TestTUIItems(t *testing.T) {
 			got = append(got, it.session.Node)
 		}
 	}
-	if want := []string{"3", "4", "2", masterNode, "a", "b"}; !slices.Equal(got, want) {
-		t.Fatalf("items %v, want the user's decisions, the master's, then the tree: %v", got, want)
+	if want := []string{"3", "4", "2", deskNode, masterNode, "a", "b"}; !slices.Equal(got, want) {
+		t.Fatalf("items %v, want the user's decisions, the master's, then the desk and the tree: %v", got, want)
 	}
 }
 
@@ -55,6 +56,10 @@ func TestTUIKeys(t *testing.T) {
 	}
 	if a, ok := tu.key("\r"); !ok || a != (tuiAction{op: "reply", id: "2", text: "Yes"}) {
 		t.Fatalf("an answer: %+v %v", a, ok)
+	}
+	tu.key("j")
+	if a, ok := tu.key("\r"); !ok || a != (tuiAction{op: "attach", id: "dddddddd"}) {
+		t.Fatalf("enter on the desk: %+v %v", a, ok)
 	}
 	tu.key("j")
 	if a, ok := tu.key("\r"); !ok || a != (tuiAction{op: "attach", id: "mmmmmmmm"}) {

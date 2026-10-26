@@ -1,6 +1,6 @@
 # bosun
 
-A master Claude Code session that runs a tree of worker sessions. It answers their routine questions and brings you the rest. A Quickshell panel drives it on the NixOS desktops, and a TUI drives it everywhere else.
+A master Claude Code session that runs a tree of worker sessions. It answers their routine questions and brings you the rest. A front desk session talks to you: it answers questions about the fleet at once and passes your instructions to the master. A Quickshell panel drives bosun on the NixOS desktops, and a TUI drives it everywhere else.
 
 [CLAUDE.md](CLAUDE.md) holds the design. The daemon and its frontends work: the command line, `bosun tui` and the Quickshell panel.
 
@@ -12,7 +12,7 @@ A master Claude Code session that runs a tree of worker sessions. It answers the
 
 ## Usage
 
-By default the daemon runs the master in `~/.local/state/bosun/master`. Claude Code must trust that directory, and every repository a worker starts in. Run `claude` in each once and accept the prompt. Sessions run their commands in Claude Code's sandbox, which on Linux needs `bwrap` and `socat` on the `PATH`.
+By default the daemon runs the master in `~/.local/state/bosun/master`, and the front desk in its `desk` folder. Claude Code must trust the master's directory, which covers the desk's, and every repository a worker starts in. Run `claude` in each once and accept the prompt. Sessions run their commands in Claude Code's sandbox, which on Linux needs `bwrap` and `socat` on the `PATH`.
 
 ```sh
 bosun daemon &
@@ -25,7 +25,7 @@ bosun attach <id>
 
 `bosun` alone lists every command. `bosun pause` stops every session, such as before a reboot, and `bosun unpause` resumes the turns it cut.
 
-The master refuses messages from your other Claude Code sessions, though the sender's `SendMessage` reports success. Reach it with `bosun tell`, or type into it through `bosun attach`.
+Talk to the desk: type into it through `bosun attach`, or send it a line with `bosun tell`. The master and the desk refuse messages from your other Claude Code sessions, though the sender's `SendMessage` reports success.
 
 The flake's default package builds `bosun`, so `nix run github:egorgrodno/bosun -- daemon` runs the daemon. As a systemd user service, the daemon needs `KillMode=process`, so that stopping the daemon leaves the sessions running.
 

@@ -7,9 +7,9 @@ import (
 )
 
 const usage = `usage:
-  bosun daemon [-master-dir DIR] [-master-model M] [-worker-model M]
-               [-max-depth N] [-max-children N]
-                                   run the daemon, which starts the master
+  bosun daemon [-master-dir DIR] [-master-model M] [-desk-model M]
+               [-worker-model M] [-max-depth N] [-max-children N]
+                                   run the daemon, which starts the master and the front desk
   bosun mcp                        the MCP server each session starts
   bosun hook                       every hook each session runs
 
@@ -20,7 +20,7 @@ const usage = `usage:
   bosun deny ID [MESSAGE]          deny a permission
   bosun reply ID ANSWER            answer a question
   bosun dismiss ID                 clear a notice from the master
-  bosun tell TEXT                  send the master a message
+  bosun tell TEXT                  send the front desk a message, or the master when there is no desk
   bosun spawn [-model M] NAME REPO PROMPT
                                    start a worker under the master
   bosun kill NAME                  stop a session

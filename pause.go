@@ -163,7 +163,7 @@ func (d *daemon) unpause() (string, error) {
 		default:
 			n.Paused = false
 			failed = append(failed, fmt.Sprintf("%s: %v", name, err))
-			if !n.Killed {
+			if !n.Killed && isWorker(name) {
 				d.heardLocked(n)
 				d.reportLocked(Event{Kind: "exit", Node: name, Text: fmt.Sprintf("The user paused bosun during its turn, and resuming it failed: %v", err)})
 			}

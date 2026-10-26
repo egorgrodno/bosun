@@ -17,15 +17,17 @@ import (
 // Request is a line a client sends the daemon. Node names the calling session, and is empty for a frontend.
 // A hook's Socket is the messaging socket of the session's process, which other sessions address it by.
 type Request struct {
-	Op     string          `json:"op"`
-	Node   string          `json:"node,omitempty"`
-	Socket string          `json:"socket,omitempty"`
-	ID     string          `json:"id,omitempty"`
-	Name   string          `json:"name,omitempty"`
-	Repo   string          `json:"repo,omitempty"`
-	Model  string          `json:"model,omitempty"`
-	Text   string          `json:"text,omitempty"`
-	Hook   json.RawMessage `json:"hook,omitempty"`
+	Op     string `json:"op"`
+	Node   string `json:"node,omitempty"`
+	Socket string `json:"socket,omitempty"`
+	ID     string `json:"id,omitempty"`
+	Name   string `json:"name,omitempty"`
+	Repo   string `json:"repo,omitempty"`
+	Model  string `json:"model,omitempty"`
+	Text   string `json:"text,omitempty"`
+	// Turns is how many of a session's last turns a transcript shows.
+	Turns int             `json:"turns,omitempty"`
+	Hook  json.RawMessage `json:"hook,omitempty"`
 	// Key names a request that its client sends again, unchanged, once the daemon is back from a restart.
 	Key string `json:"key,omitempty"`
 }
@@ -45,8 +47,8 @@ type Response struct {
 	Paused    bool       `json:"paused,omitempty"`
 }
 
-// Event is what the master or a frontend is told. The master gets decision, turn_end, exit, tell and message; a frontend gets decision, settled, sessions, message, paused and unpaused.
-// A message is what session From told session Node through Claude Code's SendMessage.
+// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, tell and message; the desk gets tell; a frontend gets decision, settled, sessions, message, paused and unpaused.
+// A message is what session From told session Node through Claude Code's SendMessage. A tell is From's text: the user's when From is empty, or the desk's or the master's.
 // Again marks an event the master took once already, in a turn that was cut short.
 type Event struct {
 	Kind     string    `json:"kind"`
@@ -112,11 +114,13 @@ type Session struct {
 	Conversation string `json:"conversation,omitempty"`
 	// Socket is the messaging socket of the session's running process, forgotten once the process stops, since another process may take the path.
 	Socket string `json:"socket,omitempty"`
-	// Events holds the turn ends and exits of a worker's children until bosun hands them to it, and Taken those handed over in its current turn.
+	// Events holds what waits for a session that runs no next_event until bosun hands it over: the turn ends and exits of a worker's children, or the desk's tells. Taken holds the reports handed to a worker in its current turn.
 	Events []Event `json:"events,omitempty"`
 	Taken  []Event `json:"taken,omitempty"`
 	// LimitedUntil is when the usage limit that stopped the session resets, and the daemon resumes it.
 	LimitedUntil *time.Time `json:"limitedUntil,omitempty"`
+	// Unseen marks a desk that bosun handed a tell or an answer since the user last opened it, so its reply may wait there unread.
+	Unseen bool `json:"unseen,omitempty"`
 
 	Base       string `json:"base,omitempty"`
 	BaseBranch string `json:"baseBranch,omitempty"`
