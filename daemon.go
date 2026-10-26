@@ -751,7 +751,8 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 				d.strandLocked(n, "stopped at a usage limit")
 			}
 		case node == deskNode:
-			// The user may have told the desk through bosun tell, and so not be watching it.
+			// The user may have told the desk through bosun tell, and so not be watching it. The notice stands in for the tells the turn took.
+			n.Taken = nil
 			d.openLocked(&Decision{Kind: "notice", Node: deskNode, Holder: "user", Note: fmt.Sprintf("The front desk's turn failed on an API error, %s: %s. bosun attach %s shows what it was doing.", in.Error, in.LastMessage, n.ID)})
 		case node != masterNode:
 			d.reportLocked(Event{Kind: "turn_end", Node: node, Text: fmt.Sprintf("Its turn failed on an API error, %s: %s", in.Error, in.LastMessage)})
@@ -769,10 +770,10 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 			// The pause stopped the session in its turn, which unpausing resumes.
 		case node == deskNode && len(n.Events) > 0:
 			resp.Behavior, resp.Text = "block", deskReport(n.Events)
-			n.Events, n.Unseen = nil, true
+			n.Taken, n.Events, n.Unseen = append(n.Taken, n.Events...), nil, true
 			d.saveLocked()
 		case node == deskNode:
-			n.Turn = false
+			n.Turn, n.Taken = false, nil
 			d.saveLocked()
 		case node != masterNode && len(n.Events) > 0:
 			// A worker runs no next_event, so news of its children waits for the end of its turn, which goes on with it.
@@ -1190,23 +1191,29 @@ func (d *daemon) tell(caller, text string) error {
 func deskReport(evs []Event) string {
 	var parts []string
 	for _, ev := range evs {
+		part := "bosun: the user sent this through bosun tell, so they may not be watching this session:\n"
 		if ev.From == masterNode {
-			parts = append(parts, "bosun: the master answers:\n"+ev.Text)
-		} else {
-			parts = append(parts, "bosun: the user sent this through bosun tell, so they may not be watching this session:\n"+ev.Text)
+			part = "bosun: the master answers:\n"
 		}
+		if ev.Again {
+			part = "bosun: a turn of yours that took this was cut short, so you may have acted on it already.\n" + part
+		}
+		parts = append(parts, part+ev.Text)
 	}
 	return strings.Join(parts, "\n\n")
 }
 
 // strandLocked hands on what waits for the desk, which cannot take it: the user's tells go to the master, and the master's answers to the user.
+// The tells that a turn it was in took go with them.
 func (d *daemon) strandLocked(desk *Session, why string) {
-	if len(desk.Events) == 0 {
+	evs := slices.Concat(desk.Taken, desk.Events)
+	desk.Taken = nil
+	if len(evs) == 0 {
 		return
 	}
 	note := fmt.Sprintf("The front desk %s.", why)
 	told := false
-	for _, ev := range desk.Events {
+	for _, ev := range evs {
 		if ev.From == masterNode {
 			note += "\n\nThe master answered: " + ev.Text
 		} else {
@@ -1219,6 +1226,23 @@ func (d *daemon) strandLocked(desk *Session, why string) {
 	}
 	desk.Events = nil
 	d.openLocked(&Decision{Kind: "notice", Node: deskNode, Holder: "user", Note: note})
+}
+
+// giveBackLocked puts the tells that the desk's cut turn took back in front of its queue, marked again, for the next poll to hand over.
+// Tells cut short once already go on as strandLocked hands them, so that a desk whose every turn fails cannot take them again and again.
+func (d *daemon) giveBackLocked(desk *Session) {
+	switch {
+	case len(desk.Taken) == 0:
+		return
+	case slices.ContainsFunc(desk.Taken, func(ev Event) bool { return ev.Again }):
+		d.strandLocked(desk, "was cut short twice in a turn that took your tells")
+		return
+	}
+	for i := range desk.Taken {
+		desk.Taken[i].Again = true
+	}
+	log.Printf("the desk's turn was cut short, so %d tells it took wait again", len(desk.Taken))
+	desk.Events, desk.Taken = append(desk.Taken, desk.Events...), nil
 }
 
 // messageLocked shows the frontends a message between sessions, and queues it for the master without waking it.
@@ -1321,10 +1345,9 @@ func (d *daemon) deliver(name string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	switch {
-	case err == nil && name == deskNode:
-		n.Unseen = true
 	case err == nil:
 		n.Taken = append(n.Taken, evs...)
+		n.Unseen = n.Unseen || name == deskNode
 	case errors.Is(err, errInTurn) || errors.Is(err, errStarting) || errors.Is(err, errPaused):
 		n.Events = append(evs, n.Events...)
 	case name == deskNode:
@@ -1879,6 +1902,10 @@ func (d *daemon) kill(name string) error {
 		if n.Killed {
 			d.heardLocked(n)
 			n.Paused = false
+		}
+		// Given back, the tells its turn took would resume the desk the user stopped.
+		if name == deskNode {
+			n.Taken = nil
 		}
 	}
 	d.stirred = true
@@ -2461,7 +2488,7 @@ func (d *daemon) ensureMaster() error {
 	return nil
 }
 
-// ensureDesk adopts the desk of an earlier run while Claude Code still lists it, and starts one otherwise, with the tells that waited for the old one.
+// ensureDesk adopts the desk of an earlier run while Claude Code still lists it, and starts one otherwise, with the tells that waited for the old one or that its last turn took.
 // An adopted desk between turns gets what waits for it.
 func (d *daemon) ensureDesk() error {
 	agents, err := d.claude.Agents()
@@ -2485,7 +2512,8 @@ func (d *daemon) ensureDesk() error {
 	}
 	n := &Session{Node: deskNode, Dir: d.deskDir(), Model: d.deskModel, Status: "starting"}
 	if old != nil {
-		n.Events = old.Events
+		n.Taken, n.Events = old.Taken, old.Events
+		d.giveBackLocked(n)
 	}
 	d.nodes[deskNode] = n
 	d.started[deskNode] = time.Now()
@@ -2717,7 +2745,14 @@ func (d *daemon) refresh(byID map[string]agent, listed time.Time) (masterMoved b
 				d.sleepLocked()
 			}
 		case n.Node == deskNode:
-			// Nobody hears of the desk's turns.
+			// Nobody hears of the desk's turns, but a turn cut short gives back the tells it took.
+			switch {
+			case n.Paused:
+			case missed && status != "idle", (status == "stopped" || status == "exited") && !betweenTurns(n.Status):
+				d.giveBackLocked(n)
+			case missed:
+				n.Taken = nil
+			}
 			n.Turn = n.Turn && !missed
 		case n.Killed || n.Paused:
 			n.Turn = false

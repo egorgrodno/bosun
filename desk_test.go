@@ -280,6 +280,48 @@ func TestDeskAndMasterTell(t *testing.T) {
 	}
 }
 
+// A desk turn cut short gives back the tells it took, once: cut short again, they go on to the master.
+func TestDeskCutGivesBackTells(t *testing.T) {
+	d, fc := testDesk(t)
+	mustCall(t, Request{Op: "tell", Text: "fix it"})
+	awaitStarts(t, fc, 3)
+	d.poll()
+	// The turn the tell began takes one more at its Stop, and goes on until the desk's process dies.
+	mustCall(t, Request{Op: "tell", Text: "and the lexer"})
+	stopHook(t, deskNode, "On it.")
+	fc.setStatus("00000002", "")
+	d.poll()
+	d.poll()
+	want := deskReport([]Event{{Kind: "tell", Text: "fix it", Again: true}, {Kind: "tell", Text: "and the lexer", Again: true}})
+	if args := awaitStarts(t, fc, 4); args[len(args)-1] != want {
+		t.Fatalf("claude ran with %q, want the tells again", args)
+	}
+	if evs := masterEvents(d); len(evs) != 0 {
+		t.Fatalf("the master got %+v", evs)
+	}
+
+	d.poll()
+	fc.setStatus("00000002", "")
+	d.poll()
+	if evs := masterEvents(d); len(evs) != 2 || evs[0].Text != "fix it" || evs[1].Text != "and the lexer" {
+		t.Fatalf("events = %+v", evs)
+	}
+	if dec := openDecision(t, 1); dec.Kind != "notice" || !strings.Contains(dec.Note, "cut short twice") {
+		t.Fatalf("decision = %+v", dec)
+	}
+
+	// A desk the user stopped stays stopped.
+	d.poll()
+	mustCall(t, Request{Op: "tell", Text: "x"})
+	awaitStarts(t, fc, 5)
+	d.poll()
+	mustCall(t, Request{Op: "kill", Name: deskNode})
+	d.poll()
+	d.poll()
+	time.Sleep(50 * time.Millisecond)
+	awaitStarts(t, fc, 5)
+}
+
 // Without a desk, a tell goes to the master, and the master's answer to the user.
 func TestTellWithoutDesk(t *testing.T) {
 	d, fc := testDesk(t)
