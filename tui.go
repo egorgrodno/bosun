@@ -27,8 +27,9 @@ type tui struct {
 	paused    bool
 	connected bool
 	sel       int
-	// answering is the question an answer is being typed for, and answer the text so far.
+	// answering is the question an answer is being typed for, or switching the master or the desk a model and effort are being typed for, and answer the text so far.
 	answering string
+	switching string
 	answer    []rune
 	err       string
 }
@@ -42,7 +43,7 @@ type tuiItem struct {
 
 // tuiAction is what a key asks of the daemon or the terminal.
 type tuiAction struct {
-	op, id, text string
+	op, id, name, text string
 }
 
 // items lists the decisions waiting on the user, then those waiting on the master, then the sessions depth first.
@@ -123,15 +124,19 @@ func (t *tui) apply(r Response) {
 
 // key handles one key, and returns what it asks for, if anything.
 func (t *tui) key(k string) (tuiAction, bool) {
-	if t.answering != "" {
+	if t.answering != "" || t.switching != "" {
 		switch k {
 		case "\x1b":
-			t.answering, t.answer = "", nil
+			t.answering, t.switching, t.answer = "", "", nil
 		case "\r":
-			if text := strings.TrimSpace(string(t.answer)); text != "" {
-				id := t.answering
-				t.answering, t.answer = "", nil
-				return tuiAction{op: "reply", id: id, text: text}, true
+			text := strings.TrimSpace(string(t.answer))
+			a := tuiAction{op: "reply", id: t.answering, text: text}
+			if t.switching != "" {
+				a = tuiAction{op: "model", name: t.switching, text: text}
+			}
+			if text != "" {
+				t.answering, t.switching, t.answer = "", "", nil
+				return a, true
 			}
 		case "\x7f", "\b":
 			if len(t.answer) > 0 {
@@ -168,6 +173,8 @@ func (t *tui) key(k string) (tuiAction, bool) {
 		return tuiAction{op: "dismiss", id: it.decision.ID}, true
 	case (k == "r" || k == "\r") && kind == "question":
 		t.answering = it.decision.ID
+	case k == "m" && it.session != nil && (it.session.Node == masterNode || it.session.Node == deskNode):
+		t.switching = it.session.Node
 	case k == "\r" && it.session != nil && it.session.ID != "" && it.session.Status != "exited":
 		return tuiAction{op: "attach", id: it.session.ID}, true
 	}
@@ -259,12 +266,21 @@ func (t *tui) render(width, height int) []string {
 		foot = append(foot, dim+clip("a approve · d deny · j/k move · q quit", width)+plain)
 	case it.decision != nil && it.decision.Kind == "question":
 		foot = append(foot, dim+clip("r answer · j/k move · q quit", width)+plain)
+	case t.switching != "":
+		foot = append(foot, fmt.Sprintf("switch %s to: %s_", t.switching, string(t.answer)), dim+clip("a model, an effort ("+strings.Join(efforts, ", ")+") or both · enter switch · esc cancel", width)+plain)
 	case it.decision != nil:
 		foot = append(foot, dim+clip("x dismiss · j/k move · q quit", width)+plain)
-	case it.session != nil && !t.paused:
-		foot = append(foot, dim+clip("enter attach, then ctrl+z to come back · p pause all · j/k move · q quit", width)+plain)
 	case it.session != nil:
-		foot = append(foot, dim+clip("enter attach, then ctrl+z to come back · p unpause · j/k move · q quit", width)+plain)
+		keys := "enter attach, then ctrl+z to come back · "
+		if it.session.Node == masterNode || it.session.Node == deskNode {
+			keys += "m switch model · "
+		}
+		if t.paused {
+			keys += "p unpause · "
+		} else {
+			keys += "p pause all · "
+		}
+		foot = append(foot, dim+clip(keys+"j/k move · q quit", width)+plain)
 	default:
 		foot = append(foot, dim+"q quit"+plain)
 	}
@@ -418,14 +434,22 @@ func runTUI() error {
 					t.err = attach(a.id)
 					_, _ = makeRaw(in)
 					enter()
-				case "pause", "unpause":
-					// Each stops or resumes every session in turn, which takes a while, and the watch stream shows the progress.
+				case "pause", "unpause", "model":
+					// Each stops or resumes sessions, which takes a while, and the watch stream shows the progress. A switch of the desk waits for its turn to end.
 					t.err = ""
-					go func(op string) {
-						if _, err := call(context.Background(), Request{Op: op}); err != nil {
+					req := Request{Op: a.op}
+					if a.op == "model" {
+						var err error
+						if req, err = modelRequest(a.name, strings.Fields(a.text)); err != nil {
+							t.err = err.Error()
+							continue
+						}
+					}
+					go func(req Request) {
+						if _, err := call(context.Background(), req); err != nil {
 							post(tuiMessage{failed: err.Error()})
 						}
-					}(a.op)
+					}(req)
 				default:
 					t.err = ""
 					req := Request{Op: a.op, ID: a.id, Text: a.text}

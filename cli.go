@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -65,6 +66,52 @@ func attachSession(id string) error {
 	return nil
 }
 
+// modelRequest is the request that switches node, the master or the desk, to what words name: an effort level, a model, or both.
+func modelRequest(node string, words []string) (Request, error) {
+	req := Request{Op: "model", Name: node}
+	for _, w := range words {
+		field := &req.Model
+		if slices.Contains(efforts, w) {
+			field = &req.Effort
+		}
+		if *field != "" {
+			return req, fmt.Errorf("name one model and one effort, not %q and %q", *field, w)
+		}
+		*field = w
+	}
+	if req.Model == "" && req.Effort == "" {
+		return req, errors.New("name a model, an effort or both")
+	}
+	return req, nil
+}
+
+// runModel switches the master or the desk, the master when the arguments name neither.
+func runModel(args []string) error {
+	flags := flag.NewFlagSet("model", flag.ExitOnError)
+	effort := flags.String("effort", "", "the effort to switch to: low, medium, high, xhigh or max")
+	_ = flags.Parse(args)
+	args = flags.Args()
+	node := masterNode
+	if len(args) > 0 && (args[0] == masterNode || args[0] == deskNode) {
+		node, args = args[0], args[1:]
+	}
+	if err := checkEffort(*effort); err != nil {
+		return err
+	}
+	if *effort != "" {
+		args = append(args, *effort)
+	}
+	if len(args) > 2 {
+		return errors.New(usage)
+	}
+	req, err := modelRequest(node, args)
+	if err != nil {
+		return err
+	}
+	_, err = call(context.Background(), req)
+	return err
+}
+
 func runCommand(cmd string, args []string) error {
 	req := Request{Op: cmd}
 	if cmd == "spawn" {
@@ -74,7 +121,7 @@ func runCommand(cmd string, args []string) error {
 		_ = flags.Parse(args)
 		req.Model, req.Effort, args = *model, *effort, flags.Args()
 	}
-	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "model": 1}[cmd]
+	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1}[cmd]
 	if len(args) < need {
 		return errors.New(usage)
 	}
@@ -89,8 +136,6 @@ func runCommand(cmd string, args []string) error {
 		req.Name, req.Repo, req.Text = args[0], args[1], strings.Join(args[2:], " ")
 	case "kill":
 		req.Name = args[0]
-	case "model":
-		req.Model = args[0]
 	}
 	resp, err := call(context.Background(), req)
 	if resp.Text != "" {

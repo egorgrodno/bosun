@@ -129,6 +129,33 @@ func TestTUIPause(t *testing.T) {
 	}
 }
 
+// m on the master or the desk takes a model and an effort to switch it to, and does nothing on a worker.
+func TestTUISwitch(t *testing.T) {
+	tu := testTUI()
+	for range 3 {
+		tu.key("j")
+	}
+	tu.key("m")
+	for _, k := range splitKeys([]byte("opus high")) {
+		tu.key(k)
+	}
+	if screen := strings.Join(tu.render(80, 20), "\n"); !strings.Contains(screen, "switch desk to: opus high_") {
+		t.Fatalf("the screen lacks the switch:\n%s", screen)
+	}
+	if a, ok := tu.key("\r"); !ok || a != (tuiAction{op: "model", name: deskNode, text: "opus high"}) {
+		t.Fatalf("a switch: %+v %v", a, ok)
+	}
+	tu.key("j")
+	if tu.key("m"); tu.switching != masterNode {
+		t.Fatalf("m on the master switches %q", tu.switching)
+	}
+	tu.key("\x1b")
+	tu.key("j")
+	if tu.key("m"); tu.switching != "" {
+		t.Fatalf("m on a worker switches %q", tu.switching)
+	}
+}
+
 func TestSplitKeys(t *testing.T) {
 	if got := splitKeys([]byte("j\x1b[Bé\r")); !slices.Equal(got, []string{"j", "\x1b[B", "é", "\r"}) {
 		t.Fatalf("keys %q", got)

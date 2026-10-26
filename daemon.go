@@ -86,7 +86,9 @@ type daemon struct {
 	stateDir     string
 	masterDir    string
 	masterModel  string
+	masterEffort string
 	deskModel    string
+	deskEffort   string
 	workerModel  string
 	workerEffort string
 	// maxDepth caps the depth of the tree, where the master's children are at depth 1, and maxChildren the live children of each session.
@@ -238,7 +240,9 @@ func runDaemon(args []string) error {
 	flags := flag.NewFlagSet("daemon", flag.ExitOnError)
 	masterDir := flags.String("master-dir", filepath.Join(stateDir(), "master"), "directory the master runs in, which Claude Code must trust")
 	masterModel := flags.String("master-model", "", "model of a master the daemon starts, such as fable, opus or sonnet; the user's default when empty")
+	masterEffort := flags.String("master-effort", "", "effort of a master the daemon starts: low, medium, high, xhigh or max; the user's default when empty")
 	deskModel := flags.String("desk-model", "", "model of a front desk the daemon starts; the user's default when empty")
+	deskEffort := flags.String("desk-effort", "", "effort of a front desk the daemon starts; the user's default when empty")
 	workerModel := flags.String("worker-model", "", "model of a worker started without one; the user's default when empty")
 	workerEffort := flags.String("worker-effort", "", "effort of a worker started without one: low, medium, high, xhigh or max; the user's default when empty")
 	maxDepth := flags.Int("max-depth", defaultMaxDepth, "deepest level of the tree, where the master's children are at level 1")
@@ -247,8 +251,10 @@ func runDaemon(args []string) error {
 	if *maxDepth < 1 || *maxChildren < 1 {
 		return errors.New("-max-depth and -max-children must be at least 1")
 	}
-	if err := checkEffort(*workerEffort); err != nil {
-		return fmt.Errorf("-worker-effort: %w", err)
+	for flag, effort := range map[string]string{"master-effort": *masterEffort, "desk-effort": *deskEffort, "worker-effort": *workerEffort} {
+		if err := checkEffort(effort); err != nil {
+			return fmt.Errorf("-%s: %w", flag, err)
+		}
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -256,7 +262,7 @@ func runDaemon(args []string) error {
 	}
 	d := newDaemon(exe, socketPath(), stateDir(), *masterDir, claudeExec{})
 	d.masterModel, d.deskModel, d.workerModel = *masterModel, *deskModel, *workerModel
-	d.workerEffort = *workerEffort
+	d.masterEffort, d.deskEffort, d.workerEffort = *masterEffort, *deskEffort, *workerEffort
 	d.maxDepth, d.maxChildren = *maxDepth, *maxChildren
 	if err := d.fitsSockets(masterNode); err != nil {
 		return fmt.Errorf("the state path %s is too long, so set BOSUN_STATE to a shorter one: %w", d.stateDir, err)
@@ -624,7 +630,7 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	case "merge":
 		resp.Text, err = d.merge(ctx, r.Node, r.Name)
 	case "model":
-		err = d.switchModel(r.Model)
+		err = d.switchSession(ctx, cmp.Or(r.Name, masterNode), r.Model, r.Effort)
 	case "pause":
 		resp.Text, err = d.pause(ctx)
 	case "unpause":
@@ -2488,7 +2494,7 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	return d.carryOnAs(ctx, name, prompt, "", "")
 }
 
-// carryOnAs is carryOn on another model or effort, where either differs from the session's. The session then moves to a copy of its conversation under a new id, as switchModel moves the master.
+// carryOnAs is carryOn on another model or effort, where either differs from the session's. The session then moves to a copy of its conversation under a new id, as switchMaster moves the master.
 func (d *daemon) carryOnAs(ctx context.Context, name, prompt, model, effort string) error {
 	d.mu.Lock()
 	n := d.nodes[name]
@@ -2522,8 +2528,17 @@ func (d *daemon) carryOnAs(ctx context.Context, name, prompt, model, effort stri
 		return err
 	}
 	if to != nil {
-		// The first id of a worker that moved began its worktree, which only that id's removal deletes.
-		n.Retired = append(n.Retired, id)
+		if name == deskNode {
+			// The desk works in no repository, so its old id holds no worktree.
+			go func(old string) {
+				if err := d.claude.Remove(old, ""); err != nil {
+					log.Print(err)
+				}
+			}(id)
+		} else {
+			// The first id of a worker that moved began its worktree, which only that id's removal deletes.
+			n.Retired = append(n.Retired, id)
+		}
 		n.ID, n.SessionID, n.Conversation, n.Model, n.Effort = next, "", "", to.Model, to.Effort
 		id = next
 	}
@@ -2573,7 +2588,7 @@ func (d *daemon) restart(ctx context.Context, n *Session, id, dir, prompt string
 	if to == nil {
 		return id, d.resumeStopped(dir, id, a.SessionID, prompt)
 	}
-	next, err := d.start(to, dir, []string{"--resume", sid}, workerPrompt(n.Node), prompt)
+	next, err := d.start(to, dir, []string{"--resume", sid}, systemPrompt(n.Node), prompt)
 	if err != nil {
 		if stopped {
 			if rerr := d.resumeStopped(dir, id, a.SessionID, ""); rerr != nil {
@@ -2845,7 +2860,7 @@ func (d *daemon) ensureMaster() error {
 			return nil
 		}
 	}
-	m := &Session{Node: masterNode, Dir: d.masterDir, Model: d.masterModel, Status: "starting"}
+	m := &Session{Node: masterNode, Dir: d.masterDir, Model: d.masterModel, Effort: d.masterEffort, Status: "starting"}
 	d.nodes[masterNode] = m
 	d.started[masterNode] = time.Now()
 	d.mu.Unlock()
@@ -2888,7 +2903,7 @@ func (d *daemon) ensureDesk() error {
 			return nil
 		}
 	}
-	n := &Session{Node: deskNode, Dir: d.deskDir(), Model: d.deskModel, Status: "starting"}
+	n := &Session{Node: deskNode, Dir: d.deskDir(), Model: d.deskModel, Effort: d.deskEffort, Status: "starting"}
 	if old != nil {
 		n.Taken, n.Events = old.Taken, old.Events
 		d.giveBackLocked(n)
@@ -2916,25 +2931,58 @@ func (d *daemon) ensureDesk() error {
 	return nil
 }
 
-// switchModel moves the master to model, in a copy of its conversation under a new id.
-func (d *daemon) switchModel(model string) error {
-	if model == "" {
-		return errors.New("name a model")
+// switchSession moves node, the master or the desk, to another model or effort, in a copy of its conversation under a new id. An empty model or effort keeps the session's own.
+func (d *daemon) switchSession(ctx context.Context, node, model, effort string) error {
+	if node != masterNode && node != deskNode {
+		return fmt.Errorf("only the master and the desk switch here, not %q: resume switches a worker", node)
+	}
+	if model == "" && effort == "" {
+		return errors.New("name a model or an effort")
+	}
+	if err := checkEffort(effort); err != nil {
+		return err
 	}
 	d.mu.Lock()
 	paused := d.paused
-	d.mu.Unlock()
-	if paused {
-		return errPaused
+	n := d.nodes[node]
+	var to Session
+	if n != nil {
+		to = Session{Node: node, Dir: n.Dir, Model: cmp.Or(model, n.Model), Effort: cmp.Or(effort, n.Effort)}
 	}
+	d.mu.Unlock()
+	switch {
+	case paused:
+		return errPaused
+	case n == nil:
+		return fmt.Errorf("there is no %s", node)
+	case to.Model == n.Model && to.Effort == n.Effort:
+		return fmt.Errorf("the %s already runs at %s", node, modelLabel(to))
+	}
+	if node == deskNode {
+		return d.switchDesk(ctx, to)
+	}
+	return d.switchMaster(&to)
+}
+
+// switchDesk moves the desk to to's model and effort, waiting for a turn it is in to end. Its tells wait meanwhile, since a desk held by a resume takes none.
+func (d *daemon) switchDesk(ctx context.Context, to Session) error {
+	if !d.deskLock.TryLock() {
+		return errors.New("the desk is being handed its tells or cleared, so try again in a moment")
+	}
+	defer d.deskLock.Unlock()
+	return d.carryOnAs(ctx, deskNode, "bosun: the user switched you to "+modelLabel(to)+", keeping your conversation. Nothing else waits for you, so end your turn.", to.Model, to.Effort)
+}
+
+// switchMaster moves the master to next's model and effort at once, cutting a turn it is in.
+func (d *daemon) switchMaster(next *Session) error {
 	if !d.masterLock.TryLock() {
 		return errors.New("the master is being woken or switched, so try again in a moment")
 	}
 	defer d.masterLock.Unlock()
+	label := modelLabel(*next)
 	d.mu.Lock()
 	m := d.nodes[masterNode]
 	old, sid := m.ID, cmp.Or(m.Conversation, m.SessionID)
-	next := &Session{Node: masterNode, Dir: m.Dir, Model: model}
 	d.mu.Unlock()
 	if old == "" || sid == "" {
 		return errors.New("the master is still starting")
@@ -2943,14 +2991,14 @@ func (d *daemon) switchModel(model string) error {
 	if err := d.claude.Stop(old); err != nil {
 		return err
 	}
-	id, err := d.start(next, next.Dir, []string{"--resume", sid}, masterPrompt, fmt.Sprintf("The user switched your model to %s. Carry on: call next_event.", model))
+	id, err := d.start(next, next.Dir, []string{"--resume", sid}, masterPrompt, fmt.Sprintf("The user switched you to %s. Carry on: call next_event.", label))
 	if err != nil {
-		d.restoreMaster(old, pid, fmt.Sprintf("Switching your model to %s failed, so you keep the old one. Carry on: call next_event.", model))
+		d.restoreMaster(old, pid, fmt.Sprintf("Switching you to %s failed, so you keep what you ran at. Carry on: call next_event.", label))
 		return err
 	}
 
 	d.mu.Lock()
-	m.ID, m.SessionID, m.Conversation, m.Model = id, "", "", model
+	m.ID, m.SessionID, m.Conversation, m.Model, m.Effort = id, "", "", next.Model, next.Effort
 	m.Status, m.State, m.pre = "starting", "", nil
 	d.asleep = false
 	d.started[masterNode] = time.Now()
@@ -2969,7 +3017,7 @@ func (d *daemon) switchModel(model string) error {
 	d.saveLocked()
 	d.broadcastSessionsLocked()
 	d.mu.Unlock()
-	log.Printf("switched the master to %s (%s)", model, id)
+	log.Printf("switched the master to %s (%s)", label, id)
 	if err := d.claude.Remove(old, ""); err != nil {
 		log.Print(err)
 	}

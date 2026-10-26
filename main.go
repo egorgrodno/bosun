@@ -7,8 +7,9 @@ import (
 )
 
 const usage = `usage:
-  bosun daemon [-master-dir DIR] [-master-model M] [-desk-model M]
-               [-worker-model M] [-max-depth N] [-max-children N]
+  bosun daemon [-master-dir DIR] [-master-model M] [-master-effort E]
+               [-desk-model M] [-desk-effort E] [-worker-model M] [-worker-effort E]
+               [-max-depth N] [-max-children N]
                                    run the daemon, which starts the master and the front desk
   bosun mcp                        the MCP server each session starts
   bosun hook                       every hook each session runs
@@ -27,7 +28,8 @@ const usage = `usage:
   bosun pause                      stop every session, and resume none until unpause
   bosun unpause                    resume the turns that pause stopped
   bosun attach ID                  claude attach to a session, which the daemon resumes if it stopped
-  bosun model M                    switch the master to model M, keeping its conversation
+  bosun model [-effort E] [master|desk] [M]
+                                   switch the master, or the desk, to model M or effort E, keeping its conversation
 
 A model is an alias such as fable, opus, sonnet or haiku, or a full model name.`
 
@@ -53,7 +55,9 @@ func main() {
 		err = runTUI()
 	case "attach":
 		err = runAttach(args)
-	case "approve", "deny", "reply", "dismiss", "tell", "spawn", "kill", "model", "pause", "unpause":
+	case "model":
+		err = runModel(args)
+	case "approve", "deny", "reply", "dismiss", "tell", "spawn", "kill", "pause", "unpause":
 		err = runCommand(cmd, args)
 	default:
 		fmt.Fprintln(os.Stderr, usage)

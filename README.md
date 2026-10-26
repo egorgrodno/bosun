@@ -23,7 +23,7 @@ bosun approve 3
 bosun attach <id>
 ```
 
-`bosun` alone lists every command. `bosun pause` stops every session, such as before a reboot, and `bosun unpause` resumes the turns it cut.
+`bosun` alone lists every command. `bosun pause` stops every session, such as before a reboot, and `bosun unpause` resumes the turns it cut. `bosun model -effort low desk sonnet` moves the desk to another model and effort, keeping its conversation, and `m` in `bosun tui` does the same for the master or the desk.
 
 Talk to the desk: type into it through `bosun attach`, or send it a line with `bosun tell`. The master and the desk refuse messages from your other Claude Code sessions, though the sender's `SendMessage` reports success.
 

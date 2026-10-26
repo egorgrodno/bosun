@@ -20,6 +20,17 @@ Your bosun tools' descriptions say how to work: read tell_master's first. They c
 // deskStart is the prompt the desk starts with, whose turn leaves it idle for the user.
 const deskStart = "bosun started you. Say nothing and end your turn: the user's first word starts your next one."
 
+// systemPrompt is what bosun appends to the system prompt of session node.
+func systemPrompt(node string) string {
+	switch node {
+	case masterNode:
+		return masterPrompt
+	case deskNode:
+		return deskPrompt
+	}
+	return workerPrompt(node)
+}
+
 func workerPrompt(node string) string {
 	return fmt.Sprintf(`You are bosun worker %[1]s, one session in a tree that a master session runs. You work in a git worktree on the branch worktree-%[1]s. Commit your work there, and never push it: your parent merges your branch.
 

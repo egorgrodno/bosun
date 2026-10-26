@@ -1123,7 +1123,7 @@ func TestWakeAndSwitchExclude(t *testing.T) {
 	d.poll()
 
 	d.masterLock.Lock()
-	if err := d.switchModel("opus"); err == nil {
+	if err := d.switchSession(context.Background(), masterNode, "opus", ""); err == nil {
 		t.Fatal("switched the master while it was being woken")
 	}
 	mustCall(t, Request{Op: "tell", Text: "x"})
