@@ -81,7 +81,7 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 - a push to a URL, or to a name that `git remote` does not list in the repository the command runs in
 - a push with a git option other than `-C`, or with a push option the check does not know
 - deleting a branch
-- a write through a file tool outside the session's worktree, memory directory, temporary folder and `$CLAUDE_JOB_DIR/tmp`
+- a write through a file tool outside the session's worktree, memory directory, temporary folder and `$CLAUDE_JOB_DIR/tmp`, or by the master into the desk's directory
 - a Bash command outside the sandbox, through `dangerouslyDisableSandbox`, unless it is on the allowlist
 
 **The allowlist lets a few commands outside the sandbox take the normal flow.** Each must be the whole command: plain words, with nothing chained, piped, substituted, redirected or assigned before it.
@@ -156,6 +156,8 @@ The check covers only what a session sends: a message from outside bosun reaches
 
 **It shares the master's memory, not its transcripts.** It runs in `desk` inside the master's directory, so Claude Code files its transcripts apart from the master's. Its settings point `autoMemoryDirectory` at the master's memory directory.
 
+**The master may not write the desk's directory.** The desk would run hooks written in its `.claude` outside any sandbox. Claude Code's sandbox guards the `.claude` and `.mcp.json` of a session's own directory alone, so the master's settings add the desk's directory to `sandbox.filesystem.denyWrite`, and the reserved check holds a file tool's write there for you. Claude Code's file tools count a write into any `.claude` folder as sensitive, which covers the desk's own.
+
 **The daemon carries tells both ways.** A frontend's `tell` and the master's `tell_desk` queue text for the desk. The desk gets its queue the way a worker parent gets its children's reports. In a turn, the daemon blocks its `Stop` with the queue as the reason. Between turns, the daemon resumes it with the queue as the prompt, and a stopped desk resumes like an idle one. The desk's `tell_master` reaches the master as a `tell` event with `from` set to `desk`.
 
 **Without a desk, tells go to the master.** When the desk could not start, its session is gone or a usage limit stopped it, a `tell` goes to the master and a `tell_desk` reaches you as a notice. The master may run on a model the limit spares. A desk that the daemon fails to resume, or that a limit stops, hands on its queue the same way.
@@ -197,5 +199,5 @@ Each leads with the queue of decisions waiting on you, above the tree. The desk 
 
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
 - **Restarts and pauses.** Only a fake `claude` has run the restart handling and the pause. No real reboot, crash or pause has been measured. The daemon reads transcripts in the 2.1.310 format. Whether `claude stop` runs the `Stop` hook is unmeasured, so the daemon ignores a `Stop` from a session that a pause stopped.
-- **The desk.** No real desk has run. A probe session inside the master's directory measured the desk's trust, `autoMemoryDirectory` from `--settings` and the clear's transcript, and nothing more. Handing an idle desk its queue stops and resumes it, as waking the master does. Whether a `claude attach` open on it survives that is unmeasured.
+- **The desk.** No real desk has run. A probe session inside the master's directory measured the desk's trust, `autoMemoryDirectory` from `--settings` and the clear's transcript, and nothing more. Handing an idle desk its queue stops and resumes it, as waking the master does. Whether a `claude attach` open on it survives that is unmeasured. That a file tool's sensitive write asks even in auto mode comes from the 2.1.310 binary.
 - **The allowlist.** No real session has run it. Two things are unmeasured: whether an `ask` rule sends a call outside the sandbox to `PermissionRequest` in auto mode, and whether `Bash(nixos-rebuild:*)` matches a flake with a `#host` attribute. The gate finds a push's repository from the hook's `cwd`. In the 2.1.310 binary that is the session's working directory, which a `cd` in an earlier Bash call moves, but no real session has shown it.

@@ -13,8 +13,9 @@ import (
 type gate struct {
 	// cwd is where the call runs.
 	cwd string
-	// writable lists where the session's file tools may write, its worktree first.
+	// writable lists where the session's file tools may write, its worktree first, and fenced the folders within them that they may not.
 	writable []string
+	fenced   []string
 	repos    repos
 }
 
@@ -51,7 +52,15 @@ func (g gate) reserved(tool string, input json.RawMessage) string {
 			NotebookPath string `json:"notebook_path"`
 		}
 		_ = json.Unmarshal(input, &in)
-		if p := cmp.Or(in.FilePath, in.NotebookPath); p != "" && !within(g.writable, p) {
+		p := cmp.Or(in.FilePath, in.NotebookPath)
+		if p != "" && !filepath.IsAbs(p) {
+			p = filepath.Join(g.writable[0], p)
+		}
+		switch {
+		case p == "":
+		case within(g.fenced, p):
+			return "a write into the desk's directory"
+		case !within(g.writable, p):
 			return "a write outside the worktree"
 		}
 	}

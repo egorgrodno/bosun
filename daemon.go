@@ -466,7 +466,15 @@ func (d *daemon) gate(node, cwd string) *gate {
 	if n == nil {
 		return nil
 	}
-	return &gate{cwd: cmp.Or(cwd, n.Dir), writable: d.writable(n), repos: d.repos()}
+	return &gate{cwd: cmp.Or(cwd, n.Dir), writable: d.writable(n), fenced: d.fenced(n), repos: d.repos()}
+}
+
+// fenced lists the folders within the session's own directory that it may not write: for the master, the desk's, whose settings and hooks would run outside the master's sandbox once the desk starts.
+func (d *daemon) fenced(s *Session) []string {
+	if s.Node == masterNode {
+		return []string{d.deskDir()}
+	}
+	return nil
 }
 
 // repos holds the record of each repository's git setup from before bosun's first worker in it.
@@ -1757,6 +1765,14 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 	if err := writeExcludes(excludes); err != nil {
 		return "", "", err
 	}
+	filesystem := map[string]any{
+		"allowWrite": []string{"~/.cache/go-build", "~/.cache/nix", "~/.cache/treefmt"},
+		"denyRead":   d.hiddenSockets(),
+	}
+	// Claude Code's sandbox guards the .claude and .mcp.json of the session's own directory alone.
+	if fenced := d.fenced(n); len(fenced) > 0 {
+		filesystem["denyWrite"] = fenced
+	}
 	settings := map[string]any{
 		"worktree": map[string]string{"baseRef": "head"},
 		// Claude Code's default, or the master's for the desk, set so that the reserved check spares exactly the directory the session writes.
@@ -1781,11 +1797,8 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 			// The sandbox confines where a command writes, not what it does to the worktree, so auto mode and the master still judge it.
 			"autoAllowBashIfSandboxed": false,
 			// Linux cannot open a single socket path, and nix needs its daemon's, so the sockets a command could act through are hidden instead.
-			"network": map[string]any{"allowAllUnixSockets": true},
-			"filesystem": map[string]any{
-				"allowWrite": []string{"~/.cache/go-build", "~/.cache/nix", "~/.cache/treefmt"},
-				"denyRead":   d.hiddenSockets(),
-			},
+			"network":    map[string]any{"allowAllUnixSockets": true},
+			"filesystem": filesystem,
 		},
 		"hooks": map[string]any{
 			"SessionStart":       quick,
@@ -2431,7 +2444,8 @@ func (d *daemon) ensureMaster() error {
 	d.nodes[masterNode] = m
 	d.started[masterNode] = time.Now()
 	d.mu.Unlock()
-	if err := os.MkdirAll(d.masterDir, 0o700); err != nil {
+	// The master starts before the desk, and its sandbox must find the desk's folder to fence, not a name it could create.
+	if err := os.MkdirAll(d.deskDir(), 0o700); err != nil {
 		return err
 	}
 	id, err := d.start(m, d.masterDir, nil, masterPrompt, "Call next_event to begin.")

@@ -101,6 +101,55 @@ func TestDeskStarts(t *testing.T) {
 	}
 }
 
+// The master may not write the desk's directory, whose settings and hooks would run outside the master's sandbox once the desk starts, and the desk may not write the master's.
+func TestDeskFenced(t *testing.T) {
+	d, _ := testDesk(t)
+	d.mu.Lock()
+	masterDir, deskDir := d.nodes[masterNode].Dir, d.nodes[deskNode].Dir
+	d.mu.Unlock()
+	for node, want := range map[string][]string{masterNode: {deskDir}, deskNode: nil} {
+		data, err := os.ReadFile(filepath.Join(d.stateDir, "nodes", node, "settings.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var s struct {
+			Sandbox struct {
+				Filesystem map[string][]string `json:"filesystem"`
+			} `json:"sandbox"`
+		}
+		if err := json.Unmarshal(data, &s); err != nil || !slices.Equal(s.Sandbox.Filesystem["denyWrite"], want) {
+			t.Fatalf("%s's sandbox denies writes to %q, want %q: %v", node, s.Sandbox.Filesystem["denyWrite"], want, err)
+		}
+	}
+
+	for _, c := range []struct {
+		node, path string
+		refused    bool
+	}{
+		{masterNode, filepath.Join(deskDir, ".claude", "settings.json"), true},
+		{masterNode, filepath.Join(deskDir, ".mcp.json"), true},
+		{masterNode, "desk/.claude/hooks/start.sh", true},
+		{masterNode, filepath.Join(masterDir, "notes.md"), false},
+		{masterNode, filepath.Join(masterDir, "desk-notes.md"), false},
+		{deskNode, filepath.Join(masterDir, ".claude", "settings.json"), true},
+		{deskNode, filepath.Join(deskDir, "notes.md"), false},
+	} {
+		input, _ := json.Marshal(map[string]string{"file_path": c.path, "content": "x"})
+		if r := d.gate(c.node, "").reserved("Write", input); (r != "") != c.refused {
+			t.Errorf("%s writing %s: reserved %q", c.node, c.path, r)
+		}
+	}
+
+	hook := runHookAsync(masterNode, hookEvent("PreToolUse", "t1", "Write", map[string]any{"file_path": filepath.Join(deskDir, ".claude", "settings.json"), "content": "{}"}))
+	if dec := openDecision(t, 1); dec.Holder != "user" || dec.Reserved != "a write into the desk's directory" {
+		t.Fatalf("decision = %+v", dec)
+	}
+	mustCall(t, Request{Op: "deny", ID: "1"})
+	if out := receive(t, hook); !strings.Contains(out, `"permissionDecision":"deny"`) {
+		t.Fatalf("the master's write into the desk's directory printed %s", out)
+	}
+}
+
 // The desk reads the fleet and tells the master, and changes nothing in the fleet itself.
 func TestDeskTools(t *testing.T) {
 	testDesk(t)
