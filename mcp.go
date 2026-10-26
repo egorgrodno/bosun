@@ -35,6 +35,9 @@ const (
 	modelHelp  = "The session's model, picked from the task: haiku for mechanical edits, version bumps and docs; sonnet for ordinary features and fixes; opus or fable, the strongest, for design, concurrency or security-sensitive work. Left out, it is the daemon's default."
 	effortHelp = "The session's effort, picked from the task: low for mechanical edits, version bumps and docs; medium for ordinary features; high for design, concurrency or security-sensitive work; xhigh or max only where high failed. Left out, it is the daemon's default."
 
+	pluginsHelp    = "Plugins to start the worker with, by name, such as craft for a task that designs, edits media or documents, or drives a Craft app. A worker starts without the user's plugins except the code-intelligence ones, since each plugin's tools and instructions ride on every request it makes. Add one only when the task needs it, and none for a task that writes code. A child inherits nothing from its parent."
+	connectorsHelp = "Whether to start the worker with the user's claude.ai connectors, such as Claude Docs, Todoist and Google Drive. It starts without them, since their tools ride on every request it makes. Turn them on only for a task that needs one, such as writing a Claude Docs document."
+
 	statusHelp = `Show the fleet as bosun status shows it: the decisions waiting on the user and on the master, the tree of sessions with their ids, states and models, and the latest messages between sessions. Each decision and each message then follows in full.
 
 Read it before you answer a question about the run. desk is you, and master is the session that runs the workers.
@@ -119,10 +122,12 @@ func tools(node string) []tool {
 	if node != masterNode {
 		return []tool{
 			{"spawn", "Start a child session in its own git worktree, branched from your HEAD, with prompt as its task. Each time it ends its turn or stops in the middle of one, bosun tells you: when you next end your turn, or in a new turn once you have ended yours. So to wait for your children, end your turn." + peersHelp, object([]string{"name", "prompt"}, map[string]any{
-				"name":   str(nameHelp),
-				"prompt": str("The child's task. It sees nothing else, so say everything it needs."),
-				"model":  str(modelHelp),
-				"effort": str(effortHelp),
+				"name":       str(nameHelp),
+				"prompt":     str("The child's task. It sees nothing else, so say everything it needs."),
+				"model":      str(modelHelp),
+				"effort":     str(effortHelp),
+				"plugins":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": pluginsHelp},
+				"connectors": map[string]any{"type": "boolean", "description": connectorsHelp},
 			})},
 			{"ask", "Ask the master a question and wait for the answer. Use it for any decision you would otherwise put to the user. The master may pass it on to the user, so the wait can be long.", object([]string{"question"}, map[string]any{
 				"question": str("The question, with what the answer depends on."),
@@ -134,11 +139,13 @@ func tools(node string) []tool {
 	}
 	return []tool{
 		{"spawn", "Start a worker session in its own git worktree, branched from the repository's checked-out HEAD, with prompt as its task." + peersHelp, object([]string{"name", "repo", "prompt"}, map[string]any{
-			"name":   str(nameHelp),
-			"repo":   str("Path to a git repository Claude Code trusts."),
-			"prompt": str("The worker's task. It sees nothing else, so say everything it needs."),
-			"model":  str(modelHelp),
-			"effort": str(effortHelp),
+			"name":       str(nameHelp),
+			"repo":       str("Path to a git repository Claude Code trusts."),
+			"prompt":     str("The worker's task. It sees nothing else, so say everything it needs."),
+			"model":      str(modelHelp),
+			"effort":     str(effortHelp),
+			"plugins":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": pluginsHelp},
+			"connectors": map[string]any{"type": "boolean", "description": connectorsHelp},
 		})},
 		{"next_event", nextEventHelp, object([]string{}, map[string]any{})},
 		{"reply", "Answer a worker's question. The worker gets the answer as the result of its ask. Answer when the user's instructions or the worker's task settle the question, and escalate it otherwise.", object([]string{"id", "answer"}, map[string]any{
@@ -323,20 +330,22 @@ func (s *mcpServer) progress(ctx context.Context, token json.RawMessage) {
 
 func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (string, error) {
 	var args struct {
-		Name     string `json:"name"`
-		Repo     string `json:"repo"`
-		Model    string `json:"model"`
-		Effort   string `json:"effort"`
-		Prompt   string `json:"prompt"`
-		Question string `json:"question"`
-		ID       string `json:"id"`
-		Answer   string `json:"answer"`
-		Allow    *bool  `json:"allow"`
-		Message  string `json:"message"`
-		Note     string `json:"note"`
-		Text     string `json:"text"`
-		Turns    int    `json:"turns"`
-		Words    string `json:"words"`
+		Name       string   `json:"name"`
+		Repo       string   `json:"repo"`
+		Model      string   `json:"model"`
+		Effort     string   `json:"effort"`
+		Plugins    []string `json:"plugins"`
+		Connectors bool     `json:"connectors"`
+		Prompt     string   `json:"prompt"`
+		Question   string   `json:"question"`
+		ID         string   `json:"id"`
+		Answer     string   `json:"answer"`
+		Allow      *bool    `json:"allow"`
+		Message    string   `json:"message"`
+		Note       string   `json:"note"`
+		Text       string   `json:"text"`
+		Turns      int      `json:"turns"`
+		Words      string   `json:"words"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &args); err != nil {
@@ -354,6 +363,7 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	switch name {
 	case "spawn":
 		req.Name, req.Repo, req.Model, req.Effort, req.Text = args.Name, args.Repo, args.Model, args.Effort, args.Prompt
+		req.Plugins, req.Connectors = args.Plugins, args.Connectors
 	case "resume":
 		req.Name, req.Model, req.Effort, req.Text = args.Name, args.Model, args.Effort, args.Prompt
 	case "merge":

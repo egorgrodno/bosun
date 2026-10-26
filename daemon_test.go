@@ -1655,7 +1655,15 @@ func TestMasterRunsLean(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(claude, "plugins"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(claude, "plugins", "installed_plugins.json"), []byte(`{"version":2,"plugins":{"craft@egor":[{"scope":"user"}],"lsp@official":[]}}`), 0o600); err != nil {
+	tsgo := filepath.Join(claude, "tsgo")
+	if err := os.MkdirAll(tsgo, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(tsgo, ".lsp.json"), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	installed := fmt.Sprintf(`{"version":2,"plugins":{"craft@egor":[{"scope":"user"}],"gopls-lsp@official":[],"tsgo@egor":[{"installPath":%q}]}}`, tsgo)
+	if err := os.WriteFile(filepath.Join(claude, "plugins", "installed_plugins.json"), []byte(installed), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(claude, "settings.json"), []byte(`{"enabledPlugins":{"craft@egor":true,"hint@builtin":true}}`), 0o600); err != nil {
@@ -1676,8 +1684,9 @@ func TestMasterRunsLean(t *testing.T) {
 		Plugins     map[string]bool     `json:"enabledPlugins"`
 		Permissions map[string][]string `json:"permissions"`
 	}
-	read := func(node string) leanSettings {
-		settings, _, err := d.writeConfig(&Session{Node: node, Dir: "/x"})
+	read := func(n *Session) leanSettings {
+		n.Dir = "/x"
+		settings, _, err := d.writeConfig(n)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1688,15 +1697,32 @@ func TestMasterRunsLean(t *testing.T) {
 		}
 		return s
 	}
-	s := read(masterNode)
-	want := map[string]bool{"craft@egor": false, "lsp@official": false, "hint@builtin": false}
+	s := read(&Session{Node: masterNode})
+	want := map[string]bool{"craft@egor": false, "gopls-lsp@official": false, "tsgo@egor": false, "hint@builtin": false}
 	if !s.Connectors || !maps.Equal(s.Plugins, want) || !slices.Equal(s.Permissions["deny"], masterDenied) {
 		t.Fatalf("the master's settings = %+v, want the connectors off, the plugins %v off and %q denied", s, want, masterDenied)
 	}
-	for _, node := range []string{deskNode, "a"} {
-		if s := read(node); s.Connectors || s.Plugins != nil || slices.Contains(s.Permissions["deny"], "Skill") {
-			t.Fatalf("%s's settings = %+v, want its connectors, plugins and skills", node, s)
-		}
+	if s := read(&Session{Node: deskNode}); s.Connectors || s.Plugins != nil || len(s.Permissions["deny"]) > 0 {
+		t.Fatalf("the desk's settings = %+v, want its connectors, plugins and tools", s)
+	}
+
+	// A worker keeps the code-intelligence plugins, whether the name or a .lsp.json shows them, and the skills.
+	s = read(&Session{Node: "a"})
+	want = map[string]bool{"craft@egor": false, "hint@builtin": false}
+	if !s.Connectors || !maps.Equal(s.Plugins, want) || !slices.Equal(s.Permissions["deny"], leanDenied) || slices.Contains(s.Permissions["deny"], "Skill") {
+		t.Fatalf("a worker's settings = %+v, want the connectors and %v off, and %q denied", s, want, leanDenied)
+	}
+	s = read(&Session{Node: "b", Plugins: []string{"craft@egor"}, Connectors: true})
+	want = map[string]bool{"hint@builtin": false}
+	if s.Connectors || !maps.Equal(s.Plugins, want) {
+		t.Fatalf("a worker with what its parent added has settings %+v, want the connectors on and only %v off", s, want)
+	}
+
+	if ids, err := workerPlugins([]string{"craft", "hint@builtin", "craft@egor"}); err != nil || !slices.Equal(ids, []string{"craft@egor", "hint@builtin"}) {
+		t.Fatalf("workerPlugins = %v, %v", ids, err)
+	}
+	if _, err := workerPlugins([]string{"nope"}); err == nil || !strings.Contains(err.Error(), "craft@egor") {
+		t.Fatalf("workerPlugins of an unknown plugin: %v, want an error that lists the user's", err)
 	}
 }
 
@@ -1714,7 +1740,7 @@ func TestSpawn(t *testing.T) {
 	fc.mu.Lock()
 	args, dir := fc.starts[len(fc.starts)-1], fc.dirs[len(fc.dirs)-1]
 	fc.mu.Unlock()
-	if dir != repo || !slices.Contains(args, "-w") || args[len(args)-1] != "fix the bug" || slices.Contains(args, "--model") {
+	if dir != repo || !slices.Contains(args, "-w") || args[len(args)-1] != "fix the bug" || slices.Contains(args, "--model") || !slices.Contains(args, "--strict-mcp-config") {
 		t.Fatalf("claude ran in %s with %q", dir, args)
 	}
 
@@ -1826,7 +1852,7 @@ func TestSpawnLeavesRoomForSandboxSockets(t *testing.T) {
 		refused bool
 	}{{33, false}, {34, true}} {
 		// No repo, so a name the check lets through fails on that instead, before anything is written.
-		_, err := d.spawn("", strings.Repeat("n", tc.length), "", "", "", "x")
+		_, err := d.spawn("", strings.Repeat("n", tc.length), "", "", "", "x", nil, false)
 		if refused := err != nil && strings.Contains(err.Error(), "sockets"); refused != tc.refused {
 			t.Errorf("spawn of a %d-character name: %v", tc.length, err)
 		}

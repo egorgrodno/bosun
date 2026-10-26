@@ -612,7 +612,7 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	case "transcript":
 		resp.Text, err = d.transcript(r.Name, r.Turns)
 	case "spawn":
-		resp.Session, err = d.spawn(r.Node, r.Name, r.Repo, r.Model, r.Effort, r.Text)
+		resp.Session, err = d.spawn(r.Node, r.Name, r.Repo, r.Model, r.Effort, r.Text, r.Plugins, r.Connectors)
 	case "resume":
 		err = d.resume(ctx, r.Node, r.Name, r.Model, r.Effort, r.Text)
 	case "attach":
@@ -1806,7 +1806,7 @@ func (d *daemon) snapshotLocked() Response {
 }
 
 // spawn starts a child of caller, or of the master when a frontend asks. A child of the master needs repo; a deeper one branches from its parent's worktree.
-func (d *daemon) spawn(caller, name, repo, model, effort, prompt string) (*Session, error) {
+func (d *daemon) spawn(caller, name, repo, model, effort, prompt string, plugins []string, connectors bool) (*Session, error) {
 	caller = cmp.Or(caller, masterNode)
 	if caller == deskNode {
 		return nil, errors.New("the desk starts no sessions: pass the user's instruction to the master with tell_master")
@@ -1822,6 +1822,10 @@ func (d *daemon) spawn(caller, name, repo, model, effort, prompt string) (*Sessi
 	}
 	if err := checkEffort(effort); err != nil {
 		return nil, err
+	}
+	plugins, perr := workerPlugins(plugins)
+	if perr != nil {
+		return nil, perr
 	}
 	d.mu.Lock()
 	parent := d.nodes[caller]
@@ -1860,7 +1864,7 @@ func (d *daemon) spawn(caller, name, repo, model, effort, prompt string) (*Sessi
 	// Once a worker runs in the repository, its sandbox may have changed the setup.
 	fresh := !slices.ContainsFunc(slices.Collect(maps.Values(d.nodes)), func(s *Session) bool { return s.Repo == root })
 	if err == nil {
-		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Base: dir, BaseBranch: branch, Model: cmp.Or(model, d.workerModel), Effort: cmp.Or(effort, d.workerEffort), Depth: d.nodes[caller].Depth + 1, Status: "starting", Heard: time.Now()}
+		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Base: dir, BaseBranch: branch, Model: cmp.Or(model, d.workerModel), Effort: cmp.Or(effort, d.workerEffort), Plugins: plugins, Connectors: connectors, Depth: d.nodes[caller].Depth + 1, Status: "starting", Heard: time.Now()}
 		d.started[name] = time.Now()
 	}
 	n := d.nodes[name]
@@ -1930,8 +1934,9 @@ func (d *daemon) start(n *Session, dir string, extra []string, system, prompt st
 	if n.Effort != "" {
 		args = append(args, "--effort", n.Effort)
 	}
-	if n.Node == masterNode {
+	if n.Node != deskNode && len(n.Plugins) == 0 && !n.Connectors {
 		// The settings name the connectors and plugins they turn off, and this keeps out the MCP servers they cannot name.
+		// It also keeps out the servers of a plugin the settings turn on, so a worker that was given one runs without it.
 		args = append(args, "--strict-mcp-config")
 	}
 	args = append(args, "--settings", settings, "--mcp-config", mcp, "--append-system-prompt", system+"\n\n"+tempFiles(d.scratchDir(n.Node)), "--", prompt)
@@ -1958,9 +1963,6 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 	hold := []hookGroup{{Hooks: []hookCommand{{Type: "command", Command: command, Timeout: int(holdTimeout / time.Second)}}}}
 	quick := []hookGroup{{Hooks: []hookCommand{{Type: "command", Command: command}}}}
 	permissions := map[string][]string{"allow": {"mcp__bosun"}, "ask": rebuildRules}
-	if isWorker(node) {
-		permissions["deny"] = []string{"AskUserQuestion"}
-	}
 	excludes := filepath.Join(dir, "gitignore")
 	if err := writeExcludes(excludes); err != nil {
 		return "", "", err
@@ -2017,14 +2019,20 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 		// The desk passes on to the master what it is told, so only bosun and the user reach it, and a session outside bosun cannot pose as the user.
 		settings["crossSessionInbound"] = "refuse"
 	}
-	if node == masterNode {
+	if node != deskNode {
 		// Every request carries each tool the session holds, and a clear starts its new conversation from these settings.
-		permissions["deny"] = masterDenied
-		settings["disableClaudeAiConnectors"] = true
+		permissions["deny"] = leanDenied
+		if node == masterNode {
+			permissions["deny"] = masterDenied
+		}
+		// A worker keeps the code-intelligence plugins and what its parent added.
 		plugins := map[string]bool{}
 		for _, p := range userPlugins() {
-			plugins[p] = false
+			if node == masterNode || !p.codeIntel() && !slices.Contains(n.Plugins, p.ID) {
+				plugins[p.ID] = false
+			}
 		}
+		settings["disableClaudeAiConnectors"] = !n.Connectors
 		settings["enabledPlugins"] = plugins
 	}
 	mcp := map[string]any{"mcpServers": map[string]any{"bosun": map[string]any{
@@ -2042,32 +2050,78 @@ func (d *daemon) writeConfig(n *Session) (settingsPath, mcpPath string, err erro
 	return settingsPath, mcpPath, writeJSON(mcpPath, mcp)
 }
 
-// masterDenied are the built-in tools the master goes without. The desk and the workers keep them.
-var masterDenied = []string{
-	// Its listing of the user's skills rides on every request, and the desk does the work they serve.
-	// Without it, Artifact and Workflow take the guidance a skill would load into their own descriptions, so all three go together.
-	"Skill",
+// leanDenied are the built-in tools that neither the master nor a worker needs. Only the desk keeps them.
+var leanDenied = []string{
 	// It publishes pages for the user, whom the desk talks to.
 	"Artifact",
 	// It orchestrates subagents on the user's word, and the master orchestrates workers.
 	"Workflow",
 	// It drafts feedback on Claude Code for a person to send.
 	"SendFeedback",
-	// It paces /loop, and next_event wakes the master.
+	// It paces /loop, and a session that waits ends its turn, which its parent's reports or next_event resume.
 	"ScheduleWakeup",
 	// It reports a code review that a skill runs.
 	"ReportFindings",
-	// The master works in no repository.
+	// The master works in no repository, and bosun gives each worker its worktree.
 	"EnterWorktree",
-	// Nobody watches the master, which reaches the user through escalate.
+	// Nobody watches a session, which reaches the user through escalate or ask.
 	"AskUserQuestion",
 }
 
-// userPlugins lists the plugins of the user's Claude Code: those installed, and those the user's settings enable, built-in ones included.
+// masterDenied are the built-in tools the master goes without. A worker keeps Skill, since its prompt sends it to the user's skills.
+var masterDenied = slices.Concat([]string{
+	// Its listing of the user's skills rides on every request, and the desk does the work they serve.
+	// Without it, Artifact and Workflow take the guidance a skill would load into their own descriptions, so all three go together.
+	"Skill",
+}, leanDenied)
+
+// plugin is a plugin of the user's Claude Code. Path is where it is installed, empty for one that only the settings name.
+type plugin struct{ ID, Path string }
+
+// name is the plugin's name without its marketplace.
+func (p plugin) name() string {
+	name, _, _ := strings.Cut(p.ID, "@")
+	return name
+}
+
+// codeIntel reports whether the plugin serves code intelligence, which helps a worker that writes code.
+// The official ones are named after their language server, as gopls-lsp, and a plugin from elsewhere declares its servers in a .lsp.json.
+func (p plugin) codeIntel() bool {
+	if strings.HasSuffix(p.name(), "-lsp") {
+		return true
+	}
+	if p.Path == "" {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(p.Path, ".lsp.json"))
+	return err == nil
+}
+
+// workerPlugins resolves the plugin names a worker's parent asked for, each a name or a full id, to ids.
+func workerPlugins(names []string) ([]string, error) {
+	var ids, have []string
+	all := userPlugins()
+	for _, p := range all {
+		have = append(have, p.ID)
+	}
+	for _, name := range names {
+		i := slices.IndexFunc(all, func(p plugin) bool { return p.ID == name || p.name() == name })
+		if i < 0 {
+			return nil, fmt.Errorf("no plugin %q: the user has %s", name, strings.Join(have, ", "))
+		}
+		ids = append(ids, all[i].ID)
+	}
+	slices.Sort(ids)
+	return slices.Compact(ids), nil
+}
+
+// userPlugins lists the plugins of the user's Claude Code: those installed, and those the user's settings enable, built-in ones included, sorted by id.
 // A file that is missing or does not parse adds none.
-func userPlugins() []string {
+func userPlugins() []plugin {
 	var installed struct {
-		Plugins map[string]json.RawMessage `json:"plugins"`
+		Plugins map[string][]struct {
+			InstallPath string `json:"installPath"`
+		} `json:"plugins"`
 	}
 	var settings struct {
 		Enabled map[string]json.RawMessage `json:"enabledPlugins"`
@@ -2080,9 +2134,22 @@ func userPlugins() []string {
 			_ = json.Unmarshal(data, v)
 		}
 	}
-	plugins := slices.Concat(slices.Collect(maps.Keys(installed.Plugins)), slices.Collect(maps.Keys(settings.Enabled)))
-	slices.Sort(plugins)
-	return slices.Compact(plugins)
+	found := map[string]string{}
+	for id := range settings.Enabled {
+		found[id] = ""
+	}
+	for id, installs := range installed.Plugins {
+		found[id] = ""
+		if len(installs) > 0 {
+			found[id] = installs[0].InstallPath
+		}
+	}
+	var plugins []plugin
+	for id, path := range found {
+		plugins = append(plugins, plugin{id, path})
+	}
+	slices.SortFunc(plugins, func(a, b plugin) int { return strings.Compare(a.ID, b.ID) })
+	return plugins
 }
 
 // hiddenSockets lists the sockets, and folders of them, through which a sandboxed command could act outside the sandbox.

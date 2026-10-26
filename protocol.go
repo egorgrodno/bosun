@@ -31,6 +31,10 @@ type Request struct {
 	Hook  json.RawMessage `json:"hook,omitempty"`
 	// Words quotes the user's message that the desk's answer to a decision acts on.
 	Words string `json:"words,omitempty"`
+	// Plugins and Connectors are what a spawn adds to the worker's lean start.
+	Plugins    []string `json:"plugins,omitempty"`
+	Connectors bool     `json:"connectors,omitempty"`
+
 	// Key names a request that its client sends again, unchanged, once the daemon is back from a restart.
 	Key string `json:"key,omitempty"`
 }
@@ -135,6 +139,9 @@ type Session struct {
 	Conversation string `json:"conversation,omitempty"`
 	// Retired holds the ids a worker had before a switch of its model or effort moved it to a new one. The first began the worker's worktree, so merge removes them too.
 	Retired []string `json:"retired,omitempty"`
+	// Plugins and Connectors are what the parent added to the worker's lean start, which each start of it repeats.
+	Plugins    []string `json:"plugins,omitempty"`
+	Connectors bool     `json:"connectors,omitempty"`
 	// Socket is the messaging socket of the session's running process, forgotten once the process stops, since another process may take the path.
 	Socket string `json:"socket,omitempty"`
 	// Events holds what waits for a session that runs no next_event until bosun hands it over: the turn ends and exits of a worker's children, or the desk's tells. Taken holds the reports handed to a worker in its current turn.
