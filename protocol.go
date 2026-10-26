@@ -55,7 +55,7 @@ type Response struct {
 	Paused    bool       `json:"paused,omitempty"`
 }
 
-// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, tell and message; the desk gets tell; a frontend gets decision, settled, answered, sessions, message, paused and unpaused.
+// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, tell and message; the desk gets tell; a frontend gets decision, settled, answered, sessions, activity, message, paused and unpaused.
 // A message is what session From told session Node through Claude Code's SendMessage. A tell is From's text: the user's when From is empty, or the desk's or the master's.
 // Again marks an event the master took once already, in a turn that was cut short.
 type Event struct {
@@ -68,6 +68,8 @@ type Event struct {
 	Sessions []Session `json:"sessions,omitempty"`
 	Answered *Answered `json:"answered,omitempty"`
 	Again    bool      `json:"again,omitempty"`
+	// Activity is the latest activity of session Node, in an activity event.
+	Activity *Activity `json:"activity,omitempty"`
 
 	// sent is when the user sent a tell to the desk, which may hand it over only after an answer it proposed since.
 	sent time.Time
@@ -142,6 +144,8 @@ type Session struct {
 	// Plugins and Connectors are what the parent added to the worker's lean start, which each start of it repeats.
 	Plugins    []string `json:"plugins,omitempty"`
 	Connectors bool     `json:"connectors,omitempty"`
+	// Activity is the latest tool call of the session or, with none in its turn, the start of its last message.
+	Activity *Activity `json:"activity,omitempty"`
 	// Socket is the messaging socket of the session's running process, forgotten once the process stops, since another process may take the path.
 	Socket string `json:"socket,omitempty"`
 	// Events holds what waits for a session that runs no next_event until bosun hands it over: the turn ends and exits of a worker's children, or the desk's tells. Taken holds the reports handed to a worker in its current turn.
@@ -162,6 +166,9 @@ type Session struct {
 	held bool
 	// refused is the reason auto mode gave for refusing the session's last call, until a call runs.
 	refused string
+	// actSent is when the frontends last heard of the session's activity, and actTimer the send held back until the window ends.
+	actSent  time.Time
+	actTimer *time.Timer
 }
 
 func socketPath() string {

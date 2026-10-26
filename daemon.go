@@ -725,6 +725,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 			n.pre = map[string]preCall{}
 		}
 		n.pre[in.ToolUseID] = preCall{in.ToolName, compact(in.ToolInput)}
+		d.setActivityLocked(n, activityOf(in.ToolName, in.ToolInput))
 		if reserved.reason != "" {
 			// The master's and the desk's own go to the user, since nobody sits above them.
 			holder := "master"
@@ -811,6 +812,9 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 	case "Stop":
 		n.pre = nil
 		n.LimitedUntil = nil
+		if text := oneLine(in.LastMessage, activityWidth); text != "" {
+			d.setActivityLocked(n, Activity{Text: text})
+		}
 		d.withdrawLocked(node, func(*Decision) bool { return true })
 		switch {
 		case n.Paused && d.paused:

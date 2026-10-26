@@ -92,6 +92,12 @@ func (t *tui) apply(r Response) {
 		t.paused = r.Event.Kind == "paused"
 	case r.Event.Kind == "sessions":
 		t.sessions = r.Event.Sessions
+	case r.Event.Kind == "activity":
+		for i := range t.sessions {
+			if t.sessions[i].Node == r.Event.Node {
+				t.sessions[i].Activity = r.Event.Activity
+			}
+		}
 	case r.Event.Kind == "message":
 		t.messages = append(t.messages, *r.Event)
 		t.messages = t.messages[max(0, len(t.messages)-keptMessages):]
@@ -226,6 +232,9 @@ func (t *tui) render(width, height int) []string {
 		}
 		s := it.session
 		add("", fmt.Sprintf("  %s%-*s %-8s %-15s %s", strings.Repeat("  ", it.depth), max(1, 14-2*it.depth), s.Node, s.ID, sessionState(*s), modelLabel(*s)), i == t.sel)
+		if line := activityLine(s.Activity); line != "" {
+			add(dim, "    "+strings.Repeat("  ", it.depth)+line, false)
+		}
 	}
 	if len(t.answered) > 0 {
 		add("", "", false)

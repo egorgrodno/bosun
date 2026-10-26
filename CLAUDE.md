@@ -229,12 +229,14 @@ In the snapshot and the `sessions` event, the desk is the session whose `node` i
 
 Each session carries `model` and `effort`, both omitted where the session runs at the user's default. `effort` is one of `low`, `medium`, `high`, `xhigh` and `max`, and only workers have one. A session's `retired` lists the ids it had before a switch, and a frontend ignores it. `spawn` takes `model` and `effort`, and a frontend shows each as `model effort`.
 
+A session's `activity` shows what it does: `tool` with `arg`, the main argument of its latest tool call, or `text`, the start of its last assistant message when that came after the last call. `at` is when it changed. `arg` and `text` are one line of at most 200 characters. The daemon sends `tool` and `arg` apart, since each frontend picks a glyph from the tool's name. It reads them from `PreToolUse` and `Stop`. The snapshot and the `sessions` event carry each session's latest `activity`. An `activity` event, with `node` and `activity`, tells one change alone. The daemon sends a change at once if none went out within 500 ms, and otherwise holds it to the end of that window and sends the latest, so a burst of tool calls sends at most two events a second. A frontend ignores an event it does not know.
+
 - `tell` goes to the desk, or to the master when there is no desk, and its result does not say which. During a pause it waits for `unpause`.
 - `transcript` takes a node `name` and an optional `turns`, 3 by default, and returns that session's last turns in `text`.
 - `attach` clears a stale desk first, which can take most of a minute. A frontend must wait that long for the answer before it runs `claude attach`.
 - `attached` takes the `id` that `claude attach` runs on. A frontend sends it on a connection of its own and closes that connection once `claude attach` exits. The master's id holds without an answer until then, and any other gets an answer at once.
 
-Each leads with the queue of decisions waiting on you, above the tree. The desk is its own row above the master's tree.
+Each leads with the queue of decisions waiting on you, above the tree. The desk is its own row above the master's tree. Under each session's row, `bosun tui` and `bosun status` show its activity as the tool, a space and the argument, or as the text.
 
 - **Quickshell panel.** It lives in the NixOS configuration's `modules/quickshell/`, as the `Agents` bar module and `BosunPanel`, and reads the protocol through `bosun watch`. Opening a session runs `bosun attach <id>` in a new kitty window. `quickshell ipc call bosun toggle` opens it.
 - **`bosun tui`.** Opening a session runs `claude attach` in the TUI's terminal. `Ctrl+Z` exits `claude attach` with status 0, leaving the session running.
