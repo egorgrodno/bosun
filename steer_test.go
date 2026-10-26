@@ -20,10 +20,14 @@ const testKey = "0123456789abcdef0123456789abcdef"
 
 // controlFake answers the supervisor's control protocol as Claude Code 2.1.310 does, for the ops bosun sends.
 type controlFake struct {
-	mu    sync.Mutex
-	reqs  []map[string]any
+	mu   sync.Mutex
+	reqs []map[string]any
+	// keys holds by short id what each attach typed into the session's terminal.
+	keys  map[string]string
 	proto int
 	key   string
+	// onKeys runs once an attach to short closes, having typed keys.
+	onKeys func(short, keys string)
 }
 
 // fakeControl serves a fake supervisor for d, with the control key in Claude Code's config directory.
@@ -36,7 +40,7 @@ func fakeControl(t *testing.T, d *daemon) *controlFake {
 	if err := os.WriteFile(filepath.Join(dir, "control.key"), []byte(testKey+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	s := &controlFake{proto: 1, key: testKey}
+	s := &controlFake{proto: 1, key: testKey, keys: map[string]string{}}
 	sock := fmt.Sprintf("@bosun-control-%d-%s", os.Getpid(), t.Name())
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
@@ -53,6 +57,9 @@ func fakeControl(t *testing.T, d *daemon) *controlFake {
 		}
 	}()
 	useFakeSocket(t, sock)
+	settle := keysSettle
+	keysSettle = 10 * time.Millisecond
+	t.Cleanup(func() { keysSettle = settle })
 	return s
 }
 
@@ -84,9 +91,21 @@ func (s *controlFake) handle(conn net.Conn) {
 		answer(map[string]any{"ok": false, "error": fmt.Sprintf("%s rejected: the presented daemon control key %v doesn't match", req["op"], req["auth"]), "code": "EAUTH"})
 		return
 	}
+	short, _ := req["short"].(string)
 	switch req["op"] {
 	case "reply":
 		answer(map[string]any{"ok": true, "op": "reply"})
+	case "attach":
+		answer(map[string]any{"ok": true, "op": "attach", "tempo": "active"})
+		_, _ = conn.Write([]byte("\x1b[?25l terminal output"))
+		typed, _ := io.ReadAll(r)
+		s.mu.Lock()
+		s.keys[short] += string(typed)
+		on := s.onKeys
+		s.mu.Unlock()
+		if on != nil {
+			on(short, string(typed))
+		}
 	default:
 		answer(map[string]any{"ok": false, "error": "unknown op", "code": "EUNKNOWN"})
 	}
@@ -107,6 +126,12 @@ func (s *controlFake) last() map[string]any {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.reqs[len(s.reqs)-1]
+}
+
+func (s *controlFake) typed(short string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keys[short]
 }
 
 // setNeeds writes what the dialog of session id asks, as Claude Code's job state holds it.
@@ -154,17 +179,18 @@ func TestSteeringRefusesSessions(t *testing.T) {
 	for _, node := range []string{masterNode, deskNode, "a"} {
 		for _, r := range []Request{
 			{Op: "say", Node: node, Name: "a", Text: "hi"},
+			{Op: "interrupt", Node: node, Name: "a"},
 		} {
 			if _, err := call(context.Background(), r); err == nil {
 				t.Fatalf("%s from %s went through", r.Op, node)
 			}
 		}
 		for _, tool := range tools(node) {
-			if tool.Name == "say" {
+			if tool.Name == "say" || tool.Name == "interrupt" {
 				t.Fatalf("%s has the tool %s", node, tool.Name)
 			}
 		}
-		for _, name := range []string{"say"} {
+		for _, name := range []string{"say", "interrupt"} {
 			args := json.RawMessage(`{"name":"a","text":"hi"}`)
 			if _, err := newMCPServer(node, io.Discard).run(context.Background(), name, args); err == nil {
 				t.Fatalf("%s's MCP server ran %s", node, name)
@@ -174,7 +200,7 @@ func TestSteeringRefusesSessions(t *testing.T) {
 	if ops := sup.ops(); len(ops) != 0 {
 		t.Fatalf("the supervisor got %v", ops)
 	}
-	if n := len(logOf(d, "say")); n != 0 {
+	if n := len(logOf(d, "say")) + len(logOf(d, "interrupt")); n != 0 {
 		t.Fatalf("%d uses logged", n)
 	}
 }
@@ -183,7 +209,7 @@ func TestSteeringRefusesSessions(t *testing.T) {
 func TestSteeringRefusesOtherSessions(t *testing.T) {
 	_, fc, sup := steerDaemon(t, "busy")
 	fc.add(agent{ID: "eeeeeeee", SessionID: "s-e", Name: "stranger", Status: "busy"})
-	for _, r := range []Request{{Op: "say", Name: "stranger", Text: "hi"}, {Op: "say", Name: "eeeeeeee", Text: "hi"}} {
+	for _, r := range []Request{{Op: "say", Name: "stranger", Text: "hi"}, {Op: "interrupt", Name: "stranger"}, {Op: "say", Name: "eeeeeeee", Text: "hi"}} {
 		if _, err := call(context.Background(), r); err == nil {
 			t.Fatalf("%s to %s went through", r.Op, r.Name)
 		}
@@ -248,7 +274,7 @@ func TestSayRefuses(t *testing.T) {
 	d.mu.Lock()
 	d.nodes["a"].Killed = true
 	d.mu.Unlock()
-	for _, r := range []Request{{Op: "say", Name: "a", Text: "hi"}} {
+	for _, r := range []Request{{Op: "say", Name: "a", Text: "hi"}, {Op: "interrupt", Name: "a"}} {
 		if _, err := call(context.Background(), r); err == nil || !strings.Contains(err.Error(), "stopped") {
 			t.Fatalf("%s to a killed worker: %v", r.Op, err)
 		}
@@ -313,6 +339,80 @@ func TestSayFallsBack(t *testing.T) {
 				texts = append(texts, e.Error)
 			}
 			assertKeyKept(t, d, append(texts, resp.Text)...)
+		})
+	}
+}
+
+func TestInterrupt(t *testing.T) {
+	d, fc, sup := steerDaemon(t, "busy")
+	sup.onKeys = func(short, keys string) {
+		if keys == "\x1b" {
+			fc.setStatus(short, "idle")
+		}
+	}
+	resp := mustCall(t, Request{Op: "interrupt", Name: "a"})
+	if got := sup.typed("aaaaaaaa"); got != "\x1b" {
+		t.Fatalf("typed %q", got)
+	}
+	attach := sup.last()
+	if attach["op"] != "attach" || attach["short"] != "aaaaaaaa" || attach["auth"] != testKey || attach["cols"] == nil || attach["rows"] == nil {
+		t.Fatalf("attach = %v", attach)
+	}
+	if len(fc.stops) != 0 {
+		t.Fatalf("stopped %v", fc.stops)
+	}
+	evs := masterEvents(d)
+	if len(evs) != 1 || evs[0].Kind != "turn_end" || evs[0].Text != "The user interrupted its turn." {
+		t.Fatalf("the master got %+v", evs)
+	}
+	if logged := logOf(d, "interrupt"); len(logged) != 1 || logged[0].Via != "supervisor" || logged[0].Node != "a" || logged[0].By != "user" {
+		t.Fatalf("logged %+v", logged)
+	}
+	// The poll finds the worker idle, and reports no second turn end.
+	d.poll()
+	if evs := masterEvents(d); len(evs) != 1 {
+		t.Fatalf("the master got %+v", evs)
+	}
+	if _, err := call(context.Background(), Request{Op: "interrupt", Name: "a"}); err == nil {
+		t.Fatal("interrupted an idle worker")
+	}
+	assertKeyKept(t, d, resp.Text)
+}
+
+// Without a supervisor to take the Esc, or when the Esc ends no turn, an interrupt stops the session and resumes it idle.
+func TestInterruptFallsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		ops  string
+	}{
+		{"no supervisor", ""},
+		{"no turn ended", "ping attach"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d, fc, sup := steerDaemon(t, "busy")
+			wait := interruptWait
+			interruptWait = 100 * time.Millisecond
+			t.Cleanup(func() { interruptWait = wait })
+			if tc.ops == "" {
+				useFakeSocket(t, "")
+			}
+			mustCall(t, Request{Op: "interrupt", Name: "a"})
+			if got := strings.Join(sup.ops(), " "); got != tc.ops {
+				t.Fatalf("the supervisor got %q", got)
+			}
+			if len(fc.stops) != 1 || strings.Join(fc.lastStart(), " ") != "--bg --resume s-a" {
+				t.Fatalf("stops %v, last start %v", fc.stops, fc.lastStart())
+			}
+			if evs := masterEvents(d); len(evs) != 1 || evs[0].Kind != "turn_end" {
+				t.Fatalf("the master got %+v", evs)
+			}
+			logged := logOf(d, "interrupt")
+			if last := logged[len(logged)-1]; last.Via != "resume" || last.Error != "" {
+				t.Fatalf("logged %+v", logged)
+			}
+			if tc.ops != "" && (len(logged) != 2 || logged[0].Via != "supervisor" || logged[0].Error == "") {
+				t.Fatalf("logged %+v", logged)
+			}
 		})
 	}
 }

@@ -663,6 +663,8 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 		err = d.tell(r.Node, r.Text)
 	case "say":
 		resp.Text, err = d.say(ctx, r.Node, r.Name, r.Text)
+	case "interrupt":
+		resp.Text, err = d.interrupt(ctx, r.Node, r.Name)
 	case "transcript":
 		resp.Text, err = d.transcript(r.Name, r.Turns)
 	case "spawn":

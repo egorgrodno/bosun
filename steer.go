@@ -16,6 +16,9 @@ import (
 // errFrontendOnly refuses a session's request for what only the user may do from a frontend, since it uses Claude Code's control key.
 var errFrontendOnly = errors.New("only the user steers a session, from a frontend")
 
+// interruptWait bounds how long an Esc has to end a turn before the interrupt stops and resumes the session instead.
+var interruptWait = 10 * time.Second
+
 // refusedCommands change what the daemon records of a session: /model its model, which bosun model and resume switch, and /clear its session id.
 var refusedCommands = []string{"/model", "/clear"}
 
@@ -156,6 +159,86 @@ func (d *daemon) say(ctx context.Context, caller, name, text string) (string, er
 	}
 	d.interruptedLocked(n, "The user cut its turn short with a message of their own, which began a new turn.", true)
 	return fmt.Sprintf("Cut %s's turn short and resumed it with the text, since %v.", name, why), nil
+}
+
+// interrupt ends session name's turn, as Esc in its terminal does, and leaves it idle. Without the supervisor, or when the Esc ends no turn, bosun stops the session and resumes it idle.
+// No Stop runs either way, so the session's parent hears of the turn's end from bosun.
+func (d *daemon) interrupt(ctx context.Context, caller, name string) (string, error) {
+	if caller != "" {
+		return "", errFrontendOnly
+	}
+	unlock := d.lockSession(name)
+	defer unlock()
+	n, id, dir, err := d.steerable(name)
+	if err != nil {
+		return "", err
+	}
+	_, a, err := d.listed(id)
+	switch {
+	case err != nil:
+		return "", err
+	case a.Status == "":
+		return "", fmt.Errorf("%s has stopped, so it runs no turn", name)
+	case a.Status == "idle":
+		return "", fmt.Errorf("%s is not in its turn", name)
+	}
+	// Held, the session is off the poll, which would report the turn's end too.
+	if err := d.hold(n, id); err != nil {
+		return "", err
+	}
+	defer d.release(n)
+	c, err := newControl(ctx)
+	if err == nil {
+		err = c.keys(id, "\x1b")
+		if err == nil {
+			err = d.awaitStatus(ctx, id, "idle", interruptWait)
+		}
+		d.mu.Lock()
+		d.logUseLocked(Entry{Kind: "interrupt", Node: name, Via: "supervisor"}, err)
+		if err == nil {
+			d.interruptedLocked(n, "The user interrupted its turn.", false)
+		}
+		d.mu.Unlock()
+		if err == nil {
+			return fmt.Sprintf("Interrupted %s's turn.", name), nil
+		}
+	}
+	if !errors.Is(err, errNoControl) {
+		return "", err
+	}
+	log.Printf("interrupting %s: %v, so bosun stops and resumes it", name, err)
+	why := err
+	err = d.resumeHeld(ctx, n, id, dir, "")
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.logUseLocked(Entry{Kind: "interrupt", Node: name, Via: "resume"}, err)
+	if err != nil {
+		return "", err
+	}
+	d.interruptedLocked(n, "The user interrupted its turn.", false)
+	return fmt.Sprintf("Interrupted %s's turn by stopping and resuming it, since %v.", name, why), nil
+}
+
+// awaitStatus waits up to wait for Claude Code to list session id with status.
+func (d *daemon) awaitStatus(ctx context.Context, id, status string, wait time.Duration) error {
+	deadline := time.Now().Add(wait)
+	for {
+		agents, err := d.claude.Agents()
+		if err != nil {
+			return err
+		}
+		if i := slices.IndexFunc(agents, func(a agent) bool { return a.ID == id }); i >= 0 && agents[i].Status == status {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%w: the session is not %s %v after an Esc", errNoControl, status, wait)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
 }
 
 // resumeWith holds n, still session id, for resumeHeld.

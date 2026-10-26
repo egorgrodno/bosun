@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -16,8 +17,17 @@ import (
 // errNoControl wraps every reason the supervisor protocol is not as bosun knows it, on which an action falls back to stopping and resuming the session.
 var errNoControl = errors.New("the supervisor's protocol is not the one bosun speaks")
 
-// controlWait bounds each exchange with the supervisor.
-var controlWait = 5 * time.Second
+// controlWait bounds each exchange with the supervisor, and keysSettle how long an attach stays open after its keys, since a lone Esc reads as a key only once no more bytes follow it.
+var (
+	controlWait = 5 * time.Second
+	keysSettle  = 500 * time.Millisecond
+)
+
+// The size an attach reports for its terminal, which the supervisor requires.
+const (
+	attachCols = 120
+	attachRows = 40
+)
 
 // controlKey reads the key that Claude Code's supervisor takes as auth from a client acting as the user.
 // The user allowed only the daemon to read it, and only for an action the user takes from a frontend on one of bosun's own sessions. It must reach no session, frontend, log or error.
@@ -65,7 +75,7 @@ func newControl(ctx context.Context) (*control, error) {
 	return &control{key: key}, nil
 }
 
-// send sends req and reads the line the supervisor answers, leaving the connection open for what follows.
+// send sends req and reads the line the supervisor answers, leaving the connection open for what follows an attach.
 func (c *control) send(req map[string]any) (net.Conn, controlReply, error) {
 	var r controlReply
 	ctx, cancel := context.WithTimeout(context.Background(), controlWait)
@@ -107,5 +117,24 @@ func (c *control) reply(short, text string) error {
 	if !r.OK || r.Op != "reply" {
 		return c.refusal("the reply", r)
 	}
+	return nil
+}
+
+// keys presses keys in session short's terminal, through an attach that turns the connection into the terminal once the supervisor answers.
+func (c *control) keys(short, keys string) error {
+	conn, r, err := c.send(map[string]any{"proto": supervisorProto, "op": "attach", "short": short, "auth": c.key, "cols": attachCols, "rows": attachRows})
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	if !r.OK || r.Op != "attach" {
+		return c.refusal("the attach", r)
+	}
+	// The supervisor drops an attacher whose output it cannot write.
+	go func() { _, _ = io.Copy(io.Discard, conn) }()
+	if _, err := conn.Write([]byte(keys)); err != nil {
+		return fmt.Errorf("pressing keys in %s's terminal failed: %w", short, err)
+	}
+	time.Sleep(keysSettle)
 	return nil
 }

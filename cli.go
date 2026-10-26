@@ -122,7 +122,7 @@ func runCommand(cmd string, args []string) error {
 		_ = flags.Parse(args)
 		req.Model, req.Effort, args = *model, *effort, flags.Args()
 	}
-	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "say": 2}[cmd]
+	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "say": 2, "interrupt": 1}[cmd]
 	if len(args) < need {
 		return errors.New(usage)
 	}
@@ -135,7 +135,7 @@ func runCommand(cmd string, args []string) error {
 		req.Text = strings.Join(args, " ")
 	case "spawn":
 		req.Name, req.Repo, req.Text = args[0], args[1], strings.Join(args[2:], " ")
-	case "kill":
+	case "kill", "interrupt":
 		req.Name = args[0]
 	case "say":
 		req.Name, req.Text = args[0], strings.Join(args[1:], " ")
@@ -350,6 +350,8 @@ func logLine(e Entry) string {
 		what = fmt.Sprintf("switched %s to %s", e.Node, modelLabel(Session{Model: e.Model, Effort: e.Effort}))
 	case "say":
 		what = with("→ " + e.Node)
+	case "interrupt":
+		what = "interrupted " + e.Node + "'s turn"
 	case "turn_end":
 		what = with("ended its turn")
 	case "exit":
