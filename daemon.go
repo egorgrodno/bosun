@@ -112,6 +112,9 @@ type daemon struct {
 	watchers  map[*watcher]bool
 	// messages holds the latest messages between sessions, for a frontend's snapshot.
 	messages []Event
+	// logged holds the fleet's latest log entries, and logSeq the Seq of the last.
+	logged []Entry
+	logSeq int
 	// said is the user's latest message to the desk, typed into it or told through bosun, and saidBefore when the one before it came.
 	said       userMessage
 	saidBefore time.Time
@@ -336,6 +339,9 @@ func linkExe(dir, exe string) (string, error) {
 // load adopts the sessions, events and decisions of an earlier run, and rewrites the sessions' settings for this build, which each reads when its process next starts.
 // The first poll then reports each turn that ended or stopped while no daemon ran.
 func (d *daemon) load() error {
+	if err := d.loadLog(); err != nil {
+		log.Printf("log.jsonl: %v", err)
+	}
 	data, err := os.ReadFile(filepath.Join(d.stateDir, "state.json"))
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -726,7 +732,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 		}
 	case "PreToolUse":
 		// A permission still open from an earlier call was denied in the session's own prompt, which runs no tool.
-		d.withdrawLocked(node, func(dec *Decision) bool { return dec.toolUseID != in.ToolUseID })
+		d.withdrawLocked(node, func(dec *Decision) bool { return dec.toolUseID != in.ToolUseID }, outcome{by: "session", behavior: "deny", cause: node + " moved past the call"})
 		if n.pre == nil {
 			n.pre = map[string]preCall{}
 		}
@@ -782,11 +788,11 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 	case "PostToolUse", "PostToolUseFailure":
 		n.refused = ""
 		delete(n.pre, in.ToolUseID)
-		d.withdrawLocked(node, func(dec *Decision) bool { return dec.toolUseID == in.ToolUseID })
+		d.withdrawLocked(node, func(dec *Decision) bool { return dec.toolUseID == in.ToolUseID }, outcome{by: "session", behavior: "allow", cause: node + " moved past the call"})
 	case "StopFailure":
 		// The turn ended on an API error, and Stop does not run.
 		n.pre = nil
-		d.withdrawLocked(node, func(*Decision) bool { return true })
+		d.withdrawLocked(node, func(*Decision) bool { return true }, outcome{by: "bosun", cause: node + "'s turn failed on an API error"})
 		if node == masterNode {
 			n.Turn = false
 			d.requeueLocked()
@@ -821,7 +827,11 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 		if text := oneLine(in.LastMessage, activityWidth); text != "" {
 			d.setActivityLocked(n, Activity{Text: text})
 		}
-		d.withdrawLocked(node, func(*Decision) bool { return true })
+		o := outcome{by: "session", behavior: "deny"}
+		if n.Killed || n.Paused && d.paused {
+			o = outcome{by: "bosun", cause: d.goneLocked(node)}
+		}
+		d.withdrawLocked(node, func(*Decision) bool { return true }, o)
 		switch {
 		case n.Paused && d.paused:
 			// The pause stopped the session in its turn, which unpausing resumes.
@@ -1064,6 +1074,15 @@ func (d *daemon) openLocked(dec *Decision) {
 	d.broadcastLocked(Event{Kind: "decision", Decision: &c})
 	if dec.Holder == "master" {
 		d.pushLocked(Event{Kind: "decision", Decision: &c})
+	} else {
+		e := Entry{Kind: "decision", By: "bosun", From: dec.from, Node: dec.Node, Decision: &c}
+		if dec.Kind != "notice" {
+			e.From = dec.Node
+		}
+		if e.From != "" {
+			e.By = role(e.From)
+		}
+		d.logLocked(e)
 	}
 	log.Printf("decision %s: %s from %s, for the %s", dec.ID, dec.Kind, dec.Node, dec.Holder)
 }
@@ -1089,24 +1108,25 @@ func (d *daemon) wait(ctx context.Context, dec *Decision) (answer, bool) {
 		if n := d.nodes[dec.Node]; n != nil {
 			id = n.ID
 		}
-		d.promptLocked(dec, fmt.Sprintf("%s has waited for permission to run %s as long as bosun can hold a permission, so only its own prompt can answer it now: bosun attach %s", dec.Node, describe(*dec), id))
+		d.promptLocked(dec, fmt.Sprintf("%s has waited for permission to run %s as long as bosun can hold a permission, so only its own prompt can answer it now: bosun attach %s", dec.Node, describe(*dec), id), "bosun could hold it no longer, which left it to "+dec.Node+"'s own prompt")
 		return answer{}, false
 	case <-ctx.Done():
 		d.mu.Lock()
 		if d.decisions[dec.ID] == dec {
-			d.settleLocked(dec, answer{withdrawn: true})
+			d.settleLocked(dec, answer{withdrawn: true}, outcome{by: "bosun", cause: d.goneLocked(dec.Node)})
 		}
 		d.mu.Unlock()
 		return answer{}, false
 	}
 }
 
-func (d *daemon) settleLocked(dec *Decision, a answer) {
+func (d *daemon) settleLocked(dec *Decision, a answer, o outcome) {
 	delete(d.decisions, dec.ID)
 	delete(d.proposed, dec.ID)
 	dec.answer <- a
 	d.saveLocked()
 	d.broadcastLocked(Event{Kind: "settled", ID: dec.ID})
+	d.logLocked(settledEntry(dec, a, o))
 	switch {
 	case a.withdrawn:
 		log.Printf("decision %s: withdrawn", dec.ID)
@@ -1117,18 +1137,31 @@ func (d *daemon) settleLocked(dec *Decision, a answer) {
 	}
 }
 
+// goneLocked is why a decision of node's lost the request that waited on it, completing "withdrawn when …".
+func (d *daemon) goneLocked(node string) string {
+	n := d.nodes[node]
+	switch {
+	case n != nil && n.Killed:
+		return "the user stopped " + node
+	case n != nil && (n.Paused || d.paused):
+		return "the pause stopped " + node
+	}
+	return node + " stopped waiting for it"
+}
+
 // withdrawLocked settles the node's open permissions that match, except reserved ones, whose hook still blocks the call, and the notices that match of a permission waiting in the node's own prompt.
-func (d *daemon) withdrawLocked(node string, match func(*Decision) bool) {
+// o says how, for the log.
+func (d *daemon) withdrawLocked(node string, match func(*Decision) bool, o outcome) {
 	for _, dec := range d.decisions {
 		if dec.Node == node && (dec.Kind == "permission" && dec.Reserved == "" || dec.prompt) && match(dec) {
-			d.settleLocked(dec, answer{withdrawn: true})
+			d.settleLocked(dec, answer{withdrawn: true}, o)
 		}
 	}
 }
 
-// promptLocked settles permission dec, whose hook can no longer answer it, and opens in its place a notice for the user, with note, until the session moves on.
-func (d *daemon) promptLocked(dec *Decision, note string) {
-	d.settleLocked(dec, answer{withdrawn: true})
+// promptLocked settles permission dec, whose hook can no longer answer it, for cause, and opens in its place a notice for the user, with note, until the session moves on.
+func (d *daemon) promptLocked(dec *Decision, note, cause string) {
+	d.settleLocked(dec, answer{withdrawn: true}, outcome{by: "bosun", cause: cause})
 	d.openLocked(&Decision{Kind: "notice", Node: dec.Node, Holder: "user", Note: note, toolUseID: dec.toolUseID, prompt: true})
 }
 
@@ -1146,9 +1179,9 @@ func (d *daemon) expireOrphans(now time.Time) {
 		switch {
 		case d.decisions[id] != dec:
 		case dec.Kind == "permission" && dec.Reserved == "" && n != nil && n.Status == "waiting":
-			d.promptLocked(dec, fmt.Sprintf("bosun restarted while %s waited for permission to run %s, and the request did not come back, so only its own prompt can answer it now: bosun attach %s", dec.Node, describe(*dec), n.ID))
+			d.promptLocked(dec, fmt.Sprintf("bosun restarted while %s waited for permission to run %s, and the request did not come back, so only its own prompt can answer it now: bosun attach %s", dec.Node, describe(*dec), n.ID), "bosun restarted and the request did not come back, which left it to "+dec.Node+"'s own prompt")
 		default:
-			d.settleLocked(dec, answer{withdrawn: true})
+			d.settleLocked(dec, answer{withdrawn: true}, outcome{by: "bosun", cause: "bosun restarted and the request did not come back"})
 		}
 	}
 }
@@ -1180,7 +1213,7 @@ func (d *daemon) answer(caller, id, words, kind string, a answer) (string, error
 	if caller == deskNode {
 		return d.deskAnswerLocked(dec, words, a)
 	}
-	d.settleLocked(dec, a)
+	d.settleLocked(dec, a, outcome{by: role(caller)})
 	return "", nil
 }
 
@@ -1220,7 +1253,7 @@ func (d *daemon) deskAnswerLocked(dec *Decision, words string, a answer) (string
 		d.answered = d.answered[max(0, len(d.answered)-keptMessages):]
 		d.broadcastLocked(Event{Kind: "answered", Answered: &rec})
 		log.Printf("decision %s: the desk answers it on the user's words %q", dec.ID, words)
-		d.settleLocked(dec, a)
+		d.settleLocked(dec, a, outcome{by: deskNode, words: words})
 		return fmt.Sprintf("bosun %s decision %s on the user's word.", given(rec), dec.ID), nil
 	}
 	d.proposed[dec.ID] = proposal{a, time.Now()}
@@ -1294,6 +1327,7 @@ func (d *daemon) escalate(caller, id, note string) error {
 	d.saveLocked()
 	c := *dec
 	d.broadcastLocked(Event{Kind: "decision", Decision: &c})
+	d.logLocked(Entry{Kind: "escalated", By: masterNode, From: masterNode, Node: dec.Node, Decision: &c, Text: note})
 	log.Printf("decision %s: escalated", id)
 	return nil
 }
@@ -1308,7 +1342,7 @@ func (d *daemon) notify(caller, text string) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: text})
+	d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: text, from: masterNode})
 	return nil
 }
 
@@ -1324,20 +1358,26 @@ func (d *daemon) tell(caller, text string) error {
 	if desk != nil && (desk.Status == "exited" || desk.LimitedUntil != nil) {
 		desk = nil
 	}
+	e := Entry{Kind: "tell", By: role(caller), From: caller, Node: masterNode, Text: text}
 	switch {
 	case caller == deskNode:
 		d.pushLocked(Event{Kind: "tell", From: deskNode, Text: text})
 	case caller == masterNode && desk == nil:
-		d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: "The master answers: " + text})
+		// The notice logs it.
+		d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: "The master answers: " + text, from: masterNode})
+		return nil
 	case caller == masterNode:
 		d.queueLocked(desk, Event{Kind: "tell", From: masterNode, Text: text})
+		e.Node = deskNode
 	case caller != "":
 		return errors.New("only the user, the desk and the master tell")
 	case desk == nil:
 		d.pushLocked(Event{Kind: "tell", Text: text})
 	default:
 		d.queueLocked(desk, Event{Kind: "tell", Text: text, sent: time.Now()})
+		e.Node = deskNode
 	}
+	d.logLocked(e)
 	return nil
 }
 
@@ -1404,6 +1444,7 @@ func (d *daemon) messageLocked(ev Event) {
 	d.messages = append(d.messages, ev)
 	d.messages = d.messages[max(0, len(d.messages)-keptMessages):]
 	d.broadcastLocked(ev)
+	d.logLocked(Entry{Kind: "message", By: role(ev.From), From: ev.From, Node: ev.Node, Text: ev.Text})
 	if ev.From != masterNode {
 		d.events = append(d.events, ev)
 		d.saveLocked()
@@ -1432,8 +1473,13 @@ func (d *daemon) pushLocked(ev Event) {
 // A worker parent runs no next_event, so it hears at the end of its turn, or between turns in a new one. A parent the user stopped, or one gone, leaves its children to the master.
 func (d *daemon) reportLocked(ev Event) {
 	var p *Session
-	if n := d.nodes[ev.Node]; n != nil {
+	n := d.nodes[ev.Node]
+	if n != nil {
 		p = d.nodes[n.Parent]
+	}
+	// A kill logs itself.
+	if n == nil || !n.Killed {
+		d.logLocked(Entry{Kind: ev.Kind, By: "worker", From: ev.Node, Node: ev.Node, Text: ev.Text})
 	}
 	if p == nil || p.Node == masterNode || p.Killed || p.Status == "exited" {
 		d.pushLocked(ev)
@@ -1807,6 +1853,7 @@ func (d *daemon) snapshotLocked() Response {
 	}
 	resp.Messages = slices.Clone(d.messages)
 	resp.Answered = slices.Clone(d.answered)
+	resp.Log = slices.Clone(d.logged)
 	slices.SortFunc(resp.Decisions, func(a, b Decision) int {
 		x, _ := strconv.Atoi(a.ID)
 		y, _ := strconv.Atoi(b.ID)
@@ -1817,6 +1864,7 @@ func (d *daemon) snapshotLocked() Response {
 
 // spawn starts a child of caller, or of the master when a frontend asks. A child of the master needs repo; a deeper one branches from its parent's worktree.
 func (d *daemon) spawn(caller, name, repo, model, effort, prompt string, plugins []string, connectors bool) (*Session, error) {
+	spawned := Entry{Kind: "spawned", By: role(caller), From: caller, Node: name, Text: prompt}
 	caller = cmp.Or(caller, masterNode)
 	if caller == deskNode {
 		return nil, errors.New("the desk starts no sessions: pass the user's instruction to the master with tell_master")
@@ -1898,6 +1946,8 @@ func (d *daemon) spawn(caller, name, repo, model, effort, prompt string, plugins
 	n.ID = id
 	d.saveLocked()
 	d.broadcastSessionsLocked()
+	spawned.Repo, spawned.Model, spawned.Effort = root, n.Model, n.Effort
+	d.logLocked(spawned)
 	log.Printf("spawned %s (%s) under %s", name, id, caller)
 	c := n.public()
 	return &c, nil
@@ -2226,6 +2276,9 @@ func (d *daemon) kill(name string) error {
 	err := d.claude.Stop(id)
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if err == nil {
+		d.logLocked(Entry{Kind: "killed", By: "user", Node: name})
+	}
 	switch {
 	case err != nil:
 		n.Killed = killed
@@ -2250,7 +2303,13 @@ func (d *daemon) merge(ctx context.Context, caller, name string) (string, error)
 	}
 	d.mu.Unlock()
 	if errors.Is(err, errGone) {
-		return d.dropGone(n)
+		text, err := d.dropGone(n)
+		if err == nil {
+			d.mu.Lock()
+			d.logLocked(Entry{Kind: "merged", By: role(caller), From: caller, Node: name, Repo: n.Repo, Text: text})
+			d.mu.Unlock()
+		}
+		return text, err
 	}
 	if err != nil {
 		return "", err
@@ -2287,6 +2346,7 @@ func (d *daemon) merge(ctx context.Context, caller, name string) (string, error)
 	d.dropLocked(name)
 	d.saveLocked()
 	d.broadcastSessionsLocked()
+	d.logLocked(Entry{Kind: "merged", By: role(caller), From: caller, Node: name, Repo: n.Repo, Text: text})
 	log.Printf("merged and removed %s", name)
 	return text, nil
 }
@@ -2486,7 +2546,17 @@ func (d *daemon) resume(ctx context.Context, caller, name, model, effort, prompt
 	if err := checkEffort(effort); err != nil {
 		return err
 	}
-	return d.carryOnAs(ctx, name, prompt, model, effort)
+	if err := d.carryOnAs(ctx, name, prompt, model, effort); err != nil {
+		return err
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e := Entry{Kind: "resumed", By: masterNode, From: masterNode, Node: name, Text: prompt}
+	if n := d.nodes[name]; n != nil {
+		e.Model, e.Effort = n.Model, n.Effort
+	}
+	d.logLocked(e)
+	return nil
 }
 
 // carryOn gives a session that ended its turn, or stopped, a new prompt, which continues its conversation under the same id with its saved options.
@@ -2958,10 +3028,19 @@ func (d *daemon) switchSession(ctx context.Context, node, model, effort string) 
 	case to.Model == n.Model && to.Effort == n.Effort:
 		return fmt.Errorf("the %s already runs at %s", node, modelLabel(to))
 	}
+	var err error
 	if node == deskNode {
-		return d.switchDesk(ctx, to)
+		err = d.switchDesk(ctx, to)
+	} else {
+		err = d.switchMaster(&to)
 	}
-	return d.switchMaster(&to)
+	if err != nil {
+		return err
+	}
+	d.mu.Lock()
+	d.logLocked(Entry{Kind: "model", By: "user", Node: node, Model: to.Model, Effort: to.Effort})
+	d.mu.Unlock()
+	return nil
 }
 
 // switchDesk moves the desk to to's model and effort, waiting for a turn it is in to end. Its tells wait meanwhile, since a desk held by a resume takes none.
@@ -3154,7 +3233,7 @@ func (d *daemon) refresh(byID map[string]agent, listed time.Time) (masterMoved b
 			go d.deliver(n.Node)
 		}
 		if betweenTurns(status) {
-			d.withdrawLocked(n.Node, func(dec *Decision) bool { return dec.prompt })
+			d.withdrawLocked(n.Node, func(dec *Decision) bool { return dec.prompt }, outcome{by: "session", cause: n.Node + " moved past the call"})
 		}
 		// The turn's hooks ran, but not its Stop: the daemon was away, or the user interrupted the turn.
 		missed := n.Turn && betweenTurns(status) && n.turnAt.Before(listed.Add(-turnSettle))

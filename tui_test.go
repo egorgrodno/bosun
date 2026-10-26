@@ -4,6 +4,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func testTUI() *tui {
@@ -96,9 +97,10 @@ func TestTUIApply(t *testing.T) {
 		t.Fatalf("decisions %v", ids)
 	}
 
-	tu.apply(Response{Type: "event", Event: &Event{Kind: "message", Node: "a", From: "b", Text: "b merges first.\nThen rebase."}})
+	at := time.Date(2026, 10, 26, 17, 43, 0, 0, time.Local)
+	tu.apply(Response{Type: "event", Event: &Event{Kind: "log", Entry: &Entry{Seq: 1, At: at, Kind: "message", By: "worker", From: "b", Node: "a", Text: "b merges first.\nThen rebase."}}})
 	screen := strings.Join(tu.render(80, 30), "\n")
-	if !strings.Contains(screen, "b → a: b merges first.") || strings.Contains(screen, "Then rebase") {
+	if !strings.Contains(screen, "Log") || !strings.Contains(screen, "17:43 b            → a: b merges first.") || strings.Contains(screen, "Then rebase") {
 		t.Fatalf("the screen shows the message as:\n%s", screen)
 	}
 

@@ -17,7 +17,7 @@ By default the daemon runs the master in `~/.local/state/bosun/master`, and the 
 ```sh
 bosun daemon &
 bosun tell 'Fix the flaky test in ~/Projects/app'
-bosun status      # the decisions waiting, then the tree
+bosun status      # the decisions waiting, the tree, then the log
 bosun tui         # the same, live, to answer them and attach to a session
 bosun approve 3
 bosun attach <id>

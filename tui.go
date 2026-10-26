@@ -22,7 +22,7 @@ import (
 type tui struct {
 	sessions  []Session
 	decisions []Decision
-	messages  []Event
+	log       []Entry
 	answered  []Answered
 	paused    bool
 	connected bool
@@ -87,7 +87,7 @@ func (t *tui) selected() tuiItem {
 func (t *tui) apply(r Response) {
 	switch {
 	case r.Type == "snapshot":
-		t.sessions, t.decisions, t.messages, t.answered, t.paused, t.connected = r.Sessions, r.Decisions, r.Messages, r.Answered, r.Paused, true
+		t.sessions, t.decisions, t.log, t.answered, t.paused, t.connected = r.Sessions, r.Decisions, r.Log, r.Answered, r.Paused, true
 	case r.Event == nil:
 	case r.Event.Kind == "paused", r.Event.Kind == "unpaused":
 		t.paused = r.Event.Kind == "paused"
@@ -99,9 +99,9 @@ func (t *tui) apply(r Response) {
 				t.sessions[i].Activity = r.Event.Activity
 			}
 		}
-	case r.Event.Kind == "message":
-		t.messages = append(t.messages, *r.Event)
-		t.messages = t.messages[max(0, len(t.messages)-keptMessages):]
+	case r.Event.Kind == "log" && r.Event.Entry != nil:
+		t.log = append(t.log, *r.Event.Entry)
+		t.log = t.log[max(0, len(t.log)-shownLog):]
 	case r.Event.Kind == "answered" && r.Event.Answered != nil:
 		t.answered = append(t.answered, *r.Event.Answered)
 		t.answered = t.answered[max(0, len(t.answered)-keptMessages):]
@@ -250,12 +250,12 @@ func (t *tui) render(width, height int) []string {
 	for _, a := range t.answered {
 		add("", fmt.Sprintf("  %-4s %-14s %s", a.Decision.ID, a.Decision.Node, answeredLine(a)), false)
 	}
-	if len(t.messages) > 0 {
+	if len(t.log) > 0 {
 		add("", "", false)
-		add(dim, "Messages", false)
+		add(dim, "Log", false)
 	}
-	for _, m := range t.messages {
-		add("", "  "+messageLine(m), false)
+	for _, e := range t.log[max(0, len(t.log)-shownLog):] {
+		add("", "  "+logLine(e), false)
 	}
 
 	var foot []string

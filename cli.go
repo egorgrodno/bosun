@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -222,13 +223,16 @@ func printStatus(w io.Writer, s Response) {
 		}
 	}
 	walk("", 0)
-	if len(s.Messages) > 0 {
-		fmt.Fprintln(w, "Messages:")
+	if len(s.Log) > 0 {
+		fmt.Fprintln(w, "Log:")
 	}
-	for _, m := range s.Messages {
-		fmt.Fprintf(w, "  %s\n", clip(messageLine(m), 120))
+	for _, e := range s.Log[max(0, len(s.Log)-shownLog):] {
+		fmt.Fprintf(w, "  %s\n", clip(logLine(e), 120))
 	}
 }
+
+// shownLog is how many of the log's latest entries bosun status and bosun tui show.
+const shownLog = 10
 
 // modelLabel is how a frontend shows the model and effort that session n runs at, each blank where it is the user's default.
 func modelLabel(n Session) string {
@@ -250,10 +254,94 @@ func sessionState(n Session) string {
 	return n.Status
 }
 
-// messageLine shows the first line of a message between sessions.
-func messageLine(m Event) string {
-	text, _, _ := strings.Cut(m.Text, "\n")
-	return fmt.Sprintf("%s → %s: %s", m.From, m.Node, text)
+// logLine shows a log entry on one line: its time, who acted and what they did.
+func logLine(e Entry) string {
+	who := cmp.Or(e.From, e.By)
+	if who == "user" {
+		who = "you"
+	}
+	first, _, _ := strings.Cut(e.Text, "\n")
+	with := func(s string) string {
+		if first == "" {
+			return s
+		}
+		return s + ": " + first
+	}
+	var what string
+	switch e.Kind {
+	case "settled":
+		what = settledLine(e)
+	case "decision":
+		what = "waits on you"
+		if e.Decision != nil {
+			what = fmt.Sprintf("%s %s, waiting on you", e.Decision.ID, describe(*e.Decision))
+			if e.Decision.Kind == "notice" {
+				what = fmt.Sprintf("notice %s: %s", e.Decision.ID, strings.SplitN(e.Decision.Note, "\n", 2)[0])
+			}
+		}
+	case "escalated":
+		id := ""
+		if e.Decision != nil {
+			id = e.Decision.ID + " "
+		}
+		what = with(fmt.Sprintf("passed %s's decision %sto you", e.Node, id))
+	case "tell", "message":
+		what = with("→ " + e.Node)
+	case "spawned":
+		what = fmt.Sprintf("spawned %s in %s", e.Node, e.Repo)
+		if l := modelLabel(Session{Model: e.Model, Effort: e.Effort}); l != "" {
+			what += " on " + l
+		}
+		what = with(what)
+	case "merged":
+		what = with("merged " + e.Node)
+	case "resumed":
+		what = with("resumed " + e.Node)
+	case "killed":
+		what = "stopped " + e.Node
+	case "paused":
+		what = "paused the fleet"
+	case "unpaused":
+		what = with("resumed the fleet")
+	case "model":
+		what = fmt.Sprintf("switched %s to %s", e.Node, modelLabel(Session{Model: e.Model, Effort: e.Effort}))
+	case "turn_end":
+		what = with("ended its turn")
+	case "exit":
+		what = with("stopped in its turn")
+	default:
+		what = with(e.Kind)
+	}
+	return fmt.Sprintf("%s %-12s %s", e.At.Local().Format("15:04"), who, what)
+}
+
+// settledLine says how a settled entry's decision was settled.
+func settledLine(e Entry) string {
+	if e.Decision == nil {
+		return "settled a decision"
+	}
+	dec := *e.Decision
+	var s string
+	switch {
+	case e.Withdrawn:
+		return fmt.Sprintf("decision %s withdrawn when %s", dec.ID, e.Cause)
+	case dec.Kind == "notice":
+		return "dismissed notice " + dec.ID
+	case dec.Kind == "question":
+		s = fmt.Sprintf("answered %s's question %s → %s", dec.Node, dec.ID, squash(e.Text))
+	default:
+		s = fmt.Sprintf("%s %s's %s %s", given(Answered{Behavior: e.Behavior}), dec.Node, dec.ID, describe(dec))
+		if e.Text != "" {
+			s += " → " + squash(e.Text)
+		}
+	}
+	switch {
+	case e.By == "session":
+		s += ", in its own prompt"
+	case e.Words != "":
+		s += fmt.Sprintf(", on your words %q", squash(e.Words))
+	}
+	return s
 }
 
 // answeredLine shows what the desk answered on the user's word, and the words it acted on.

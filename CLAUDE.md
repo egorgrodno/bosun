@@ -209,6 +209,8 @@ A worker's parent must hear of every turn of it that ends or stops, unless a pau
 
 **The daemon's state survives a power loss.** `state.json` holds the sessions, the master's queue and the open decisions, and each save syncs it to disk.
 
+**The log outlasts a restart.** The daemon appends each entry to `log.jsonl` in the state directory, without a sync, so a power loss may drop the latest. On start it reads the latest 200 entries. Once the file holds 400 entries, it rewrites the file to those 200. `seq` carries on from the highest it read.
+
 **The desk outlasts a restart.** On start the daemon adopts the desk while Claude Code lists it, and otherwise starts a new one that gets the old one's queue. A desk that cannot start leaves a notice.
 
 **Blocked calls outlast a restart.** While the daemon is away, a hook, `ask`, `next_event` and `attached` send their request again under the same `key`. A hook does so within its own timeout, and the others for 30 seconds after they last reached the daemon. The restarted daemon hands each the decision or batch it waited on, and an escalated decision stays with you. A decision whose request has not come back 30 seconds after the start is settled. If its session still waits in its own prompt, a permission then becomes a notice, as it does a minute before the `timeout`. A call that gives up falls back: a `PreToolUse` denies its call, a `PermissionRequest` leaves it to the session's own prompt, and `ask` and `next_event` fail.
@@ -233,13 +235,33 @@ Each session carries `model` and `effort`, both omitted where the session runs a
 
 A session's `activity` shows what it does: `tool` with `arg`, the main argument of its latest tool call, or `text`, the start of its last assistant message when that came after the last call. `at` is when it changed. `arg` and `text` are one line of at most 200 characters. The daemon sends `tool` and `arg` apart, since each frontend picks a glyph from the tool's name. It reads them from `PreToolUse` and `Stop`. The snapshot and the `sessions` event carry each session's latest `activity`. An `activity` event, with `node` and `activity`, tells one change alone. The daemon sends a change at once if none went out within 500 ms, and otherwise holds it to the end of that window and sends the latest, so a burst of tool calls sends at most two events a second. A frontend ignores an event it does not know.
 
+**The log.** The snapshot's `log` holds the fleet's latest 200 entries, oldest first. A `log` event carries each new one in `entry`. An entry has `seq`, an integer that orders the entries across restarts, `at` and `kind`. `by` is the role that acted: `user`, `master`, `desk`, `worker`, `session` or `bosun`. `from` is the acting session's node, empty for the user and bosun. `node` is the session the entry is about. The snapshot's `messages` and the `message` event repeat the `message` entries.
+
+| `kind` | Means | Also carries |
+|---|---|---|
+| `decision` | a decision or notice began to wait on you | `decision` |
+| `escalated` | the master passed a decision to you | `decision`, `text`: the master's note |
+| `settled` | a decision was settled | `decision`, and `behavior`, `text`, `words` or `withdrawn` with `cause` |
+| `tell` | the user, the desk or the master told `node`, `master` or `desk` | `text` |
+| `message` | session `from` messaged `node` | `text` |
+| `spawned` | the user or a session started worker `node` | `text`: the prompt, `repo`, `model`, `effort` |
+| `resumed` | the master gave worker `node` a new prompt | `text`: the prompt, and the `model` and `effort` it runs at after |
+| `merged` | a session merged worker `node` | `repo`, `text`: what the merge did |
+| `killed` | the user stopped `node` | |
+| `paused` | the user paused the fleet | |
+| `unpaused` | the user resumed the fleet | `text`: which turns resumed |
+| `model` | the user switched the master or the desk | `model`, `effort` |
+| `turn_end`, `exit` | worker `node` ended its turn, or stopped in it, other than by a kill | `text` |
+
+A `decision` entry's `by` is the role of the session that asks, or that sent the notice, and `bosun` for bosun's own notices. A `settled` entry says who settled the decision. `by` is `master`, `user`, `desk` with the quoted `words`, `session` for the session's own prompt, or `bosun`. `behavior` is a permission's `allow` or `deny`, and `text` a denial's message or a question's answer. A dismissed notice carries no `behavior` or `text`. A decision nobody answered carries `withdrawn`, and `cause` ends the sentence "withdrawn when …", such as `the pause stopped worker-a`. An entry's `decision` is the decision as it stood then, with each string of its input cut to 2000 characters and `…`.
+
 - `tell` goes to the desk, or to the master when there is no desk, and its result does not say which. During a pause it waits for `unpause`.
 - `model` switches the master or the desk, as `{"op":"model","name":"desk","model":"opus","effort":"high"}`. `name` is `master` or `desk`, and the master when empty. It needs `model`, `effort` or both, and refuses a switch to what the session runs at already, and any switch during a pause. The result comes once the copy has started, and for a busy desk that can take 30 seconds. The `sessions` event then shows the new `id`, `model` and `effort`.
 - `transcript` takes a node `name` and an optional `turns`, 3 by default, and returns that session's last turns in `text`.
 - `attach` clears a stale desk first, which can take most of a minute. A frontend must wait that long for the answer before it runs `claude attach`.
 - `attached` takes the `id` that `claude attach` runs on. A frontend sends it on a connection of its own and closes that connection once `claude attach` exits. The master's id holds without an answer until then, and any other gets an answer at once.
 
-Each leads with the queue of decisions waiting on you, above the tree. The desk is its own row above the master's tree. Under each session's row, `bosun tui` and `bosun status` show its activity as the tool, a space and the argument, or as the text.
+Each leads with the queue of decisions waiting on you, above the tree. The desk is its own row above the master's tree. Under each session's row, `bosun tui` and `bosun status` show its activity as the tool, a space and the argument, or as the text. Below the tree they show the log's latest 10 entries.
 
 - **Quickshell panel.** It lives in the NixOS configuration's `modules/quickshell/`, as the `Agents` bar module and `BosunPanel`, and reads the protocol through `bosun watch`. Opening a session runs `bosun attach <id>` in a new kitty window. `quickshell ipc call bosun toggle` opens it.
 - **`bosun tui`.** Opening a session runs `claude attach` in the TUI's terminal. `Ctrl+Z` exits `claude attach` with status 0, leaving the session running.

@@ -53,9 +53,11 @@ type Response struct {
 	Messages  []Event    `json:"messages,omitempty"`
 	Answered  []Answered `json:"answered,omitempty"`
 	Paused    bool       `json:"paused,omitempty"`
+	// Log holds the fleet's latest entries, oldest first.
+	Log []Entry `json:"log,omitempty"`
 }
 
-// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, tell and message; the desk gets tell; a frontend gets decision, settled, answered, sessions, activity, message, paused and unpaused.
+// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, tell and message; the desk gets tell; a frontend gets decision, settled, answered, sessions, activity, message, paused, unpaused and log.
 // A message is what session From told session Node through Claude Code's SendMessage. A tell is From's text: the user's when From is empty, or the desk's or the master's.
 // Again marks an event the master took once already, in a turn that was cut short.
 type Event struct {
@@ -67,12 +69,36 @@ type Event struct {
 	Decision *Decision `json:"decision,omitempty"`
 	Sessions []Session `json:"sessions,omitempty"`
 	Answered *Answered `json:"answered,omitempty"`
+	Entry    *Entry    `json:"entry,omitempty"`
 	Again    bool      `json:"again,omitempty"`
 	// Activity is the latest activity of session Node, in an activity event.
 	Activity *Activity `json:"activity,omitempty"`
 
 	// sent is when the user sent a tell to the desk, which may hand it over only after an answer it proposed since.
 	sent time.Time
+}
+
+// Entry is a line of the fleet's log. Seq numbers the entries in order, across restarts of the daemon.
+// By is who acted: user, master, desk, worker, session for a decision's session through its own prompt, or bosun. From names the session that acted, and Node the session the entry is about.
+type Entry struct {
+	Seq  int       `json:"seq"`
+	At   time.Time `json:"at"`
+	Kind string    `json:"kind"`
+	By   string    `json:"by"`
+	From string    `json:"from,omitempty"`
+	Node string    `json:"node,omitempty"`
+	Text string    `json:"text,omitempty"`
+	// Decision is what a decision, escalated or settled entry is about, with each long string of its input cut short.
+	Decision *Decision `json:"decision,omitempty"`
+	// Behavior is a settled permission's answer, allow or deny. Withdrawn marks a decision nobody answered, and Cause completes "withdrawn when …".
+	Behavior  string `json:"behavior,omitempty"`
+	Withdrawn bool   `json:"withdrawn,omitempty"`
+	Cause     string `json:"cause,omitempty"`
+	// Words quotes the user's message that the desk settled a decision on.
+	Words  string `json:"words,omitempty"`
+	Repo   string `json:"repo,omitempty"`
+	Model  string `json:"model,omitempty"`
+	Effort string `json:"effort,omitempty"`
 }
 
 // Answered is a decision the desk answered on the user's word: Behavior is allow or deny for a permission, and Text a denial's message or a question's answer.
@@ -107,6 +133,8 @@ type Decision struct {
 	opened time.Time
 	// prompt marks a notice that a permission waits in its session's own prompt, which the session moving on withdraws.
 	prompt bool
+	// from is the session that sent a notice, for the log, and empty for bosun's own.
+	from   string
 	answer chan answer
 }
 

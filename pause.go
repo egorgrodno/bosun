@@ -25,6 +25,7 @@ func (d *daemon) pause(ctx context.Context) (string, error) {
 		d.paused = true
 		d.saveLocked()
 		d.broadcastLocked(Event{Kind: "paused"})
+		d.logLocked(Entry{Kind: "paused", By: "user"})
 		log.Print("pausing")
 	}
 	d.mu.Unlock()
@@ -185,8 +186,14 @@ func (d *daemon) unpause() (string, error) {
 	if len(resumed) > 0 {
 		text = fmt.Sprintf("Unpaused bosun, and resumed the turns of %s.", strings.Join(resumed, ", "))
 	}
+	var err error
+	logged := text
 	if len(failed) > 0 {
-		return text, fmt.Errorf("resuming some sessions failed: %s", strings.Join(failed, "; "))
+		err = fmt.Errorf("resuming some sessions failed: %s", strings.Join(failed, "; "))
+		logged += " Resuming failed for " + strings.Join(failed, "; ") + "."
 	}
-	return text, nil
+	d.mu.Lock()
+	d.logLocked(Entry{Kind: "unpaused", By: "user", Text: logged})
+	d.mu.Unlock()
+	return text, err
 }
