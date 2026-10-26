@@ -43,7 +43,11 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **Supervisor.** A `claude --bg` that finds no supervisor starts Claude Code's supervisor in its own cgroup. The supervisor runs every background session and exits after the last one. Each session takes the supervisor's cgroup and environment, not those of its own `claude --bg`. So when the daemon starts the supervisor, every session runs in the daemon's cgroup. When a terminal started it, every session takes the terminal's environment, and the daemon queues a notice for you. `claude attach` resumes a stopped session itself, so a frontend sends `attach` first, which resumes the session idle, and runs `claude attach` only once that succeeds.
 
-**Models.** The daemon's `-master-model`, `-desk-model` and `-worker-model` pick the models, and `spawn` can pick one for a worker. `bosun model` switches the master by resuming it with `--model`, and the daemon follows the new id. Workers block on the daemon, not on the master, so they keep running through the switch.
+**Models.** The daemon's `-master-model`, `-desk-model` and `-worker-model` pick the models, and `-worker-effort` a worker's effort. `spawn` can pick a model and an effort for a worker, which `start` passes as `--model` and `--effort`. `bosun model` switches the master by resuming it with `--model`, and the daemon follows the new id. Workers block on the daemon, not on the master, so they keep running through the switch.
+
+**Switching a worker.** `resume` with a model or effort that differs from the worker's moves it to a copy of its conversation under a new id, through `start`, since a resume with a flag copies the session. The daemon stops the old session first, and follows the new id like `switchModel`: the worker's `id` changes, its `sessionId` is read from the listing again, and the old id goes to `retired`. A failed start resumes the old session idle under its own id. The old id stays listed, stopped, since it began the worktree and `claude rm` of it may delete the worktree. `merge` removes the retired ids first, then the current one.
+
+`claude agents --json` reports neither a session's model nor its effort, so the daemon keeps both in `state.json`. A start with `--effort` records it in the session's `respawnFlags` in `~/.claude/jobs/<id>/state.json`, which a flagless resume replays.
 
 **The master runs lean.** Each request carries the system prompt, every tool's description and the listings of skills and MCP servers. The desk talks to you, so the master needs little of that. Its settings turn off the claude.ai connectors and each of the user's plugins. They also deny the built-in tools in `masterDenied`: `Skill`, which carries the skill listing, `Artifact`, `Workflow`, `SendFeedback`, `ScheduleWakeup`, `ReportFindings`, `EnterWorktree` and `AskUserQuestion`. Its start adds `--strict-mcp-config`, which keeps out every MCP server but bosun's. The master keeps Bash, the file tools, `Agent` with its built-in agent types, `ToolSearch`, `ListAgents`, `SendMessage`, `TaskStop`, `Monitor`, `WebFetch` and `WebSearch`. The desk and the workers keep everything. A probe measured a fresh session at 62.7k tokens with all of it and 17.7k without. `--disable-slash-commands` would also drop the skill listing, but it makes `/clear` an unknown command.
 
@@ -128,7 +132,7 @@ In the normal flow, auto mode decides a call outside the sandbox alone. The sett
 | `next_event` | master | blocks until a worker asks or needs a permission, a child of the master ends a turn or exits, or a `tell` comes from the desk, or from a frontend when there is no desk |
 | `reply` | master | answers a question |
 | `decide` | master | allows or denies a permission |
-| `resume` | master | gives a worker that ended its turn, or stopped in it, a new prompt |
+| `resume` | master | gives a worker that ended its turn, or stopped in it, a new prompt, and optionally a new model or effort |
 | `escalate` | master | queues a question or a permission for you |
 | `notify` | master | queues a notice for you, about a problem that is not a decision |
 
@@ -204,6 +208,8 @@ The snapshot's `paused`, and the `paused` and `unpaused` events, show a pause. A
 
 In the snapshot and the `sessions` event, the desk is the session whose `node` is `desk`. Like the master, it has no `parent`.
 
+Each session carries `model` and `effort`, both omitted where the session runs at the user's default. `effort` is one of `low`, `medium`, `high`, `xhigh` and `max`, and only workers have one. A session's `retired` lists the ids it had before a switch, and a frontend ignores it. `spawn` takes `model` and `effort`, and a frontend shows each as `model effort`.
+
 - `tell` goes to the desk, or to the master when there is no desk, and its result does not say which. During a pause it waits for `unpause`.
 - `transcript` takes a node `name` and an optional `turns`, 3 by default, and returns that session's last turns in `text`.
 - `attach` clears a stale desk first, which can take most of a minute. A frontend must wait that long for the answer before it runs `claude attach`.
@@ -216,6 +222,7 @@ Each leads with the queue of decisions waiting on you, above the tree. The desk 
 
 ## Open questions
 
+- **Effort.** That `--effort` lands in `respawnFlags` and survives a flagless resume is inferred from `--model` doing so, and unmeasured. So is whether `claude rm` of a switched worker's first id removes the worktree its copy runs in, and whether `claude rm` of the copy alone leaves it.
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
 - **Restarts and pauses.** Only a fake `claude` has run the restart handling and the pause. No real reboot, crash or pause has been measured. The daemon reads transcripts in the 2.1.310 format. Whether `claude stop` runs the `Stop` hook is unmeasured, so the daemon ignores a `Stop` from a session that a pause stopped.
 - **The desk.** No real desk has run. A probe session inside the master's directory measured the desk's trust, `autoMemoryDirectory` from `--settings` and the clear's transcript, and nothing more. Handing an idle desk its queue stops and resumes it, as waking the master does. Whether a `claude attach` open on it survives that is unmeasured. That a file tool's sensitive write asks even in auto mode comes from the 2.1.310 binary.

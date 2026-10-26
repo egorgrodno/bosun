@@ -81,13 +81,14 @@ func isWorker(node string) bool {
 }
 
 type daemon struct {
-	exe         string
-	socket      string
-	stateDir    string
-	masterDir   string
-	masterModel string
-	deskModel   string
-	workerModel string
+	exe          string
+	socket       string
+	stateDir     string
+	masterDir    string
+	masterModel  string
+	deskModel    string
+	workerModel  string
+	workerEffort string
 	// maxDepth caps the depth of the tree, where the master's children are at depth 1, and maxChildren the live children of each session.
 	maxDepth    int
 	maxChildren int
@@ -219,11 +220,15 @@ func runDaemon(args []string) error {
 	masterModel := flags.String("master-model", "", "model of a master the daemon starts, such as fable, opus or sonnet; the user's default when empty")
 	deskModel := flags.String("desk-model", "", "model of a front desk the daemon starts; the user's default when empty")
 	workerModel := flags.String("worker-model", "", "model of a worker started without one; the user's default when empty")
+	workerEffort := flags.String("worker-effort", "", "effort of a worker started without one: low, medium, high, xhigh or max; the user's default when empty")
 	maxDepth := flags.Int("max-depth", defaultMaxDepth, "deepest level of the tree, where the master's children are at level 1")
 	maxChildren := flags.Int("max-children", defaultMaxChildren, "most children each session runs at once, a stopped one included until it is killed")
 	_ = flags.Parse(args)
 	if *maxDepth < 1 || *maxChildren < 1 {
 		return errors.New("-max-depth and -max-children must be at least 1")
+	}
+	if err := checkEffort(*workerEffort); err != nil {
+		return fmt.Errorf("-worker-effort: %w", err)
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -231,6 +236,7 @@ func runDaemon(args []string) error {
 	}
 	d := newDaemon(exe, socketPath(), stateDir(), *masterDir, claudeExec{})
 	d.masterModel, d.deskModel, d.workerModel = *masterModel, *deskModel, *workerModel
+	d.workerEffort = *workerEffort
 	d.maxDepth, d.maxChildren = *maxDepth, *maxChildren
 	if err := d.fitsSockets(masterNode); err != nil {
 		return fmt.Errorf("the state path %s is too long, so set BOSUN_STATE to a shorter one: %w", d.stateDir, err)
@@ -586,9 +592,9 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	case "transcript":
 		resp.Text, err = d.transcript(r.Name, r.Turns)
 	case "spawn":
-		resp.Session, err = d.spawn(r.Node, r.Name, r.Repo, r.Model, r.Text)
+		resp.Session, err = d.spawn(r.Node, r.Name, r.Repo, r.Model, r.Effort, r.Text)
 	case "resume":
-		err = d.resume(ctx, r.Node, r.Name, r.Text)
+		err = d.resume(ctx, r.Node, r.Name, r.Model, r.Effort, r.Text)
 	case "attach":
 		err = d.attach(r.ID)
 	case "attached":
@@ -1509,7 +1515,7 @@ func (d *daemon) clear(ctx context.Context, node string) error {
 		}
 		d.mu.Unlock()
 	}()
-	if err := d.restart(ctx, n, id, dir, "/clear"); err != nil {
+	if _, err := d.restart(ctx, n, id, dir, "/clear", nil); err != nil {
 		return err
 	}
 	timer := time.NewTimer(clearWait)
@@ -1673,7 +1679,7 @@ func (d *daemon) snapshotLocked() Response {
 }
 
 // spawn starts a child of caller, or of the master when a frontend asks. A child of the master needs repo; a deeper one branches from its parent's worktree.
-func (d *daemon) spawn(caller, name, repo, model, prompt string) (*Session, error) {
+func (d *daemon) spawn(caller, name, repo, model, effort, prompt string) (*Session, error) {
 	caller = cmp.Or(caller, masterNode)
 	if caller == deskNode {
 		return nil, errors.New("the desk starts no sessions: pass the user's instruction to the master with tell_master")
@@ -1686,6 +1692,9 @@ func (d *daemon) spawn(caller, name, repo, model, prompt string) (*Session, erro
 	}
 	if prompt == "" {
 		return nil, errors.New("the prompt is empty")
+	}
+	if err := checkEffort(effort); err != nil {
+		return nil, err
 	}
 	d.mu.Lock()
 	parent := d.nodes[caller]
@@ -1724,7 +1733,7 @@ func (d *daemon) spawn(caller, name, repo, model, prompt string) (*Session, erro
 	// Once a worker runs in the repository, its sandbox may have changed the setup.
 	fresh := !slices.ContainsFunc(slices.Collect(maps.Values(d.nodes)), func(s *Session) bool { return s.Repo == root })
 	if err == nil {
-		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Base: dir, BaseBranch: branch, Model: cmp.Or(model, d.workerModel), Depth: d.nodes[caller].Depth + 1, Status: "starting", Heard: time.Now()}
+		d.nodes[name] = &Session{Node: name, Parent: caller, Repo: root, Dir: worktree, Base: dir, BaseBranch: branch, Model: cmp.Or(model, d.workerModel), Effort: cmp.Or(effort, d.workerEffort), Depth: d.nodes[caller].Depth + 1, Status: "starting", Heard: time.Now()}
 		d.started[name] = time.Now()
 	}
 	n := d.nodes[name]
@@ -1790,6 +1799,9 @@ func (d *daemon) start(n *Session, dir string, extra []string, system, prompt st
 	args := append([]string{"--bg", "-n", n.Node}, extra...)
 	if n.Model != "" {
 		args = append(args, "--model", n.Model)
+	}
+	if n.Effort != "" {
+		args = append(args, "--effort", n.Effort)
 	}
 	if n.Node == masterNode {
 		// The settings name the connectors and plugins they turn off, and this keeps out the MCP servers they cannot name.
@@ -2188,6 +2200,12 @@ func (d *daemon) land(n *Session, id string) (string, error) {
 			return "", fmt.Errorf("the checkout %s refuses the merge, which only the user can clear: %w", n.Base, err)
 		}
 	}
+	// A worker that moved to a new id left its first id, which owns the worktree, stopped and listed.
+	for _, old := range n.Retired {
+		if err := d.remove(old, tip); err != nil {
+			log.Printf("removing %s's earlier session %s: %v", n.Node, old, err)
+		}
+	}
 	if err := d.remove(id, tip); err != nil {
 		return "", fmt.Errorf("merged %s into %s, but removing %s failed: %w", branch, n.BaseBranch, n.Node, err)
 	}
@@ -2239,8 +2257,19 @@ func gitOut(dir string, args ...string) (string, error) {
 	return text, nil
 }
 
-// resume gives a worker that ended its turn a new prompt.
-func (d *daemon) resume(ctx context.Context, caller, name, prompt string) error {
+// efforts are the levels claude --effort takes.
+var efforts = []string{"low", "medium", "high", "xhigh", "max"}
+
+// checkEffort accepts an empty effort, the user's default, or a level claude --effort takes.
+func checkEffort(effort string) error {
+	if effort == "" || slices.Contains(efforts, effort) {
+		return nil
+	}
+	return fmt.Errorf("unknown effort %q: use %s", effort, strings.Join(efforts, ", "))
+}
+
+// resume gives a worker that ended its turn a new prompt, on another model or effort when asked.
+func (d *daemon) resume(ctx context.Context, caller, name, model, effort, prompt string) error {
 	if caller != masterNode {
 		return errors.New("only the master resumes a worker")
 	}
@@ -2250,17 +2279,31 @@ func (d *daemon) resume(ctx context.Context, caller, name, prompt string) error 
 	if !isWorker(name) {
 		return fmt.Errorf("no worker %q", name)
 	}
-	return d.carryOn(ctx, name, prompt)
+	if err := checkEffort(effort); err != nil {
+		return err
+	}
+	return d.carryOnAs(ctx, name, prompt, model, effort)
 }
 
 // carryOn gives a session that ended its turn, or stopped, a new prompt, which continues its conversation under the same id with its saved options.
 func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
+	return d.carryOnAs(ctx, name, prompt, "", "")
+}
+
+// carryOnAs is carryOn on another model or effort, where either differs from the session's. The session then moves to a copy of its conversation under a new id, as switchModel moves the master.
+func (d *daemon) carryOnAs(ctx context.Context, name, prompt, model, effort string) error {
 	d.mu.Lock()
 	n := d.nodes[name]
 	var id, dir, status string
 	var killed, held bool
+	var to *Session
 	if n != nil {
 		id, dir, status, killed, held = n.ID, n.Dir, n.Status, n.Killed, n.held
+		if model != "" && model != n.Model || effort != "" && effort != n.Effort {
+			next := *n
+			next.Model, next.Effort = cmp.Or(model, n.Model), cmp.Or(effort, n.Effort)
+			to = &next
+		}
 	}
 	d.mu.Unlock()
 	switch {
@@ -2274,11 +2317,17 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	case killed:
 		return fmt.Errorf("the user stopped %s", name)
 	}
-	err := d.restart(ctx, n, id, dir, prompt)
+	next, err := d.restart(ctx, n, id, dir, prompt, to)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err != nil {
 		return err
+	}
+	if to != nil {
+		// The first id of a worker that moved began its worktree, which only that id's removal deletes.
+		n.Retired = append(n.Retired, id)
+		n.ID, n.SessionID, n.Conversation, n.Model, n.Effort = next, "", "", to.Model, to.Effort
+		id = next
 	}
 	n.Status, n.State, n.pre, n.Paused = "starting", "", nil, false
 	d.started[name] = time.Now()
@@ -2288,38 +2337,54 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	return nil
 }
 
-// restart resumes n, still session id, with prompt once it ends its turn, holding it meanwhile.
-func (d *daemon) restart(ctx context.Context, n *Session, id, dir, prompt string) error {
+// restart resumes n, still session id, with prompt once it ends its turn, holding it meanwhile. It returns the id the session has after, which differs from id only when to, the session as it should run, names another model or effort.
+// A failed move leaves the session stopped under its own id, resumed idle, since a stop preceded it.
+func (d *daemon) restart(ctx context.Context, n *Session, id, dir, prompt string, to *Session) (string, error) {
 	a, err := d.awaitIdle(ctx, n.Node, id)
 	if err != nil {
-		return err
+		return "", err
 	}
 	// Claude Code resumes a running session into a copy under a new id, so a running session stops first.
 	if err := d.hold(n, id); err != nil {
-		return err
+		return "", err
 	}
 	defer d.release(n)
+	stopped := false
 	if a.Status != "" {
 		if err := d.claude.Stop(id); err != nil {
-			return err
+			return "", err
 		}
+		stopped = true
 		if err := d.awaitExit(ctx, n.Node, a.PID); err != nil {
-			return err
+			return "", err
 		}
 		// A running session lists the conversation it is in. Once a clear has begun a new one, only the stopped listing names the id that resumes the session.
 		if _, a, err = d.listed(id); err != nil {
-			return err
+			return "", err
 		}
 	}
 	d.mu.Lock()
 	n.Socket = ""
 	// A pause may have begun since the hold, and would only stop the session again.
 	paused := d.paused
+	sid := cmp.Or(n.Conversation, a.SessionID)
 	d.mu.Unlock()
 	if paused {
-		return errPaused
+		return "", errPaused
 	}
-	return d.resumeStopped(dir, id, a.SessionID, prompt)
+	if to == nil {
+		return id, d.resumeStopped(dir, id, a.SessionID, prompt)
+	}
+	next, err := d.start(to, dir, []string{"--resume", sid}, workerPrompt(n.Node), prompt)
+	if err != nil {
+		if stopped {
+			if rerr := d.resumeStopped(dir, id, a.SessionID, ""); rerr != nil {
+				log.Printf("resuming %s after its switch failed: %v", n.Node, rerr)
+			}
+		}
+		return "", err
+	}
+	return next, nil
 }
 
 // hold claims n, still session id, for resume or merge, as long as the user did not stop it or pause the fleet.

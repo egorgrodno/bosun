@@ -30,9 +30,10 @@ func str(description string) map[string]any {
 }
 
 const (
-	nameHelp  = "Node name: lowercase letters, digits and hyphens, unique in the repository. It names the session, its worktree and its branch worktree-<name>."
-	peersHelp = " Workers message each other by node name. When several share one feature, name in each worker's prompt the other workers' nodes and what each one builds, and start them all before any needs another."
-	modelHelp = "The session's model, such as fable, opus, sonnet or haiku. Leave it out unless the user named one for this task: the user sets the default."
+	nameHelp   = "Node name: lowercase letters, digits and hyphens, unique in the repository. It names the session, its worktree and its branch worktree-<name>."
+	peersHelp  = " Workers message each other by node name. When several share one feature, name in each worker's prompt the other workers' nodes and what each one builds, and start them all before any needs another."
+	modelHelp  = "The session's model, picked from the task: haiku for mechanical edits, version bumps and docs; sonnet for ordinary features and fixes; opus or fable, the strongest, for design, concurrency or security-sensitive work. Left out, it is the daemon's default."
+	effortHelp = "The session's effort, picked from the task: low for mechanical edits, version bumps and docs; medium for ordinary features; high for design, concurrency or security-sensitive work; xhigh or max only where high failed. Left out, it is the daemon's default."
 
 	statusHelp = `Show the fleet as bosun status shows it: the decisions waiting on the user and on the master, the tree of sessions with their ids, states and models, and the latest messages between sessions. Each decision and each message then follows in full.
 
@@ -106,6 +107,7 @@ func tools(node string) []tool {
 				"name":   str(nameHelp),
 				"prompt": str("The child's task. It sees nothing else, so say everything it needs."),
 				"model":  str(modelHelp),
+				"effort": str(effortHelp),
 			})},
 			{"ask", "Ask the master a question and wait for the answer. Use it for any decision you would otherwise put to the user. The master may pass it on to the user, so the wait can be long.", object([]string{"question"}, map[string]any{
 				"question": str("The question, with what the answer depends on."),
@@ -121,6 +123,7 @@ func tools(node string) []tool {
 			"repo":   str("Path to a git repository Claude Code trusts."),
 			"prompt": str("The worker's task. It sees nothing else, so say everything it needs."),
 			"model":  str(modelHelp),
+			"effort": str(effortHelp),
 		})},
 		{"next_event", nextEventHelp, object([]string{}, map[string]any{})},
 		{"reply", "Answer a worker's question. The worker gets the answer as the result of its ask. Answer when the user's instructions or the worker's task settle the question, and escalate it otherwise.", object([]string{"id", "answer"}, map[string]any{
@@ -135,9 +138,11 @@ func tools(node string) []tool {
 		{"merge", "Merge a worker's branch into the branch it began from once you have reviewed it, then remove the worker with its worktree and branch. It only fast-forwards: when the worker's branch has fallen behind, resume the worker to rebase onto it first. When the merge needs the user, as when they switched the checkout to another branch, tell them with notify. Merge with this tool, never with git: your sandbox cannot write to a repository, so git would wait on the user.", object([]string{"name"}, map[string]any{
 			"name": str("The worker's node name."),
 		})},
-		{"resume", "Give a worker that ended its turn, or stopped in the middle of one, a new prompt, such as a fix after review. It carries on in the same conversation and worktree, and its next turn_end comes as an event.", object([]string{"name", "prompt"}, map[string]any{
+		{"resume", "Give a worker that ended its turn, or stopped in the middle of one, a new prompt, such as a fix after review. It carries on in the same conversation and worktree, and its next turn_end comes as an event. Give a model or effort to switch it for this turn on, such as a higher effort after a failed attempt, or a lower one once the hard part is done. The switch moves the worker to a new session id, which the daemon follows.", object([]string{"name", "prompt"}, map[string]any{
 			"name":   str("The worker's node name."),
 			"prompt": str("What to do next. The worker remembers its task, so say only what is new."),
+			"model":  str("The model to switch to, as for spawn. Left out, it keeps its own."),
+			"effort": str("The effort to switch to, as for spawn. Left out, it keeps its own."),
 		})},
 		{"escalate", "Hand a question or permission request to the user, who answers it from bosun. Its worker keeps waiting, and the decision needs nothing more from you.", object([]string{"id"}, map[string]any{
 			"id":   str("The decision's id."),
@@ -306,6 +311,7 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		Name     string `json:"name"`
 		Repo     string `json:"repo"`
 		Model    string `json:"model"`
+		Effort   string `json:"effort"`
 		Prompt   string `json:"prompt"`
 		Question string `json:"question"`
 		ID       string `json:"id"`
@@ -331,9 +337,9 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	req := Request{Op: name, Node: s.node, ID: args.ID}
 	switch name {
 	case "spawn":
-		req.Name, req.Repo, req.Model, req.Text = args.Name, args.Repo, args.Model, args.Prompt
+		req.Name, req.Repo, req.Model, req.Effort, req.Text = args.Name, args.Repo, args.Model, args.Effort, args.Prompt
 	case "resume":
-		req.Name, req.Text = args.Name, args.Prompt
+		req.Name, req.Model, req.Effort, req.Text = args.Name, args.Model, args.Effort, args.Prompt
 	case "merge":
 		req.Name = args.Name
 	case "ask":

@@ -21,7 +21,7 @@ const usage = `usage:
   bosun reply ID ANSWER            answer a question
   bosun dismiss ID                 clear a notice from the master
   bosun tell TEXT                  send the front desk a message, or the master when there is no desk
-  bosun spawn [-model M] NAME REPO PROMPT
+  bosun spawn [-model M] [-effort E] NAME REPO PROMPT
                                    start a worker under the master
   bosun kill NAME                  stop a session
   bosun pause                      stop every session, and resume none until unpause

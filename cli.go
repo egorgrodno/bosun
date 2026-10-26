@@ -70,8 +70,9 @@ func runCommand(cmd string, args []string) error {
 	if cmd == "spawn" {
 		flags := flag.NewFlagSet("spawn", flag.ExitOnError)
 		model := flags.String("model", "", "the worker's model, in place of the daemon's -worker-model")
+		effort := flags.String("effort", "", "the worker's effort (low, medium, high, xhigh or max), in place of the daemon's -worker-effort")
 		_ = flags.Parse(args)
-		req.Model, args = *model, flags.Args()
+		req.Model, req.Effort, args = *model, *effort, flags.Args()
 	}
 	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "model": 1}[cmd]
 	if len(args) < need {
@@ -162,7 +163,7 @@ func printStatus(w io.Writer, s Response) {
 	var walk func(parent string, depth int)
 	walk = func(parent string, depth int) {
 		for _, n := range children[parent] {
-			fmt.Fprintf(w, "  %s%-*s %-8s %-15s %s\n", strings.Repeat("  ", depth), 14-2*depth, n.Node, n.ID, sessionState(n), n.Model)
+			fmt.Fprintf(w, "  %s%-*s %-8s %-15s %s\n", strings.Repeat("  ", depth), 14-2*depth, n.Node, n.ID, sessionState(n), modelLabel(n))
 			walk(n.Node, depth+1)
 		}
 	}
@@ -173,6 +174,11 @@ func printStatus(w io.Writer, s Response) {
 	for _, m := range s.Messages {
 		fmt.Fprintf(w, "  %s\n", clip(messageLine(m), 120))
 	}
+}
+
+// modelLabel is how a frontend shows the model and effort that session n runs at, each blank where it is the user's default.
+func modelLabel(n Session) string {
+	return strings.TrimSpace(n.Model + " " + n.Effort)
 }
 
 // sessionState is how a frontend shows the state of session n.

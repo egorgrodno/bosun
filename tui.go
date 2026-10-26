@@ -221,7 +221,7 @@ func (t *tui) render(width, height int) []string {
 			continue
 		}
 		s := it.session
-		add("", fmt.Sprintf("  %s%-*s %-8s %-15s %s", strings.Repeat("  ", it.depth), max(1, 14-2*it.depth), s.Node, s.ID, sessionState(*s), s.Model), i == t.sel)
+		add("", fmt.Sprintf("  %s%-*s %-8s %-15s %s", strings.Repeat("  ", it.depth), max(1, 14-2*it.depth), s.Node, s.ID, sessionState(*s), modelLabel(*s)), i == t.sel)
 	}
 	if len(t.messages) > 0 {
 		add("", "", false)

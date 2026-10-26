@@ -24,6 +24,7 @@ type Request struct {
 	Name   string `json:"name,omitempty"`
 	Repo   string `json:"repo,omitempty"`
 	Model  string `json:"model,omitempty"`
+	Effort string `json:"effort,omitempty"`
 	Text   string `json:"text,omitempty"`
 	// Turns is how many of a session's last turns a transcript shows.
 	Turns int             `json:"turns,omitempty"`
@@ -91,7 +92,7 @@ type answer struct {
 }
 
 // Session is a node of the tree. Status and State come from `claude agents --json --all`, with Status "stopped" while it lists the session without a process, and "exited" once it lists the session no more.
-// An empty Model is the user's default. Killed marks a worker the user stopped, which the master may not resume.
+// An empty Model or Effort is the user's default. Killed marks a worker the user stopped, which the master may not resume.
 // Turn marks a turn whose end the master has not heard of, and Heard is when the master last heard the end of one.
 // Paused marks a session that a pause stopped in its turn, which unpausing resumes.
 // A worker's branch began at the HEAD of BaseBranch, checked out in Base, which merge fast-forwards.
@@ -103,6 +104,7 @@ type Session struct {
 	ID        string    `json:"id,omitempty"`
 	SessionID string    `json:"sessionId,omitempty"`
 	Model     string    `json:"model,omitempty"`
+	Effort    string    `json:"effort,omitempty"`
 	Depth     int       `json:"depth"`
 	Status    string    `json:"status"`
 	State     string    `json:"state,omitempty"`
@@ -112,6 +114,8 @@ type Session struct {
 	Paused    bool      `json:"paused,omitempty"`
 	// Conversation is the one a clear began, which a copy of the session must name.
 	Conversation string `json:"conversation,omitempty"`
+	// Retired holds the ids a worker had before a switch of its model or effort moved it to a new one. The first began the worker's worktree, so merge removes them too.
+	Retired []string `json:"retired,omitempty"`
 	// Socket is the messaging socket of the session's running process, forgotten once the process stops, since another process may take the path.
 	Socket string `json:"socket,omitempty"`
 	// Events holds what waits for a session that runs no next_event until bosun hands it over: the turn ends and exits of a worker's children, or the desk's tells. Taken holds the reports handed to a worker in its current turn.
