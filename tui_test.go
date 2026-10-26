@@ -98,6 +98,26 @@ func TestTUIApply(t *testing.T) {
 	}
 }
 
+func TestTUIPause(t *testing.T) {
+	tu := testTUI()
+	if a, ok := tu.key("p"); !ok || a.op != "pause" {
+		t.Fatalf("p: %+v %v", a, ok)
+	}
+	tu.apply(Response{Type: "event", Event: &Event{Kind: "paused"}})
+	tu.apply(Response{Type: "event", Event: &Event{Kind: "sessions", Sessions: []Session{{Node: masterNode, ID: "mmmmmmmm", Status: "stopped", Paused: true}}}})
+	screen := strings.Join(tu.render(80, 20), "\n")
+	if !strings.Contains(screen, "Paused") || !strings.Contains(screen, "paused ") {
+		t.Fatalf("the screen does not show the pause:\n%s", screen)
+	}
+	if a, ok := tu.key("p"); !ok || a.op != "unpause" {
+		t.Fatalf("p while paused: %+v %v", a, ok)
+	}
+	tu.apply(Response{Type: "snapshot"})
+	if tu.paused {
+		t.Fatal("a snapshot without the pause left it shown")
+	}
+}
+
 func TestSplitKeys(t *testing.T) {
 	if got := splitKeys([]byte("j\x1b[Bé\r")); !slices.Equal(got, []string{"j", "\x1b[B", "é", "\r"}) {
 		t.Fatalf("keys %q", got)

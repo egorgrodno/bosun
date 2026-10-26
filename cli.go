@@ -80,6 +80,9 @@ func runCommand(cmd string, args []string) error {
 		req.Model = args[0]
 	}
 	resp, err := call(context.Background(), req)
+	if resp.Text != "" {
+		fmt.Println(resp.Text)
+	}
 	if err != nil {
 		return err
 	}
@@ -116,6 +119,9 @@ func runWatch() error {
 }
 
 func printStatus(w io.Writer, s Response) {
+	if s.Paused {
+		fmt.Fprintln(w, "Paused: bosun unpause resumes the turns it stopped.")
+	}
 	for _, holder := range []string{"user", "master"} {
 		first := true
 		for _, dec := range s.Decisions {
@@ -140,16 +146,7 @@ func printStatus(w io.Writer, s Response) {
 	var walk func(parent string, depth int)
 	walk = func(parent string, depth int) {
 		for _, n := range children[parent] {
-			state := n.Status
-			switch {
-			case n.Killed:
-				state = "killed"
-			case n.LimitedUntil != nil:
-				state = "limited until " + n.LimitedUntil.Local().Format("15:04")
-			case n.State != "":
-				state += "/" + n.State
-			}
-			fmt.Fprintf(w, "  %s%-*s %-8s %-15s %s\n", strings.Repeat("  ", depth), 14-2*depth, n.Node, n.ID, state, n.Model)
+			fmt.Fprintf(w, "  %s%-*s %-8s %-15s %s\n", strings.Repeat("  ", depth), 14-2*depth, n.Node, n.ID, sessionState(n), n.Model)
 			walk(n.Node, depth+1)
 		}
 	}
@@ -160,6 +157,21 @@ func printStatus(w io.Writer, s Response) {
 	for _, m := range s.Messages {
 		fmt.Fprintf(w, "  %s\n", clip(messageLine(m), 120))
 	}
+}
+
+// sessionState is how a frontend shows the state of session n.
+func sessionState(n Session) string {
+	switch {
+	case n.Killed:
+		return "killed"
+	case n.Paused:
+		return "paused"
+	case n.LimitedUntil != nil:
+		return "limited until " + n.LimitedUntil.Local().Format("15:04")
+	case n.State != "":
+		return n.Status + "/" + n.State
+	}
+	return n.Status
 }
 
 // messageLine shows the first line of a message between sessions.

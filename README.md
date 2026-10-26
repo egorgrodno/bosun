@@ -23,7 +23,7 @@ bosun approve 3
 bosun attach <id>
 ```
 
-`bosun` alone lists every command.
+`bosun` alone lists every command. `bosun pause` stops every session, such as before a reboot, and `bosun unpause` resumes the turns it cut.
 
 The master refuses messages from your other Claude Code sessions, though the sender's `SendMessage` reports success. Reach it with `bosun tell`, or type into it through `bosun attach`.
 

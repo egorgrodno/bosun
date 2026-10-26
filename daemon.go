@@ -61,6 +61,7 @@ var clearWait = 30 * time.Second
 var (
 	errInTurn   = errors.New("still in its turn")
 	errStarting = errors.New("still starting")
+	errPaused   = errors.New("bosun is paused: bosun unpause resumes it")
 )
 
 // eventsWaiting is the prompt that wakes the master, and the reason a block of its Stop gives.
@@ -82,14 +83,16 @@ type daemon struct {
 
 	// masterLock is held while the master is woken, switched or resumed idle, so that no two of them resume it at once.
 	masterLock sync.Mutex
-	mu         sync.Mutex
-	nodes      map[string]*Session
-	started    map[string]time.Time
-	decisions  map[string]*Decision
-	nextID     int
-	events     []Event
-	wake       chan struct{}
-	watchers   map[*watcher]bool
+	// pauseLock is held through a pause or an unpause, each of which stops or resumes one session after another.
+	pauseLock sync.Mutex
+	mu        sync.Mutex
+	nodes     map[string]*Session
+	started   map[string]time.Time
+	decisions map[string]*Decision
+	nextID    int
+	events    []Event
+	wake      chan struct{}
+	watchers  map[*watcher]bool
 	// messages holds the latest messages between sessions, for a frontend's snapshot.
 	messages []Event
 	// stopBlocked holds from a block of the master's Stop until its next call to next_event.
@@ -114,7 +117,8 @@ type daemon struct {
 	// orphans holds by id the decisions of an earlier run until orphansUntil, for the hooks and asks that wait on them to send their requests again.
 	orphans      map[string]*Decision
 	orphansUntil time.Time
-	// stopping holds once the daemon shuts down.
+	// paused holds while the user has paused the fleet, and stopping once the daemon shuts down.
+	paused   bool
 	stopping bool
 }
 
@@ -136,6 +140,7 @@ type savedState struct {
 	Taken     []Event         `json:"taken,omitempty"`
 	TakenKey  string          `json:"takenKey,omitempty"`
 	Decisions []savedDecision `json:"decisions,omitempty"`
+	Paused    bool            `json:"paused,omitempty"`
 }
 
 // savedDecision is a decision with what the protocol leaves out of it.
@@ -296,7 +301,7 @@ func (d *daemon) load() error {
 			log.Printf("%s: %v", s.Node, err)
 		}
 		switch {
-		case s.Node == masterNode || s.Killed:
+		case s.Node == masterNode || s.Killed || s.Paused:
 		case s.Heard.IsZero():
 			// An earlier build kept no such time, and told the master of every turn it saw end.
 			s.Heard = now
@@ -307,7 +312,7 @@ func (d *daemon) load() error {
 			}
 		}
 	}
-	d.events, d.taken, d.takenKey = st.Events, st.Taken, st.TakenKey
+	d.events, d.taken, d.takenKey, d.paused = st.Events, st.Taken, st.TakenKey, st.Paused
 	for _, sd := range st.Decisions {
 		dec := sd.Decision
 		dec.toolUseID, dec.key, dec.opened, dec.prompt = sd.ToolUseID, sd.Key, sd.Opened, sd.Prompt
@@ -326,7 +331,7 @@ func (d *daemon) saveLocked() {
 	if d.stopping {
 		return
 	}
-	st := savedState{NextID: d.nextID, Events: d.events, Taken: d.taken, TakenKey: d.takenKey}
+	st := savedState{NextID: d.nextID, Events: d.events, Taken: d.taken, TakenKey: d.takenKey, Paused: d.paused}
 	for _, n := range d.sortedLocked() {
 		st.Sessions = append(st.Sessions, n)
 	}
@@ -522,6 +527,10 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 		resp.Text, err = d.merge(ctx, r.Node, r.Name)
 	case "model":
 		err = d.switchModel(r.Model)
+	case "pause":
+		resp.Text, err = d.pause(ctx)
+	case "unpause":
+		resp.Text, err = d.unpause()
 	case "status":
 		d.mu.Lock()
 		resp = d.snapshotLocked()
@@ -654,6 +663,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 			d.heardLocked(n)
 		}
 		switch {
+		case n.Paused && d.paused:
 		case in.Error == "rate_limit":
 			d.limitLocked(n, in.LastMessage)
 			if node == masterNode {
@@ -671,6 +681,8 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 		n.LimitedUntil = nil
 		d.withdrawLocked(node, func(*Decision) bool { return true })
 		switch {
+		case n.Paused && d.paused:
+			// The pause stopped the session in its turn, which unpausing resumes.
 		case node != masterNode && len(n.Events) > 0:
 			// A worker runs no next_event, so news of its children waits for the end of its turn, which goes on with it.
 			resp.Behavior, resp.Text = "block", childReport(n.Events)
@@ -1086,8 +1098,8 @@ func (d *daemon) pushLocked(ev Event) {
 	d.saveLocked()
 	close(d.wake)
 	d.wake = make(chan struct{})
-	// A master that a usage limit stopped wakes once the limit resets.
-	if m := d.nodes[masterNode]; d.asleep && (m == nil || m.LimitedUntil == nil) {
+	// A master that a usage limit stopped wakes once the limit resets, and a paused one once the user unpauses.
+	if m := d.nodes[masterNode]; d.asleep && !d.paused && (m == nil || m.LimitedUntil == nil) {
 		d.asleep = false
 		go d.wakeMaster()
 	}
@@ -1132,7 +1144,7 @@ func (d *daemon) orphanLocked(n *Session) {
 func (d *daemon) deliver(name string) {
 	d.mu.Lock()
 	n := d.nodes[name]
-	if n == nil || n.Killed || n.LimitedUntil != nil || len(n.Events) == 0 {
+	if n == nil || n.Killed || n.LimitedUntil != nil || d.paused || len(n.Events) == 0 {
 		d.mu.Unlock()
 		return
 	}
@@ -1145,7 +1157,7 @@ func (d *daemon) deliver(name string) {
 	switch {
 	case err == nil:
 		n.Taken = append(n.Taken, evs...)
-	case errors.Is(err, errInTurn) || errors.Is(err, errStarting):
+	case errors.Is(err, errInTurn) || errors.Is(err, errStarting) || errors.Is(err, errPaused):
 		n.Events = append(evs, n.Events...)
 	default:
 		log.Printf("telling %s of its children: %v", name, err)
@@ -1215,13 +1227,21 @@ func (d *daemon) turnLocked(n *Session) {
 func (d *daemon) wakeMaster() {
 	d.masterLock.Lock()
 	defer d.masterLock.Unlock()
+	d.mu.Lock()
+	if d.paused {
+		// unpause wakes it.
+		d.asleep = true
+		d.mu.Unlock()
+		return
+	}
+	d.mu.Unlock()
 	if d.stale(time.Now()) {
 		if err := d.clearMaster(context.Background()); err != nil {
 			log.Printf("clearing the master's conversation: %v", err)
 		}
 	}
 	err := d.carryOn(context.Background(), masterNode, eventsWaiting)
-	if err == nil || errors.Is(err, errInTurn) || errors.Is(err, errStarting) {
+	if err == nil || errors.Is(err, errInTurn) || errors.Is(err, errStarting) || errors.Is(err, errPaused) {
 		return
 	}
 	log.Printf("waking the master: %v", err)
@@ -1287,9 +1307,9 @@ func (d *daemon) clearMaster(ctx context.Context) error {
 	}
 }
 
-// sleepLocked lets the master sleep until the next event, or wakes it now when events already wait, since only a new event wakes it.
+// sleepLocked lets the master sleep until the next event, or wakes it now when events already wait and the fleet is not paused, since only a new event wakes it.
 func (d *daemon) sleepLocked() {
-	d.asleep = !needsMaster(d.pendingLocked())
+	d.asleep = d.paused || !needsMaster(d.pendingLocked())
 	if !d.asleep {
 		go d.wakeMaster()
 	}
@@ -1400,7 +1420,7 @@ func (d *daemon) broadcastSessionsLocked() {
 }
 
 func (d *daemon) snapshotLocked() Response {
-	resp := Response{Type: "snapshot", Sessions: []Session{}, Decisions: []Decision{}}
+	resp := Response{Type: "snapshot", Sessions: []Session{}, Decisions: []Decision{}, Paused: d.paused}
 	for _, n := range d.sortedLocked() {
 		resp.Sessions = append(resp.Sessions, n.public())
 	}
@@ -1433,6 +1453,10 @@ func (d *daemon) spawn(caller, name, repo, model, prompt string) (*Session, erro
 	if parent == nil {
 		d.mu.Unlock()
 		return nil, fmt.Errorf("unknown node %q", caller)
+	}
+	if d.paused {
+		d.mu.Unlock()
+		return nil, errPaused
 	}
 	dir, root := parent.Dir, parent.Repo
 	d.mu.Unlock()
@@ -1658,6 +1682,7 @@ func (d *daemon) kill(name string) error {
 		n.Killed = killed || (id != "" && !held && name != masterNode)
 		if n.Killed {
 			d.heardLocked(n)
+			n.Paused = false
 		}
 	}
 	d.stirred = true
@@ -1941,7 +1966,7 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	if err != nil {
 		return err
 	}
-	n.Status, n.State, n.pre = "starting", "", nil
+	n.Status, n.State, n.pre, n.Paused = "starting", "", nil, false
 	d.started[name] = time.Now()
 	d.saveLocked()
 	d.broadcastSessionsLocked()
@@ -1974,11 +1999,16 @@ func (d *daemon) restart(ctx context.Context, n *Session, id, dir, prompt string
 	}
 	d.mu.Lock()
 	n.Socket = ""
+	// A pause may have begun since the hold, and would only stop the session again.
+	paused := d.paused
 	d.mu.Unlock()
+	if paused {
+		return errPaused
+	}
 	return d.resumeStopped(dir, id, a.SessionID, prompt)
 }
 
-// hold claims n, still session id, for resume or merge, as long as the user did not stop it.
+// hold claims n, still session id, for resume or merge, as long as the user did not stop it or pause the fleet.
 func (d *daemon) hold(n *Session, id string) error {
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1987,6 +2017,8 @@ func (d *daemon) hold(n *Session, id string) error {
 		return fmt.Errorf("%s is %w", n.Node, errStarting)
 	case n.Killed:
 		return fmt.Errorf("the user stopped %s", n.Node)
+	case d.paused:
+		return errPaused
 	}
 	n.held = true
 	return nil
@@ -2171,6 +2203,12 @@ func (d *daemon) ensureMaster() error {
 func (d *daemon) switchModel(model string) error {
 	if model == "" {
 		return errors.New("name a model")
+	}
+	d.mu.Lock()
+	paused := d.paused
+	d.mu.Unlock()
+	if paused {
+		return errPaused
 	}
 	if !d.masterLock.TryLock() {
 		return errors.New("the master is being woken or switched, so try again in a moment")
@@ -2367,7 +2405,7 @@ func (d *daemon) refresh(byID map[string]agent, listed time.Time) (masterMoved b
 			if missed || status == "stopped" && !d.asleep {
 				d.sleepLocked()
 			}
-		case n.Killed:
+		case n.Killed || n.Paused:
 			n.Turn = false
 		case missed:
 			d.heardLocked(n)

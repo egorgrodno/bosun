@@ -20,7 +20,7 @@ One binary carries every part:
 | `bosun mcp` | the stdio MCP server each session starts, relaying to the daemon |
 | `bosun hook` | every hook each session runs |
 | `bosun tui` | the terminal frontend |
-| `bosun status`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `model`, `attach`, `watch` | the command-line frontend |
+| `bosun status`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `watch` | the command-line frontend |
 
 The daemon holds each session's parent and the queue of decisions waiting on an answer. It reads each session's state from `claude agents --json --all`, which also lists sessions bosun did not start.
 
@@ -35,6 +35,8 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 **Retiring.** Claude Code's supervisor stops a background session that has sat idle for an hour. `claude agents --json --all` keeps listing it without a `pid` or `status` until `claude rm`, the same as a session that `claude stop` stopped. Either resumes like an idle session, so stopped does not mean done. The listing cannot tell a kill from a retirement, so the daemon marks each worker that `bosun kill` stops, and `resume` refuses it.
 
 **Usage limits.** A turn that ends on an API error runs the `StopFailure` hook instead of `Stop`. Its `error` names the kind, such as `rate_limit`, `overloaded` or `server_error`, and its `last_assistant_message` holds Claude Code's message. For a usage limit that message says when the limit resets, as `resets 3pm (Europe/Berlin)`, or past a day `resets Oct 27, 3pm (Europe/Berlin)`. The daemon resumes each session a limit stopped at that time, the master first. Every session shares one account, so a limit usually stops them all, though a limit on one model stops only its sessions. A worker's other errors reach its parent as its `turn_end`.
+
+**Pausing.** `bosun pause` stops every session and marks the ones in their turns. While paused, the daemon resumes no session on its own, the usage-limit resume included, and refuses `spawn`, `resume`, `merge` and `model`. A session you resume yourself through `bosun attach` runs, and its messages resume their recipients. Events still queue for the master. `bosun unpause` resumes each marked session with a prompt that says why, and wakes the master if an event waits for it. The pause outlasts a restart of the daemon.
 
 **Upgrades.** A session reads its settings and MCP config only when its process starts. Both run bosun through `bosun` in the state directory, a link that each daemon start points at its own binary, and each start rewrites every session's settings. The system prompt is another matter. Claude Code snapshots it into the transcript, and every resume reuses the snapshot, even a resume with new flags. Tool descriptions come from the MCP server, which each process start runs from the current build. So the master's system prompt holds only what never changes, and its tools' descriptions hold its rules.
 
@@ -131,7 +133,7 @@ The check covers only what a session sends: a message from outside bosun reaches
 
 ## Restarts
 
-A worker's parent must hear of every turn of it that ends or stops.
+A worker's parent must hear of every turn of it that ends or stops, unless a pause stopped it.
 
 **The daemon's state survives a power loss.** `state.json` holds the sessions, the master's queue and the open decisions, and each save syncs it to disk.
 
@@ -139,11 +141,13 @@ A worker's parent must hear of every turn of it that ends or stops.
 
 **Missed turn ends.** Each hook of a session's turn marks it in a turn, and the daemon saves the mark. `Stop` and `StopFailure` clear it. A marked worker still listed between turns ten seconds after its last hook ended its turn unheard. Either the daemon was away, or the user interrupted the turn. An idle one reaches its parent as a `turn_end` with the last message of its transcript. A stopped one reaches it as an `exit`, or as a `turn_end` if its transcript shows the turn finished. On start, a worker counts as marked when its transcript holds a message newer than the last turn end its parent heard. That covers a turn that ran while no daemon did.
 
-**The master's batch.** The events `next_event` returns stay with the daemon until the master's next `next_event`, or a `Stop` that ends its turn. When its turn ends any other way, such as by a crash, a kill, an API error or a restart, the daemon puts the batch back in front of the queue with `again` set. A worker that stops in its turn likewise gets back the reports of its children that the turn took.
+**The master's batch.** The events `next_event` returns stay with the daemon until the master's next `next_event`, or a `Stop` that ends its turn. When its turn ends any other way, such as by a crash, a kill, an API error, a pause or a restart, the daemon puts the batch back in front of the queue with `again` set. A worker that stops in its turn likewise gets back the reports of its children that the turn took.
 
 ## Frontends
 
-Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `model`, `attach`. Every rule lives in the daemon.
+Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`. Every rule lives in the daemon.
+
+The snapshot's `paused`, and the `paused` and `unpaused` events, show a pause. A session's `paused` marks a turn that `unpause` resumes.
 
 Each leads with the queue of decisions waiting on you, above the tree.
 
@@ -153,4 +157,4 @@ Each leads with the queue of decisions waiting on you, above the tree.
 ## Open questions
 
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
-- **Restarts.** Only a fake `claude` has run the restart handling. No real reboot or crash has been measured. The daemon reads transcripts in the 2.1.310 format.
+- **Restarts and pauses.** Only a fake `claude` has run the restart handling and the pause. No real reboot, crash or pause has been measured. The daemon reads transcripts in the 2.1.310 format. Whether `claude stop` runs the `Stop` hook is unmeasured, so the daemon ignores a `Stop` from a session that a pause stopped.

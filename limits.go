@@ -83,7 +83,7 @@ func (d *daemon) limitLocked(n *Session, text string) {
 // recoverLimited resumes each session that a usage limit stopped once the limit has reset, the master first, since it settles what the workers need.
 func (d *daemon) recoverLimited(now time.Time) {
 	d.mu.Lock()
-	if d.recovering {
+	if d.recovering || d.paused {
 		d.mu.Unlock()
 		return
 	}
@@ -124,18 +124,34 @@ func (d *daemon) recover(name string) error {
 		d.mu.Unlock()
 		return nil
 	}
+	until := n.LimitedUntil
 	n.LimitedUntil = nil
 	d.saveLocked()
 	d.mu.Unlock()
+	var err error
 	if name != masterNode {
-		return d.carryOn(context.Background(), name, limitReset)
+		err = d.carryOn(context.Background(), name, limitReset)
+	} else {
+		err = d.resumeMaster(limitResetMaster)
 	}
+	if errors.Is(err, errPaused) {
+		// The pause that began meanwhile stopped it out of its turn, so unpausing would not resume it.
+		d.mu.Lock()
+		n.LimitedUntil = until
+		d.saveLocked()
+		d.mu.Unlock()
+	}
+	return err
+}
+
+// resumeMaster resumes the master with prompt, and leaves it asleep, for the next event to try again, when that fails.
+func (d *daemon) resumeMaster(prompt string) error {
 	d.masterLock.Lock()
 	defer d.masterLock.Unlock()
 	d.mu.Lock()
 	d.asleep = false
 	d.mu.Unlock()
-	err := d.carryOn(context.Background(), masterNode, limitResetMaster)
+	err := d.carryOn(context.Background(), masterNode, prompt)
 	if err != nil && !errors.Is(err, errInTurn) && !errors.Is(err, errStarting) {
 		d.mu.Lock()
 		d.asleep = true

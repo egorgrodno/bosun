@@ -42,9 +42,10 @@ type Response struct {
 	Sessions  []Session  `json:"sessions,omitempty"`
 	Decisions []Decision `json:"decisions,omitempty"`
 	Messages  []Event    `json:"messages,omitempty"`
+	Paused    bool       `json:"paused,omitempty"`
 }
 
-// Event is what the master or a frontend is told. The master gets decision, turn_end, exit, tell and message; a frontend gets decision, settled, sessions and message.
+// Event is what the master or a frontend is told. The master gets decision, turn_end, exit, tell and message; a frontend gets decision, settled, sessions, message, paused and unpaused.
 // A message is what session From told session Node through Claude Code's SendMessage.
 // Again marks an event the master took once already, in a turn that was cut short.
 type Event struct {
@@ -90,6 +91,7 @@ type answer struct {
 // Session is a node of the tree. Status and State come from `claude agents --json --all`, with Status "stopped" while it lists the session without a process, and "exited" once it lists the session no more.
 // An empty Model is the user's default. Killed marks a worker the user stopped, which the master may not resume.
 // Turn marks a turn whose end the master has not heard of, and Heard is when the master last heard the end of one.
+// Paused marks a session that a pause stopped in its turn, which unpausing resumes.
 // A worker's branch began at the HEAD of BaseBranch, checked out in Base, which merge fast-forwards.
 type Session struct {
 	Node      string    `json:"node"`
@@ -105,6 +107,7 @@ type Session struct {
 	Killed    bool      `json:"killed,omitempty"`
 	Turn      bool      `json:"turn,omitempty"`
 	Heard     time.Time `json:"heard,omitzero"`
+	Paused    bool      `json:"paused,omitempty"`
 	// Conversation is the one a clear began, which a copy of the session must name.
 	Conversation string `json:"conversation,omitempty"`
 	// Socket is the messaging socket of the session's running process, forgotten once the process stops, since another process may take the path.

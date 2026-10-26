@@ -24,8 +24,10 @@ const usage = `usage:
   bosun spawn [-model M] NAME REPO PROMPT
                                    start a worker under the master
   bosun kill NAME                  stop a session
+  bosun pause                      stop every session, and resume none until unpause
+  bosun unpause                    resume the turns that pause stopped
   bosun attach ID                  claude attach to a session, which the daemon resumes if it stopped
-  bosun model M                   switch the master to model M, keeping its conversation
+  bosun model M                    switch the master to model M, keeping its conversation
 
 A model is an alias such as fable, opus, sonnet or haiku, or a full model name.`
 
@@ -51,7 +53,7 @@ func main() {
 		err = runTUI()
 	case "attach":
 		err = runAttach(args)
-	case "approve", "deny", "reply", "dismiss", "tell", "spawn", "kill", "model":
+	case "approve", "deny", "reply", "dismiss", "tell", "spawn", "kill", "model", "pause", "unpause":
 		err = runCommand(cmd, args)
 	default:
 		fmt.Fprintln(os.Stderr, usage)

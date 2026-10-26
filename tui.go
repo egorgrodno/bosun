@@ -23,6 +23,7 @@ type tui struct {
 	sessions  []Session
 	decisions []Decision
 	messages  []Event
+	paused    bool
 	connected bool
 	sel       int
 	// answering is the question an answer is being typed for, and answer the text so far.
@@ -80,8 +81,10 @@ func (t *tui) selected() tuiItem {
 func (t *tui) apply(r Response) {
 	switch {
 	case r.Type == "snapshot":
-		t.sessions, t.decisions, t.messages, t.connected = r.Sessions, r.Decisions, r.Messages, true
+		t.sessions, t.decisions, t.messages, t.paused, t.connected = r.Sessions, r.Decisions, r.Messages, r.Paused, true
 	case r.Event == nil:
+	case r.Event.Kind == "paused", r.Event.Kind == "unpaused":
+		t.paused = r.Event.Kind == "paused"
 	case r.Event.Kind == "sessions":
 		t.sessions = r.Event.Sessions
 	case r.Event.Kind == "message":
@@ -135,6 +138,10 @@ func (t *tui) key(k string) (tuiAction, bool) {
 	switch {
 	case k == "q" || k == "\x03":
 		return tuiAction{op: "quit"}, true
+	case k == "p" && t.paused:
+		return tuiAction{op: "unpause"}, true
+	case k == "p":
+		return tuiAction{op: "pause"}, true
 	case k == "j" || k == "\x1b[B":
 		t.sel = min(t.sel+1, len(t.items())-1)
 	case k == "k" || k == "\x1b[A":
@@ -179,6 +186,9 @@ func (t *tui) render(width, height int) []string {
 	if !t.connected {
 		add(dim, "Waiting for the bosun daemon...", false)
 	}
+	if t.paused {
+		add(yellow, "Paused: p resumes the turns it stopped", false)
+	}
 	items := t.items()
 	section := ""
 	for i, it := range items {
@@ -207,16 +217,7 @@ func (t *tui) render(width, height int) []string {
 			continue
 		}
 		s := it.session
-		state := s.Status
-		switch {
-		case s.Killed:
-			state = "killed"
-		case s.LimitedUntil != nil:
-			state = "limited until " + s.LimitedUntil.Local().Format("15:04")
-		case s.State != "":
-			state += "/" + s.State
-		}
-		add("", fmt.Sprintf("  %s%-*s %-8s %-15s %s", strings.Repeat("  ", it.depth), max(1, 14-2*it.depth), s.Node, s.ID, state, s.Model), i == t.sel)
+		add("", fmt.Sprintf("  %s%-*s %-8s %-15s %s", strings.Repeat("  ", it.depth), max(1, 14-2*it.depth), s.Node, s.ID, sessionState(*s), s.Model), i == t.sel)
 	}
 	if len(t.messages) > 0 {
 		add("", "", false)
@@ -236,8 +237,10 @@ func (t *tui) render(width, height int) []string {
 		foot = append(foot, dim+clip("r answer · j/k move · q quit", width)+plain)
 	case it.decision != nil:
 		foot = append(foot, dim+clip("x dismiss · j/k move · q quit", width)+plain)
+	case it.session != nil && !t.paused:
+		foot = append(foot, dim+clip("enter attach, then ctrl+z to come back · p pause all · j/k move · q quit", width)+plain)
 	case it.session != nil:
-		foot = append(foot, dim+clip("enter attach, then ctrl+z to come back · j/k move · q quit", width)+plain)
+		foot = append(foot, dim+clip("enter attach, then ctrl+z to come back · p unpause · j/k move · q quit", width)+plain)
 	default:
 		foot = append(foot, dim+"q quit"+plain)
 	}
@@ -290,11 +293,12 @@ func splitKeys(b []byte) []string {
 	return keys
 }
 
-// tuiMessage is what a goroutine hands the main loop: a line of the watch stream, the stream's end, or a resize.
+// tuiMessage is what a goroutine hands the main loop: a line of the watch stream, the stream's end, a resize, or a request that failed.
 type tuiMessage struct {
 	resp    *Response
 	gone    bool
 	resized bool
+	failed  string
 }
 
 func runTUI() error {
@@ -363,6 +367,8 @@ func runTUI() error {
 						t.apply(*m.resp)
 					case m.gone:
 						t.connected = false
+					case m.failed != "":
+						t.err = m.failed
 					}
 				default:
 					break drain
@@ -388,6 +394,14 @@ func runTUI() error {
 					t.err = attach(a.id)
 					_, _ = makeRaw(in)
 					enter()
+				case "pause", "unpause":
+					// Each stops or resumes every session in turn, which takes a while, and the watch stream shows the progress.
+					t.err = ""
+					go func(op string) {
+						if _, err := call(context.Background(), Request{Op: op}); err != nil {
+							post(tuiMessage{failed: err.Error()})
+						}
+					}(a.op)
 				default:
 					t.err = ""
 					req := Request{Op: a.op, ID: a.id, Text: a.text}
