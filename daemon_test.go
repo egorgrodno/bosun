@@ -38,6 +38,10 @@ type fakeClaude struct {
 	procs   map[string]int
 	live    map[int]int
 	nextPID int
+	// conversations holds the conversation a clear moved each session to, which the session lists while it runs, and which --resume takes for a session of its own.
+	conversations map[string]string
+	// cleared runs once a resume with /clear moves session name to conversation sid, as the session's SessionStart hook reports it.
+	cleared func(name, sid string)
 }
 
 func (f *fakeClaude) spawnLocked(id string) int {
@@ -101,6 +105,17 @@ func (f *fakeClaude) Start(dir string, args []string) (string, error) {
 				if len(args) == 3 {
 					a.Status = "idle"
 				}
+				if args[len(args)-1] == "/clear" {
+					a.Status = "idle"
+					c := fmt.Sprintf("%s-%d", sid, len(f.starts))
+					if f.conversations == nil {
+						f.conversations = map[string]string{}
+					}
+					f.conversations[a.ID] = c
+					if f.cleared != nil {
+						go f.cleared(a.Name, c)
+					}
+				}
 				return a.ID, nil
 			}
 		}
@@ -142,7 +157,13 @@ func (f *fakeClaude) Agents() ([]agent, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.tickLocked()
-	return slices.Clone(f.agents), nil
+	agents := slices.Clone(f.agents)
+	for i, a := range agents {
+		if c := f.conversations[a.ID]; c != "" && a.Status != "" {
+			agents[i].SessionID = c
+		}
+	}
+	return agents, nil
 }
 
 func (f *fakeClaude) Stop(id string) error {
@@ -909,6 +930,117 @@ func TestWakeMasterFails(t *testing.T) {
 	}
 }
 
+// staleMaster adopts the testDaemon's master as asleep with status, after its last transcript write at written, or with no transcript when written is zero.
+// Without keepWorker, no worker is left.
+func staleMaster(t *testing.T, status string, written time.Time, keepWorker bool) (*daemon, *fakeClaude) {
+	t.Helper()
+	d, fc := testDaemon(t)
+	idleWait = 0
+	t.Cleanup(func() { idleWait = 30 * time.Second })
+	d.mu.Lock()
+	if !keepWorker {
+		delete(d.nodes, "a")
+	}
+	dir := filepath.Dir(d.nodes[masterNode].memoryDir())
+	d.mu.Unlock()
+	if !written.IsZero() {
+		path := filepath.Join(dir, "s-m.jsonl")
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(path, written, written); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fc.mu.Lock()
+	fc.agents[0].SessionID = "s-m"
+	fc.cleared = func(name, sid string) {
+		raw, _ := json.Marshal(map[string]any{"hook_event_name": "SessionStart", "session_id": sid, "source": "clear"})
+		hookOutput(name, bytes.NewReader(raw))
+	}
+	fc.mu.Unlock()
+	fc.setStatus("00000001", status)
+	if err := d.ensureMaster(); err != nil {
+		t.Fatal(err)
+	}
+	return d, fc
+}
+
+// resumes returns the prompt of each resume of the master after its start.
+func resumes(fc *fakeClaude) []string {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	var prompts []string
+	for _, args := range fc.starts[1:] {
+		prompts = append(prompts, strings.Join(args, " "))
+	}
+	return prompts
+}
+
+func TestWakeClearsStaleMaster(t *testing.T) {
+	for _, status := range []string{"idle", ""} {
+		t.Run(cmp.Or(status, "stopped"), func(t *testing.T) {
+			d, fc := staleMaster(t, status, time.Now().Add(-2*cacheLife), false)
+			mustCall(t, Request{Op: "tell", Text: "x"})
+			awaitWoken(t, d, fc, 3)
+			// The listing shows the new conversation while the master runs, which --resume takes for a session of its own.
+			want := []string{"--bg --resume s-m -- /clear", "--bg --resume s-m -- " + eventsWaiting}
+			if got := resumes(fc); !slices.Equal(got, want) {
+				t.Fatalf("claude ran with %q, want %q", got, want)
+			}
+			d.mu.Lock()
+			conversation := d.nodes[masterNode].Conversation
+			d.mu.Unlock()
+			if conversation != "s-m-2" {
+				t.Fatalf("the master's conversation is %q, want the one the clear began", conversation)
+			}
+			if events := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events; len(events) != 1 || events[0].Kind != "tell" {
+				t.Fatalf("events = %+v", events)
+			}
+		})
+	}
+}
+
+func TestWakeKeepsMaster(t *testing.T) {
+	for _, c := range []struct {
+		name       string
+		written    time.Time
+		keepWorker bool
+	}{
+		{"with a worker left", time.Now().Add(-2 * cacheLife), true},
+		{"within its prompt cache", time.Now().Add(-cacheLife / 2), false},
+		{"without a transcript", time.Time{}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			d, fc := staleMaster(t, "", c.written, c.keepWorker)
+			mustCall(t, Request{Op: "tell", Text: "x"})
+			awaitWoken(t, d, fc, 2)
+			if got, want := resumes(fc), []string{"--bg --resume s-m -- " + eventsWaiting}; !slices.Equal(got, want) {
+				t.Fatalf("claude ran with %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// A clear that never reports its new conversation still wakes the master.
+func TestWakeAfterFailedClear(t *testing.T) {
+	d, fc := staleMaster(t, "", time.Now().Add(-2*cacheLife), false)
+	wait := clearWait
+	clearWait = 50 * time.Millisecond
+	t.Cleanup(func() { clearWait = wait })
+	fc.mu.Lock()
+	fc.cleared = nil
+	fc.mu.Unlock()
+	mustCall(t, Request{Op: "tell", Text: "x"})
+	awaitWoken(t, d, fc, 3)
+	if got := resumes(fc); len(got) != 2 || got[1] != "--bg --resume s-m -- "+eventsWaiting {
+		t.Fatalf("claude ran with %q", got)
+	}
+}
+
 // peerPrompt is the UserPromptSubmit of a session that a message from session from reaches.
 func peerPrompt(from, text string) []byte {
 	raw, _ := json.Marshal(map[string]any{
@@ -1195,12 +1327,30 @@ func TestSwitchModel(t *testing.T) {
 	}
 }
 
+// A copy of the master after a clear continues the conversation the clear began, not the one the session began with.
+func TestSwitchModelAfterClear(t *testing.T) {
+	d, fc := testDaemon(t)
+	d.mu.Lock()
+	d.nodes[masterNode].SessionID, d.nodes[masterNode].Conversation = "s-master", "s-cleared"
+	d.mu.Unlock()
+	mustCall(t, Request{Op: "model", Model: "opus"})
+	if sid := argAfter(fc.lastStart(), "--resume"); sid != "s-cleared" {
+		t.Fatalf("the switch copied %q", sid)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if c := d.nodes[masterNode].Conversation; c != "" {
+		t.Fatalf("the copy keeps the conversation %q", c)
+	}
+}
+
 func TestSwitchModelFailureResumesMaster(t *testing.T) {
 	d, fc := testDaemon(t)
 	d.mu.Lock()
 	d.nodes[masterNode].SessionID = "s-master"
 	d.mu.Unlock()
 	fc.mu.Lock()
+	fc.agents[0].SessionID = "s-master"
 	fc.fail = func(args []string) error {
 		if slices.Contains(args, "--model") {
 			return fmt.Errorf("unknown model")

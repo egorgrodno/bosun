@@ -37,6 +37,8 @@ const (
 
 Work in a loop: call next_event, handle every event it returns, and call it again. When it returns no events, end your turn: the next event starts a new one.
 
+Once you have merged every worker and an hour has passed since your last turn, bosun clears your conversation before the next event wakes you, so you wake with no earlier conversation. Whenever you learn something that must outlast a clear, such as how the user wants decisions handled, write it to your memory directory then.
+
 The events:
 - tell: a message from the user. Act on it, usually by starting workers with spawn.
 - decision of kind question: a worker asks something. Settle it with reply or escalate.

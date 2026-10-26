@@ -86,6 +86,8 @@ type Session struct {
 	Status    string `json:"status"`
 	State     string `json:"state,omitempty"`
 	Killed    bool   `json:"killed,omitempty"`
+	// Conversation is the one a clear began, which a copy of the session must name.
+	Conversation string `json:"conversation,omitempty"`
 	// LimitedUntil is when the usage limit that stopped the session resets, and the daemon resumes it.
 	LimitedUntil *time.Time `json:"limitedUntil,omitempty"`
 

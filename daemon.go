@@ -51,6 +51,12 @@ var idleWait = 30 * time.Second
 // stopWait bounds how long a resume waits for the process of the session it stopped to exit.
 const stopWait = 10 * time.Second
 
+// cacheLife is how long Claude Code's prompt cache keeps a session's transcript.
+const cacheLife = time.Hour
+
+// clearWait bounds how long a clear waits for the master's SessionStart.
+var clearWait = 30 * time.Second
+
 var (
 	errInTurn   = errors.New("still in its turn")
 	errStarting = errors.New("still starting")
@@ -87,6 +93,8 @@ type daemon struct {
 	stopBlocked bool
 	// asleep holds from a Stop that ends the master's turn with no events waiting until the next event resumes it.
 	asleep bool
+	// cleared closes once the master's SessionStart reports the conversation that a clear began.
+	cleared chan struct{}
 	// recovering holds while the daemon resumes the sessions that a usage limit stopped, and limitNotice is the last notice of a limit.
 	recovering  bool
 	limitNotice string
@@ -435,6 +443,7 @@ type hookInput struct {
 	LastMessage string          `json:"last_assistant_message"`
 	Error       string          `json:"error"`
 	Prompt      string          `json:"prompt"`
+	Source      string          `json:"source"`
 }
 
 // hook handles one hook event of a session. It blocks while a decision it opened waits, and answers with no behavior when the decision is withdrawn.
@@ -462,6 +471,14 @@ func (d *daemon) hook(ctx context.Context, node string, raw json.RawMessage) (Re
 	case "SessionStart":
 		if n.Repo != "" {
 			worktree = n.Dir
+		}
+		if in.Source == "clear" && node == masterNode {
+			n.Conversation = in.SessionID
+			d.saveLocked()
+			if d.cleared != nil {
+				close(d.cleared)
+				d.cleared = nil
+			}
 		}
 	case "UserPromptSubmit":
 		if from, text, ok := peerMessage(in.Prompt); ok {
@@ -828,9 +845,15 @@ func (d *daemon) pushLocked(ev Event) {
 }
 
 // wakeMaster resumes the master asleep. A master found in a turn, as one is once the user types into it, or starting needs no waking: it reads the events before its turn ends.
+// A stale master wakes in a new conversation.
 func (d *daemon) wakeMaster() {
 	d.masterLock.Lock()
 	defer d.masterLock.Unlock()
+	if d.stale(time.Now()) {
+		if err := d.clearMaster(context.Background()); err != nil {
+			log.Printf("clearing the master's conversation: %v", err)
+		}
+	}
 	err := d.carryOn(context.Background(), masterNode, eventsWaiting)
 	if err == nil || errors.Is(err, errInTurn) || errors.Is(err, errStarting) {
 		return
@@ -841,6 +864,61 @@ func (d *daemon) wakeMaster() {
 	d.asleep = true
 	id := d.nodes[masterNode].ID
 	d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("Waking the master failed, so its events wait unread: %v. The next event tries again. If it keeps failing, `claude rm %s` and a restart of the daemon start a new master, without the old one's conversation.", err, id)})
+}
+
+// stale reports whether the master should wake in a new conversation: no worker is left for it to remember, and it has outlasted its prompt cache, so its next turn would read the whole transcript uncached.
+func (d *daemon) stale(now time.Time) bool {
+	d.mu.Lock()
+	m := d.nodes[masterNode]
+	if m == nil || m.ID == "" || len(d.nodes) > 1 {
+		d.mu.Unlock()
+		return false
+	}
+	dir := filepath.Dir(m.memoryDir())
+	d.mu.Unlock()
+	last, ok := lastWrite(dir)
+	return ok && now.Sub(last) >= cacheLife
+}
+
+// lastWrite returns when Claude Code last wrote a transcript in dir, a project folder of its config directory, and whether it holds one.
+func lastWrite(dir string) (time.Time, bool) {
+	paths, _ := filepath.Glob(filepath.Join(dir, "*.jsonl"))
+	var last time.Time
+	for _, p := range paths {
+		if fi, err := os.Stat(p); err == nil && fi.ModTime().After(last) {
+			last = fi.ModTime()
+		}
+	}
+	return last, !last.IsZero()
+}
+
+// clearMaster moves the master to a new conversation in the same session, as /clear does, and leaves it idle.
+func (d *daemon) clearMaster(ctx context.Context) error {
+	cleared := make(chan struct{})
+	d.mu.Lock()
+	m := d.nodes[masterNode]
+	id, dir := m.ID, m.Dir
+	d.cleared = cleared
+	d.mu.Unlock()
+	defer func() {
+		d.mu.Lock()
+		if d.cleared == cleared {
+			d.cleared = nil
+		}
+		d.mu.Unlock()
+	}()
+	if err := d.restart(ctx, m, id, dir, "/clear"); err != nil {
+		return err
+	}
+	timer := time.NewTimer(clearWait)
+	defer timer.Stop()
+	select {
+	case <-cleared:
+		log.Print("cleared the master's conversation")
+		return nil
+	case <-timer.C:
+		return fmt.Errorf("the master began no new conversation within %v of /clear", clearWait)
+	}
 }
 
 // sleepLocked lets the master sleep until the next event, or wakes it now when events already wait, since only a new event wakes it.
@@ -1473,25 +1551,7 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	case killed:
 		return fmt.Errorf("the user stopped %s", name)
 	}
-	a, err := d.awaitIdle(ctx, name, id)
-	if err != nil {
-		return err
-	}
-
-	// Claude Code resumes a running session into a copy under a new id, so a running session stops first.
-	if err := d.hold(n, id); err != nil {
-		return err
-	}
-	defer d.release(n)
-	if a.Status != "" {
-		err = d.claude.Stop(id)
-		if err == nil {
-			err = d.awaitExit(ctx, name, a.PID)
-		}
-	}
-	if err == nil {
-		err = d.resumeStopped(dir, id, a.SessionID, prompt)
-	}
+	err := d.restart(ctx, n, id, dir, prompt)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if err != nil {
@@ -1503,6 +1563,32 @@ func (d *daemon) carryOn(ctx context.Context, name, prompt string) error {
 	d.broadcastSessionsLocked()
 	log.Printf("resumed %s (%s)", name, id)
 	return nil
+}
+
+// restart resumes n, still session id, with prompt once it ends its turn, holding it meanwhile.
+func (d *daemon) restart(ctx context.Context, n *Session, id, dir, prompt string) error {
+	a, err := d.awaitIdle(ctx, n.Node, id)
+	if err != nil {
+		return err
+	}
+	// Claude Code resumes a running session into a copy under a new id, so a running session stops first.
+	if err := d.hold(n, id); err != nil {
+		return err
+	}
+	defer d.release(n)
+	if a.Status != "" {
+		if err := d.claude.Stop(id); err != nil {
+			return err
+		}
+		if err := d.awaitExit(ctx, n.Node, a.PID); err != nil {
+			return err
+		}
+		// A running session lists the conversation it is in. Once a clear has begun a new one, only the stopped listing names the id that resumes the session.
+		if _, a, err = d.listed(id); err != nil {
+			return err
+		}
+	}
+	return d.resumeStopped(dir, id, a.SessionID, prompt)
 }
 
 // hold claims n, still session id, for resume or merge, as long as the user did not stop it.
@@ -1700,7 +1786,7 @@ func (d *daemon) switchModel(model string) error {
 	defer d.masterLock.Unlock()
 	d.mu.Lock()
 	m := d.nodes[masterNode]
-	old, sid := m.ID, m.SessionID
+	old, sid := m.ID, cmp.Or(m.Conversation, m.SessionID)
 	next := &Session{Node: masterNode, Dir: m.Dir, Model: model}
 	d.mu.Unlock()
 	if old == "" || sid == "" {
@@ -1712,12 +1798,12 @@ func (d *daemon) switchModel(model string) error {
 	}
 	id, err := d.start(next, next.Dir, []string{"--resume", sid}, masterPrompt, fmt.Sprintf("The user switched your model to %s. Carry on: call next_event.", model))
 	if err != nil {
-		d.restoreMaster(old, sid, pid, fmt.Sprintf("Switching your model to %s failed, so you keep the old one. Carry on: call next_event.", model))
+		d.restoreMaster(old, pid, fmt.Sprintf("Switching your model to %s failed, so you keep the old one. Carry on: call next_event.", model))
 		return err
 	}
 
 	d.mu.Lock()
-	m.ID, m.SessionID, m.Model = id, "", model
+	m.ID, m.SessionID, m.Conversation, m.Model = id, "", "", model
 	m.Status, m.State, m.pre = "starting", "", nil
 	d.asleep = false
 	d.started[masterNode] = time.Now()
@@ -1758,14 +1844,18 @@ func (d *daemon) pidOf(id string) int {
 }
 
 // restoreMaster resumes the old master, whose process was pid until a switch that failed stopped it, under its own id.
-func (d *daemon) restoreMaster(id, sid string, pid int, prompt string) {
+func (d *daemon) restoreMaster(id string, pid int, prompt string) {
 	d.mu.Lock()
 	m := d.nodes[masterNode]
 	dir := m.Dir
 	d.mu.Unlock()
 	err := d.awaitExit(context.Background(), masterNode, pid)
+	var a agent
 	if err == nil {
-		err = d.resumeStopped(dir, id, sid, prompt)
+		_, a, err = d.listed(id)
+	}
+	if err == nil {
+		err = d.resumeStopped(dir, id, a.SessionID, prompt)
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
