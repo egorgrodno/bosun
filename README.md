@@ -25,6 +25,8 @@ bosun attach <id>
 
 `bosun` alone lists every command.
 
+The master refuses messages from your other Claude Code sessions, though the sender's `SendMessage` reports success. Reach it with `bosun tell`, or type into it through `bosun attach`.
+
 The flake's default package builds `bosun`, so `nix run github:egorgrodno/bosun -- daemon` runs the daemon. As a systemd user service, the daemon needs `KillMode=process`, so that stopping the daemon leaves the sessions running.
 
 ## Development
