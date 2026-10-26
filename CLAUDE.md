@@ -219,6 +219,35 @@ A worker's parent must hear of every turn of it that ends or stops, unless a pau
 
 **The master's batch.** The events `next_event` returns stay with the daemon until the master's next `next_event`, or a `Stop` that ends its turn. When its turn ends any other way, such as by a crash, a kill, an API error, a pause or a restart, the daemon puts the batch back in front of the queue with `again` set. A worker that stops in its turn likewise gets back the reports of its children that the turn took.
 
+## Inside a session
+
+This section holds what a frontend can read from a session, and send to it, without `claude attach`. Haiku probes measured it against 2.1.310.
+
+**The transcript holds the conversation a message at a time.** `~/.claude/projects/<cwd slug>/<session id>.jsonl` gets a record for each prompt, each assistant content block (thinking, text, tool call with its input) and each tool result. A result's `toolUseResult` holds what the terminal draws for the call, such as an edit's `structuredPatch` or a command's `stdout` and `stderr`. An assistant message lands within about a second of the end of its response, as a record per block. Nothing lands while the model streams or a tool runs. In one probe, the records of 17 seconds of thinking, a 400-word text and the tool call after them landed together.
+
+**Most records are bookkeeping.** Beside `user`, `assistant` and `system`, a transcript holds `attachment` records of a dozen kinds and others such as `api-request`, `cost-state` and `last-prompt`. A `/compact` writes a `system` record of subtype `compact_boundary`. The summary follows as a `user` record with `isCompactSummary`, then the command's own records.
+
+**A session's own dialog reaches the transcript only as the tool call that raised it.** A pending question is the `AskUserQuestion` call's input. A pending permission is the bare tool call. The dialog's text, such as the rule that asked, shows only on the terminal. While a dialog waits, the job's `~/.claude/jobs/<id>/state.json` holds `tempo` `blocked`, and `needs` names the dialog, as `approve Bash: echo needs-permission` or `answer: red or blue? (Red · Blue)`.
+
+**The supervisor streams the terminal and the job state.** Its control socket is `/tmp/cc-daemon-<uid>/<hash>/control.sock`, hidden inside the sandbox. The protocol is undocumented and reports `proto` 1. The `subscribe` op needs no `auth`. The socket first sends a `snapshot` of the job record and the terminal's tail, then `stream` and `state` messages. Each `stream` is a chunk of terminal output with its escape codes. Only the `stream` carries a running tool's elapsed time and output. Each `state` patches `tempo`, `state`, `detail`, `needs` or `pid`. `detail` is a line on what the turn is doing, such as `Running the 12-second timed tail and printing ok`.
+
+**The supervisor's `reply` op types as the user.** It takes `short`, `text` and `auth`. `auth` is the content of `~/.claude/daemon/control.key`, a credential. The text goes into the session's queue, and the transcript gets a `queue-operation` record with `operation` `enqueue`. As with typing, what follows depends on the session:
+
+| The session | The text |
+|---|---|
+| idle | starts a turn as a `user` record with `origin` `{"kind":"human"}` |
+| in its turn | joins the turn when the running tool call returns, and `UserPromptSubmit` runs then |
+| blocked on an `AskUserQuestion` | answers it when the text names an option. The call's result reads `Your questions have been answered: "red or blue?"="Blue"` |
+| blocked on a permission prompt | waits in the queue, and the prompt stays open |
+
+A text the turn takes in gets a `queue-operation` with `operation` `remove` and `reason` `absorbed_mid_turn`, and a `queued_command` attachment with `origin` `{"kind":"human"}`. The queue lives in the process: a stop followed by a resume dropped a queued text. A `SendMessage`, by contrast, arrives as a peer's message.
+
+**A signal or a stop ends the process, not the turn.** No measured supervisor op interrupts a turn. `SIGINT` to the session's process ends it, as `claude stop` does. Neither runs `Stop`: each runs `SessionEnd` with `reason` `other`. The transcript ends on the tool call that was running. The next prompt writes that call's result, `[Tool call interrupted: the session ended before this call's result was recorded ...]`. A stop followed by a resume without flags or a prompt leaves the session idle. That interrupts a turn at the cost of a process start.
+
+**The supervisor's `attach` op may carry keys.** In the binary, the op turns its connection into the session's terminal. After its JSON reply, the socket carries raw terminal bytes both ways, so Esc or Enter written there acts as a key. It needs the same `auth` as `reply`. A probe's request omitted a required string field and got `malformed request`.
+
+**`/compact` runs no turn.** It compacts the session in place, under the same session id. It runs `PreCompact` and `PostCompact` with `trigger` `manual`. It runs `SessionStart` with `source` `compact`, and no `UserPromptSubmit`. It ran as the prompt after `--` in a resume of a stopped session, and as a `reply`. Unlike a prompt, a `reply` of `/compact` during a turn waited for the turn's `Stop`, then ran.
+
 ## Frontends
 
 Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `attached`, `transcript`. Every rule lives in the daemon.
@@ -270,10 +299,11 @@ Each leads with the queue of decisions waiting on you, above the tree. The desk 
 
 - **Effort.** That `--effort` lands in `respawnFlags` and survives a flagless resume is inferred from `--model` doing so, and unmeasured. So is whether `claude rm` of a switched worker's first id removes the worktree its copy runs in, and whether `claude rm` of the copy alone leaves it.
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
-- **Restarts and pauses.** Only a fake `claude` has run the restart handling and the pause. No real reboot, crash or pause has been measured. The daemon reads transcripts in the 2.1.310 format. Whether `claude stop` runs the `Stop` hook is unmeasured, so the daemon ignores a `Stop` from a session that a pause stopped.
+- **Restarts and pauses.** Only a fake `claude` has run the restart handling and the pause. No real reboot, crash or pause has been measured. The daemon reads transcripts in the 2.1.310 format. A `claude stop` in a turn runs no `Stop` (see "Inside a session"), and the daemon ignores a `Stop` from a session that a pause stopped.
 - **The desk.** No real desk has run. A probe session inside the master's directory measured the desk's trust, `autoMemoryDirectory` from `--settings` and the clear's transcript, and nothing more. Handing an idle desk its queue stops and resumes it, as waking the master does. Whether a `claude attach` open on it survives that is unmeasured. That a file tool's sensitive write asks even in auto mode comes from the 2.1.310 binary. The desk's answers assume that `UserPromptSubmit` carries each prompt you type, verbatim. No real desk has shown that. When it runs for a prompt typed while the desk is in its turn is unmeasured, and the daemon times the prompt by it. The desk's switch rests on the master's: no real desk has moved to a copy.
 - **The open master and its subagents.** No real `claude attach` has run under the `attached` hold. While you have the master open, it sleeps ten seconds after its last event, so a wake stops and resumes it under your `claude attach`. Whether the attach survives that is unmeasured. That a stop ends a background subagent, and that its result waits for the running tool call to return, are assumed, not measured.
 - **Reserved actions at the master.** Only the tests' fake hooks have sent one. Whether a file tool writes through a symlink, as the check assumes, is unmeasured.
 - **The allowlist.** No real session has run it. Two things are unmeasured: whether an `ask` rule sends a call outside the sandbox to `PermissionRequest` in auto mode, and whether `Bash(nixos-rebuild:*)` matches a flake with a `#host` attribute. The gate finds a push's repository from the hook's `cwd`. In the 2.1.310 binary that is the session's working directory, which a `cd` in an earlier Bash call moves, but no real session has shown it.
 - **The lean worker.** The probe ran without bosun's MCP server, in a scratch directory, and its Bash call stopped at a permission prompt after its second request. Whether a worker given a plugin or connectors gets the servers once `--strict-mcp-config` is off, and whether the user's other MCP servers then join it, is unmeasured. So is the effect of a `.lsp.json` or `-lsp` plugin on a worker's size.
 - **The lean master.** Only haiku probe sessions measured it, in a scratch directory with the same flags and settings. No real master has run lean. The snapshot in a probe's transcript records the built-in tools' descriptions too, so a resume without a clear may send the old ones. That is unmeasured, as is whether `--strict-mcp-config` outlasts a resume. No plugin that claude.ai syncs has been seen, so whether `userPlugins` finds one is unknown.
+- **Inside a session.** The probes ran outside bosun. The supervisor's ops may change with any Claude Code build. Esc and Enter through the `attach` op are unmeasured, as are a subagent's records and where they land.
