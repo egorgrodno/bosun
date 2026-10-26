@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -753,6 +754,39 @@ func TestAttachResumesStopped(t *testing.T) {
 	}
 	if _, err := call(context.Background(), Request{Op: "attach", ID: "ffffffff"}); err == nil {
 		t.Fatal("attached to a session bosun does not run")
+	}
+}
+
+// bosun attach runs claude attach only on a session the daemon readied, and passes on claude attach's failure.
+func TestAttachSession(t *testing.T) {
+	_, fc := testDaemon(t)
+	bin := t.TempDir()
+	ran := filepath.Join(bin, "ran")
+	script := fmt.Sprintf("#!/bin/sh\necho \"$@\" > %s\nexit 3\n", ran)
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	if err := attachSession("ffffffff"); err == nil || !strings.Contains(err.Error(), "no session ffffffff") {
+		t.Fatalf("attaching to a session bosun does not run: %v", err)
+	}
+	if _, err := os.Stat(ran); err == nil {
+		t.Fatal("claude attach ran on a session the daemon refused")
+	}
+
+	fc.add(agent{ID: "aaaaaaaa", SessionID: "s-a", Name: "a", Status: "busy"})
+	err := attachSession("aaaaaaaa")
+	if exit := (*exec.ExitError)(nil); !errors.As(err, &exit) || exit.ExitCode() != 3 {
+		t.Fatalf("a failing claude attach returned %v", err)
+	}
+	if args, _ := os.ReadFile(ran); string(args) != "attach aaaaaaaa\n" {
+		t.Fatalf("claude ran with %q", args)
+	}
+
+	t.Setenv("BOSUN_SOCKET", "@bosun-none-"+t.Name())
+	if err := attachSession("aaaaaaaa"); err == nil || !strings.Contains(err.Error(), "the daemon is not running") {
+		t.Fatalf("attaching without a daemon: %v", err)
 	}
 }
 

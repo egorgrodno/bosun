@@ -11,32 +11,46 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 )
 
-// runAttach runs claude attach on a session once the daemon has readied it, and without that when the daemon cannot.
+// runAttach runs claude attach on a session, and exits non-zero when either the daemon or claude attach fails, so that a terminal opened for it can stay open on the error.
 func runAttach(args []string) error {
 	if len(args) != 1 {
 		return errors.New(usage)
 	}
-	if err := readyAttach(args[0]); err != nil {
-		fmt.Fprintln(os.Stderr, "bosun:", err)
+	err := attachSession(args[0])
+	if exit := (*exec.ExitError)(nil); errors.As(err, &exit) {
+		// claude attach printed why.
+		os.Exit(max(exit.ExitCode(), 1))
 	}
-	claude, err := exec.LookPath("claude")
-	if err != nil {
-		return err
-	}
-	return syscall.Exec(claude, []string{"claude", "attach", args[0]}, os.Environ())
+	return err
 }
 
-// readyAttach has the daemon resume session id if it stopped, which claude attach would otherwise do itself, starting Claude Code's supervisor in this terminal.
-func readyAttach(id string) error {
+// attachSession hands the terminal to claude attach on session id until it exits, as Ctrl+Z makes it do, once the daemon has readied the session.
+// It stops at a daemon error: claude attach would resume a stopped session itself, starting Claude Code's supervisor in this terminal.
+func attachSession(id string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_, err := call(ctx, Request{Op: "attach", ID: id})
-	return err
+	if _, err := call(ctx, Request{Op: "attach", ID: id}); err != nil {
+		if op := (*net.OpError)(nil); errors.As(err, &op) {
+			return fmt.Errorf("the daemon is not running: %w", err)
+		}
+		return err
+	}
+	// The terminal's signals are claude's while it runs: caught here, they reset to the default in the child.
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTSTP, syscall.SIGQUIT)
+	defer signal.Stop(sigs)
+	cmd := exec.Command("claude", "attach", id)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("claude attach %s: %w", id, err)
+	}
+	return nil
 }
 
 func runCommand(cmd string, args []string) error {

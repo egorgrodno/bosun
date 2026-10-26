@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
 	"slices"
 	"strconv"
@@ -404,20 +403,10 @@ func runTUI() error {
 	}
 }
 
-// attach hands the terminal to claude attach until it exits, as Ctrl+Z makes it do, and returns why it failed, if it did.
+// attach hands the terminal to claude attach, and returns why it failed, if it did.
 func attach(id string) string {
-	ready := readyAttach(id)
-	// The terminal's signals are claude's while it runs: caught here, they reset to the default in the child.
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTSTP, syscall.SIGQUIT)
-	defer signal.Stop(sigs)
-	cmd := exec.Command("claude", "attach", id)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Sprintf("claude attach %s: %v", id, err)
-	}
-	if ready != nil {
-		return fmt.Sprintf("bosun did not resume %s before claude attach: %v", id, ready)
+	if err := attachSession(id); err != nil {
+		return err.Error()
 	}
 	return ""
 }
