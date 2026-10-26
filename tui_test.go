@@ -101,6 +101,12 @@ func TestTUIApply(t *testing.T) {
 	if !strings.Contains(screen, "b → a: b merges first.") || strings.Contains(screen, "Then rebase") {
 		t.Fatalf("the screen shows the message as:\n%s", screen)
 	}
+
+	tu.apply(Response{Type: "event", Event: &Event{Kind: "answered", Answered: &Answered{Decision: Decision{ID: "2", Kind: "question", Node: "a", Question: "X or Y?"}, Text: "Y", Words: "yes,\nY"}}})
+	screen = strings.Join(tu.render(100, 30), "\n")
+	if want := `answered asks: X or Y? → Y, on your words "yes, Y"`; !strings.Contains(screen, "Answered by the desk on your word") || !strings.Contains(screen, want) {
+		t.Fatalf("the screen shows the desk's answer as:\n%s", screen)
+	}
 }
 
 func TestTUIPause(t *testing.T) {

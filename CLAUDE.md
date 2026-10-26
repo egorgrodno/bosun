@@ -128,6 +128,7 @@ In the normal flow, auto mode decides a call outside the sandbox alone. The sett
 | `tell_master` | desk | queues the user's instruction for the master |
 | `status` | desk | shows what `bosun status` shows, with each decision and message in full |
 | `transcript` | desk | shows a session's last turns: each prompt, its text and a line per tool call |
+| `answer` | desk | gives your answer to a decision that waits on you, once you have said yes to it |
 | `tell_desk` | master | answers the desk, or the user when there is no desk |
 | `next_event` | master | blocks until a worker asks or needs a permission, a child of the master ends a turn or exits, or a `tell` comes from the desk, or from a frontend when there is no desk |
 | `reply` | master | answers a question |
@@ -172,7 +173,7 @@ The check covers only what a session sends: a message from outside bosun reaches
 
 ## The front desk
 
-**The desk is the session the user talks to.** The daemon starts it beside the master as node `desk`. It reads the fleet, files issues and reads repositories, and only the master changes the fleet. It passes the user's instructions to the master with `tell_master`, and the master answers with `tell_desk`. It does not answer decisions.
+**The desk is the session the user talks to.** The daemon starts it beside the master as node `desk`. It reads the fleet, files issues and reads repositories. It passes the user's instructions to the master with `tell_master`, and the master answers with `tell_desk`. Only the master changes the fleet. The desk also gives your answer to a decision that waits on you, once you say yes.
 
 **It shares the master's memory, not its transcripts.** It runs in `desk` inside the master's directory, so Claude Code files its transcripts apart from the master's. Its settings point `autoMemoryDirectory` at the master's memory directory.
 
@@ -181,6 +182,18 @@ The check covers only what a session sends: a message from outside bosun reaches
 **The daemon carries tells both ways.** A frontend's `tell` and the master's `tell_desk` queue text for the desk. The desk gets its queue the way a worker parent gets its children's reports. In a turn, the daemon blocks its `Stop` with the queue as the reason. Between turns, the daemon resumes it with the queue as the prompt, and a stopped desk resumes like an idle one. A turn cut short gives back the tells it took, marked `again`. Tells cut short twice go on to the master, so a desk whose every turn fails cannot loop on them. The desk's `tell_master` reaches the master as a `tell` event with `from` set to `desk`.
 
 **Without a desk, tells go to the master.** When the desk could not start, its session is gone or a usage limit stopped it, a `tell` goes to the master and a `tell_desk` reaches you as a notice. The master may run on a model the limit spares. A desk that the daemon fails to resume, or that a limit stops, hands on its queue the same way.
+
+**The desk answers a decision only after your yes to it.** Its `answer` takes two calls. The first proposes an answer to one decision. The daemon holds it and returns the decision in full, for the desk to show you. The second gives the answer, under three conditions:
+
+- it repeats the proposed answer
+- you have sent the desk exactly one message since the proposal
+- its `words` appear in that message
+
+So a decision that opened after your message can never be answered by it. A message is a prompt you type into the desk, read from its `UserPromptSubmit`, or a `tell` of yours, which counts from when you sent it. The master's answers, a tell handed over again after a cut turn, and bosun's own prompts do not count. Every prompt bosun sends the desk must begin with `bosun:` and a space, or be listed in `deskPromptFromBosun`. Any other prompt counts as your message. A clear or a restart drops what the desk proposed.
+
+**The daemon checks order and the quote, not the yes.** Whether your words say yes to that answer, and whether the desk showed you the decision, rest on the desk. The `answered` record shows you what it gave.
+
+**Some decisions the desk may not answer.** `answer` refuses a notice, a decision the master holds and a decision of the desk's own. It also refuses a reserved action on your list, marked `userOnly`, which only your own answer in a frontend settles. It may answer the master's own permissions, which wait on you.
 
 **A stale desk wakes cleared.** The daemon clears the desk as it clears the master: before it resumes the desk with its queue, and before a frontend's `attach` readies it. The desk is stale once its transcript has gone an hour unwritten, whatever the workers do. A clear would hide a reply you have not read, so a desk handed a tell since you last opened it through `attach` stays uncleared. A `claude attach` that skips `bosun attach` finds it uncleared.
 
@@ -202,7 +215,9 @@ A worker's parent must hear of every turn of it that ends or stops, unless a pau
 
 Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `attached`, `transcript`. Every rule lives in the daemon.
 
-A decision's `reserved` holds the reason it is a reserved action, such as `a force push`.
+A decision's `reserved` holds the reason it is a reserved action, such as `a force push`. Its `userOnly` marks an action on your list.
+
+A frontend should show the `answered` event and the snapshot's `answered`: each decision the desk answered on your word, with the answer given and the words the desk quoted.
 
 The snapshot's `paused`, and the `paused` and `unpaused` events, show a pause. A session's `paused` marks a turn that `unpause` resumes.
 
@@ -225,7 +240,7 @@ Each leads with the queue of decisions waiting on you, above the tree. The desk 
 - **Effort.** That `--effort` lands in `respawnFlags` and survives a flagless resume is inferred from `--model` doing so, and unmeasured. So is whether `claude rm` of a switched worker's first id removes the worktree its copy runs in, and whether `claude rm` of the copy alone leaves it.
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
 - **Restarts and pauses.** Only a fake `claude` has run the restart handling and the pause. No real reboot, crash or pause has been measured. The daemon reads transcripts in the 2.1.310 format. Whether `claude stop` runs the `Stop` hook is unmeasured, so the daemon ignores a `Stop` from a session that a pause stopped.
-- **The desk.** No real desk has run. A probe session inside the master's directory measured the desk's trust, `autoMemoryDirectory` from `--settings` and the clear's transcript, and nothing more. Handing an idle desk its queue stops and resumes it, as waking the master does. Whether a `claude attach` open on it survives that is unmeasured. That a file tool's sensitive write asks even in auto mode comes from the 2.1.310 binary.
+- **The desk.** No real desk has run. A probe session inside the master's directory measured the desk's trust, `autoMemoryDirectory` from `--settings` and the clear's transcript, and nothing more. Handing an idle desk its queue stops and resumes it, as waking the master does. Whether a `claude attach` open on it survives that is unmeasured. That a file tool's sensitive write asks even in auto mode comes from the 2.1.310 binary. The desk's answers assume that `UserPromptSubmit` carries each prompt you type, verbatim. No real desk has shown that. When it runs for a prompt typed while the desk is in its turn is unmeasured, and the daemon times the prompt by it.
 - **The open master and its subagents.** No real `claude attach` has run under the `attached` hold. While you have the master open, it sleeps ten seconds after its last event, so a wake stops and resumes it under your `claude attach`. Whether the attach survives that is unmeasured. That a stop ends a background subagent, and that its result waits for the running tool call to return, are assumed, not measured.
 - **Reserved actions at the master.** Only the tests' fake hooks have sent one. Whether a file tool writes through a symlink, as the check assumes, is unmeasured.
 - **The allowlist.** No real session has run it. Two things are unmeasured: whether an `ask` rule sends a call outside the sandbox to `PermissionRequest` in auto mode, and whether `Bash(nixos-rebuild:*)` matches a flake with a `#host` attribute. The gate finds a push's repository from the hook's `cwd`. In the 2.1.310 binary that is the session's working directory, which a `cd` in an earlier Bash call moves, but no real session has shown it.

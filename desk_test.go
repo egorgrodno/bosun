@@ -2,9 +2,12 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -157,7 +160,7 @@ func TestDeskTools(t *testing.T) {
 	for _, tool := range tools(deskNode) {
 		names = append(names, tool.Name)
 	}
-	if !slices.Equal(names, []string{"tell_master", "status", "transcript"}) {
+	if !slices.Equal(names, []string{"tell_master", "status", "transcript", "answer"}) {
 		t.Fatalf("the desk's tools are %q", names)
 	}
 	desk := newMCPServer(deskNode, nil)
@@ -169,8 +172,6 @@ func TestDeskTools(t *testing.T) {
 		{Op: "ask", Node: deskNode, Text: "x"},
 		{Op: "merge", Node: deskNode, Name: "a"},
 		{Op: "resume", Node: deskNode, Name: "a", Text: "x"},
-		{Op: "approve", Node: deskNode, ID: "1"},
-		{Op: "reply", Node: deskNode, ID: "1", Text: "x"},
 		{Op: "escalate", Node: deskNode, ID: "1"},
 		{Op: "notify", Node: deskNode, Text: "x"},
 		{Op: "next_event", Node: deskNode},
@@ -528,4 +529,244 @@ func TestRestartAdoptsDesk(t *testing.T) {
 	if desk := d.nodes[deskNode]; desk.ID != "00000002" || len(desk.Events) != 0 {
 		t.Fatalf("desk = %+v", desk)
 	}
+}
+
+// deskSays runs the desk's UserPromptSubmit for prompt, as the user typing it into the desk does.
+func deskSays(t *testing.T, prompt string) {
+	t.Helper()
+	raw, _ := json.Marshal(map[string]any{"hook_event_name": "UserPromptSubmit", "session_id": "s-d", "prompt": prompt})
+	receive(t, runHookAsync(deskNode, raw))
+}
+
+// deskAnswer calls the desk's answer tool with the JSON arguments args.
+func deskAnswer(args string) (string, error) {
+	return newMCPServer(deskNode, nil).run(context.Background(), "answer", json.RawMessage(args))
+}
+
+// escalatedQuestion has worker a ask question, which the master escalates to the user as the nth open decision, and returns the answer a gets.
+func escalatedQuestion(t *testing.T, n int, question string) chan string {
+	t.Helper()
+	got := make(chan string, 1)
+	go func() {
+		resp, err := call(context.Background(), Request{Op: "ask", Node: "a", Text: question})
+		got <- cmp.Or(resp.Text, fmt.Sprint(err))
+	}()
+	dec := openDecision(t, n)
+	mustCall(t, Request{Op: "escalate", Node: masterNode, ID: dec.ID})
+	return got
+}
+
+// The desk gives the user's answer to a decision once the user has said yes to it, shown whole, and the frontends see what it gave on which words.
+func TestDeskAnswers(t *testing.T) {
+	d, _ := testDesk(t)
+	conn, err := net.Dial("unix", socketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if err := json.NewEncoder(conn).Encode(Request{Op: "watch"}); err != nil {
+		t.Fatal(err)
+	}
+	stream := json.NewDecoder(conn)
+
+	receive(t, runHookAsync("a", hookEvent("PreToolUse", "t1", "Bash", bashTest)))
+	hook := runHookAsync("a", hookEvent("PermissionRequest", "", "Bash", bashTest))
+	openDecision(t, 1)
+	mustCall(t, Request{Op: "escalate", Node: masterNode, ID: "1"})
+	deskSays(t, "approve a's tests")
+
+	text, err := deskAnswer(`{"id":"1","allow":true}`)
+	if err != nil || !strings.HasPrefix(text, "bosun has not answered decision 1") || !strings.Contains(text, "you will allow it") || !strings.Contains(text, `"command": "npm test"`) {
+		t.Fatalf("the first call returned %q, %v", text, err)
+	}
+	// The user's words from before the desk showed the decision say yes to nothing.
+	if text, err := deskAnswer(`{"id":"1","allow":true,"words":"approve a's tests"}`); err != nil || !strings.HasPrefix(text, "The user has said nothing since you showed it.") {
+		t.Fatalf("an answer before the user's yes returned %q, %v", text, err)
+	}
+	deskSays(t, "Yes,\n  run them.")
+	if text, err := deskAnswer(`{"id":"1","allow":true,"words":"yes, run them"}`); err == nil {
+		t.Fatalf("an answer on words the user did not write returned %q", text)
+	}
+	text, err = deskAnswer(`{"id":"1","allow":true,"words":"Yes, run them."}`)
+	if err != nil || text != "bosun allowed decision 1 on the user's word." {
+		t.Fatalf("the answer on the user's yes returned %q, %v", text, err)
+	}
+	if out := receive(t, hook); !strings.Contains(out, `"behavior":"allow"`) {
+		t.Fatalf("hook printed %s", out)
+	}
+
+	for {
+		var r Response
+		if err := stream.Decode(&r); err != nil {
+			t.Fatal(err)
+		}
+		if r.Event != nil && r.Event.Kind == "answered" {
+			if a := r.Event.Answered; a.Decision.ID != "1" || a.Behavior != "allow" || a.Words != "Yes, run them." {
+				t.Fatalf("answered = %+v", a)
+			}
+			break
+		}
+	}
+	restart(t, d)
+	resp := mustCall(t, Request{Op: "status"})
+	if len(resp.Answered) != 1 || resp.Answered[0].Decision.Tool != "Bash" {
+		t.Fatalf("answered after a restart = %+v", resp.Answered)
+	}
+	var b strings.Builder
+	printStatus(&b, resp)
+	if want := `allowed Bash: npm test, on your words "Yes, run them."`; !strings.Contains(b.String(), want) {
+		t.Fatalf("status shows\n%s\nwithout %s", b.String(), want)
+	}
+}
+
+// The desk answers only the user's own decisions, and not a reserved action on the user's list.
+func TestDeskAnswerRefuses(t *testing.T) {
+	testDesk(t)
+	asked := make(chan string, 1)
+	go func() {
+		resp, _ := call(context.Background(), Request{Op: "ask", Node: "a", Text: "haiku or sonnet?"})
+		asked <- resp.Text
+	}()
+	openDecision(t, 1)
+	push := runHookAsync("a", hookEvent("PreToolUse", "t2", "Bash", map[string]any{"command": "git push --force origin HEAD"}))
+	if dec := openDecision(t, 2); !dec.UserOnly {
+		t.Fatalf("decision = %+v", dec)
+	}
+	receive(t, runHookAsync(deskNode, hookEvent("PreToolUse", "t3", "Bash", bashTest)))
+	own := runHookAsync(deskNode, hookEvent("PermissionRequest", "", "Bash", bashTest))
+	openDecision(t, 3)
+	mustCall(t, Request{Op: "notify", Node: masterNode, Text: "spawn failed"})
+	openDecision(t, 4)
+
+	for id, c := range map[string]struct{ args, refusal string }{
+		"1": {`"answer":"haiku"`, "waits on the master"},
+		"2": {`"allow":true`, "on the user's list"},
+		"3": {`"allow":true`, "your own"},
+		"4": {`"allow":true`, "is a notice"},
+	} {
+		deskSays(t, "approve "+id)
+		// A refusal holds no answer for the user's next message to say yes to.
+		for range 2 {
+			if text, err := deskAnswer(fmt.Sprintf(`{"id":%q,%s,"words":"yes"}`, id, c.args)); err == nil || !strings.Contains(err.Error(), c.refusal) {
+				t.Errorf("answering %s returned %q, %v", id, text, err)
+			}
+			deskSays(t, "yes")
+		}
+	}
+	if _, err := call(context.Background(), Request{Op: "dismiss", Node: deskNode, ID: "4"}); err == nil {
+		t.Error("the desk dismissed a notice")
+	}
+	if n := len(mustCall(t, Request{Op: "status"}).Decisions); n != 4 {
+		t.Fatalf("%d decisions open", n)
+	}
+	mustCall(t, Request{Op: "reply", ID: "1", Text: "haiku"})
+	mustCall(t, Request{Op: "deny", ID: "2"})
+	mustCall(t, Request{Op: "deny", ID: "3"})
+	receive(t, asked)
+	receive(t, push)
+	receive(t, own)
+}
+
+// Only the user's next message after the desk showed an answer says yes to it: a tell from the user counts, and bosun's own prompts and the master's answers do not.
+func TestDeskAnswerAwaitsNextMessage(t *testing.T) {
+	d, fc := testDesk(t)
+	deskSays(t, "tell a to use haiku")
+	asked := escalatedQuestion(t, 1, "haiku or sonnet?")
+	haiku := func(words string) string {
+		t.Helper()
+		text, err := deskAnswer(fmt.Sprintf(`{"id":"1","answer":"Use haiku.","words":%q}`, words))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return text
+	}
+	if text := haiku("tell a to use haiku"); !strings.HasPrefix(text, "bosun has not answered") || !strings.Contains(text, "you will answer: Use haiku.") {
+		t.Fatalf("an answer to a decision that opened after the user's message returned %q", text)
+	}
+
+	for _, prompt := range []string{deskStart, pauseReset, limitReset, "/clear", deskReport([]Event{{Kind: "tell", From: masterNode, Text: "a asks which model."}})} {
+		deskSays(t, prompt)
+	}
+	mustCall(t, Request{Op: "tell", Node: masterNode, Text: "yes"})
+	awaitStarts(t, fc, 3)
+	awaitQueued(t, d, deskNode, 0, 1)
+	if text := haiku("yes"); !strings.Contains(text, "said nothing since") {
+		t.Fatalf("an answer on the master's word returned %q", text)
+	}
+
+	// A tell of the user's counts from when they sent it, though the desk gets it only as its turn ends.
+	d.poll()
+	tellInTurn := func(text string) {
+		t.Helper()
+		mustCall(t, Request{Op: "tell", Text: text})
+		if out := stopHook(t, deskNode, "Answer a: use haiku?"); !strings.Contains(out, `"decision":"block"`) {
+			t.Fatalf("the desk's Stop printed %s", out)
+		}
+	}
+	mustCall(t, Request{Op: "tell", Text: "yes, use haiku"})
+	haiku("yes")
+	stopHook(t, deskNode, "Answer a: use haiku?")
+	if text := haiku("use haiku"); !strings.Contains(text, "said nothing since") {
+		t.Fatalf("an answer on a tell sent before it was shown returned %q", text)
+	}
+	tellInTurn("yes, use haiku")
+	if text := haiku("use haiku"); text != "bosun answered decision 1 on the user's word." {
+		t.Fatalf("the answer on the user's tell returned %q", text)
+	}
+	if got := receive(t, asked); got != "Use haiku." {
+		t.Fatalf("a got %q", got)
+	}
+
+	asked = escalatedQuestion(t, 1, "and for the tests?")
+	sonnet := func(words string) string {
+		t.Helper()
+		text, err := deskAnswer(fmt.Sprintf(`{"id":"2","answer":"Use sonnet.","words":%q}`, words))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return text
+	}
+	sonnet("")
+	deskSays(t, "which is cheaper?")
+	deskSays(t, "ok, yes")
+	if text := sonnet("yes"); !strings.HasPrefix(text, "The user has written to you more than once") {
+		t.Fatalf("an answer two messages after it was shown returned %q", text)
+	}
+	// Tells handed over together are as many messages.
+	mustCall(t, Request{Op: "tell", Text: "wait"})
+	tellInTurn("yes")
+	if text := sonnet("yes"); !strings.HasPrefix(text, "The user has written to you more than once") {
+		t.Fatalf("an answer two tells after it was shown returned %q", text)
+	}
+	// A call without words asks anew, so the yes before it no longer counts.
+	deskSays(t, "yes")
+	if text := sonnet(""); !strings.HasPrefix(text, "bosun has not answered") {
+		t.Fatalf("a call without words returned %q", text)
+	}
+	if text := sonnet("yes"); !strings.Contains(text, "said nothing since") {
+		t.Fatalf("an answer on a yes from before it was asked again returned %q", text)
+	}
+	deskSays(t, "yes")
+	if text, _ := deskAnswer(`{"id":"2","answer":"Use haiku.","words":"yes"}`); !strings.HasPrefix(text, "It differs from the answer you last showed") {
+		t.Fatalf("an answer other than the one shown returned %q", text)
+	}
+	// A clear leaves the desk no memory of what it showed.
+	deskSays(t, "yes")
+	raw, _ := json.Marshal(map[string]any{"hook_event_name": "SessionStart", "session_id": "s-d-2", "source": "clear"})
+	receive(t, runHookAsync(deskNode, raw))
+	if text, _ := deskAnswer(`{"id":"2","answer":"Use haiku.","words":"yes"}`); !strings.HasPrefix(text, "bosun has not answered") {
+		t.Fatalf("an answer shown before a clear returned %q", text)
+	}
+
+	// A tell that a cut turn gives back was the user's message once already.
+	d.mu.Lock()
+	before := d.said
+	d.toldLocked([]Event{{Kind: "tell", Text: "yes", Again: true}, {Kind: "tell", From: masterNode, Text: "yes"}})
+	after := d.said
+	d.mu.Unlock()
+	if after != before {
+		t.Fatalf("the user's message went from %+v to %+v", before, after)
+	}
+	mustCall(t, Request{Op: "reply", ID: "2", Text: "sonnet"})
+	receive(t, asked)
 }

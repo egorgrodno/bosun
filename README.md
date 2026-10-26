@@ -1,6 +1,6 @@
 # bosun
 
-A master Claude Code session that runs a tree of worker sessions. It answers their routine questions and brings you the rest. A front desk session talks to you: it answers questions about the fleet at once and passes your instructions to the master. A Quickshell panel drives bosun on the NixOS desktops, and a TUI drives it everywhere else.
+A master Claude Code session that runs a tree of worker sessions. It answers their routine questions and brings you the rest. A front desk session talks to you: it answers questions about the fleet at once, passes your instructions to the master, and settles a decision for you once you say yes. A Quickshell panel drives bosun on the NixOS desktops, and a TUI drives it everywhere else.
 
 [CLAUDE.md](CLAUDE.md) holds the design. The daemon and its frontends work: the command line, `bosun tui` and the Quickshell panel.
 

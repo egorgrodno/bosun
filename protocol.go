@@ -29,6 +29,8 @@ type Request struct {
 	// Turns is how many of a session's last turns a transcript shows.
 	Turns int             `json:"turns,omitempty"`
 	Hook  json.RawMessage `json:"hook,omitempty"`
+	// Words quotes the user's message that the desk's answer to a decision acts on.
+	Words string `json:"words,omitempty"`
 	// Key names a request that its client sends again, unchanged, once the daemon is back from a restart.
 	Key string `json:"key,omitempty"`
 }
@@ -45,10 +47,11 @@ type Response struct {
 	Sessions  []Session  `json:"sessions,omitempty"`
 	Decisions []Decision `json:"decisions,omitempty"`
 	Messages  []Event    `json:"messages,omitempty"`
+	Answered  []Answered `json:"answered,omitempty"`
 	Paused    bool       `json:"paused,omitempty"`
 }
 
-// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, tell and message; the desk gets tell; a frontend gets decision, settled, sessions, message, paused and unpaused.
+// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, tell and message; the desk gets tell; a frontend gets decision, settled, answered, sessions, message, paused and unpaused.
 // A message is what session From told session Node through Claude Code's SendMessage. A tell is From's text: the user's when From is empty, or the desk's or the master's.
 // Again marks an event the master took once already, in a turn that was cut short.
 type Event struct {
@@ -59,7 +62,21 @@ type Event struct {
 	Text     string    `json:"text,omitempty"`
 	Decision *Decision `json:"decision,omitempty"`
 	Sessions []Session `json:"sessions,omitempty"`
+	Answered *Answered `json:"answered,omitempty"`
 	Again    bool      `json:"again,omitempty"`
+
+	// sent is when the user sent a tell to the desk, which may hand it over only after an answer it proposed since.
+	sent time.Time
+}
+
+// Answered is a decision the desk answered on the user's word: Behavior is allow or deny for a permission, and Text a denial's message or a question's answer.
+// Words quotes the user's message that said yes to the answer, which the desk had shown them in full.
+type Answered struct {
+	Decision Decision  `json:"decision"`
+	Behavior string    `json:"behavior,omitempty"`
+	Text     string    `json:"text,omitempty"`
+	Words    string    `json:"words"`
+	At       time.Time `json:"at"`
 }
 
 // Decision is a permission or a question waiting on its holder, the master or the user, or a notice from the master waiting on the user. A notice's text is its Note.
@@ -75,6 +92,8 @@ type Decision struct {
 	Note     string          `json:"note,omitempty"`
 	// Refused is the reason auto mode gave for refusing the session's last call. After a run of refusals, it asks about a call instead of refusing it.
 	Refused string `json:"refused,omitempty"`
+	// UserOnly marks a reserved action on the user's list, which only the user's own answer in a frontend settles.
+	UserOnly bool `json:"userOnly,omitempty"`
 
 	toolUseID string
 	// key is the Key of the request that waits on the decision.

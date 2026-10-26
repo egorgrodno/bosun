@@ -110,6 +110,13 @@ type daemon struct {
 	watchers  map[*watcher]bool
 	// messages holds the latest messages between sessions, for a frontend's snapshot.
 	messages []Event
+	// said is the user's latest message to the desk, typed into it or told through bosun, and saidBefore when the one before it came.
+	said       userMessage
+	saidBefore time.Time
+	// proposed holds by decision id the answer the desk last showed the user, which only the user's next message can say yes to.
+	proposed map[string]proposal
+	// answered holds the latest decisions the desk answered on the user's word.
+	answered []Answered
 	// stopBlocked holds from a block of the master's Stop until its next call to next_event.
 	// Claude Code's stop_hook_active cannot stand in: it stays true for the rest of the turn a block continued.
 	stopBlocked bool
@@ -145,6 +152,17 @@ type watcher struct {
 	cancel context.CancelFunc
 }
 
+type userMessage struct {
+	at   time.Time
+	text string
+}
+
+// proposal is an answer the desk showed the user at at.
+type proposal struct {
+	answer answer
+	at     time.Time
+}
+
 // preCall is a PreToolUse not yet followed by its PostToolUse.
 type preCall struct {
 	tool  string
@@ -158,6 +176,7 @@ type savedState struct {
 	Taken     []Event         `json:"taken,omitempty"`
 	TakenKey  string          `json:"takenKey,omitempty"`
 	Decisions []savedDecision `json:"decisions,omitempty"`
+	Answered  []Answered      `json:"answered,omitempty"`
 	Paused    bool            `json:"paused,omitempty"`
 }
 
@@ -184,6 +203,7 @@ func newDaemon(exe, socket, stateDir, masterDir string, claude claudeCLI) *daemo
 		decisions:   map[string]*Decision{},
 		orphans:     map[string]*Decision{},
 		cleared:     map[string]chan struct{}{},
+		proposed:    map[string]proposal{},
 		wake:        make(chan struct{}),
 		watchers:    map[*watcher]bool{},
 	}
@@ -343,7 +363,7 @@ func (d *daemon) load() error {
 			}
 		}
 	}
-	d.events, d.taken, d.takenKey, d.paused = st.Events, st.Taken, st.TakenKey, st.Paused
+	d.events, d.taken, d.takenKey, d.paused, d.answered = st.Events, st.Taken, st.TakenKey, st.Paused, st.Answered
 	for _, sd := range st.Decisions {
 		dec := sd.Decision
 		dec.toolUseID, dec.key, dec.opened, dec.prompt = sd.ToolUseID, sd.Key, sd.Opened, sd.Prompt
@@ -362,7 +382,7 @@ func (d *daemon) saveLocked() {
 	if d.stopping {
 		return
 	}
-	st := savedState{NextID: d.nextID, Events: d.events, Taken: d.taken, TakenKey: d.takenKey, Paused: d.paused}
+	st := savedState{NextID: d.nextID, Events: d.events, Taken: d.taken, TakenKey: d.takenKey, Answered: d.answered, Paused: d.paused}
 	for _, n := range d.sortedLocked() {
 		st.Sessions = append(st.Sessions, n)
 	}
@@ -576,17 +596,17 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 			resp.Events = d.nextEvent(ctx, r.Key)
 		}
 	case "approve":
-		err = d.answer(r.Node, r.ID, "permission", answer{behavior: "allow"})
+		resp.Text, err = d.answer(r.Node, r.ID, r.Words, "permission", answer{behavior: "allow"})
 	case "deny":
-		err = d.answer(r.Node, r.ID, "permission", answer{behavior: "deny", text: r.Text})
+		resp.Text, err = d.answer(r.Node, r.ID, r.Words, "permission", answer{behavior: "deny", text: r.Text})
 	case "reply":
-		err = d.answer(r.Node, r.ID, "question", answer{text: r.Text})
+		resp.Text, err = d.answer(r.Node, r.ID, r.Words, "question", answer{text: r.Text})
 	case "escalate":
 		err = d.escalate(r.Node, r.ID, r.Text)
 	case "notify":
 		err = d.notify(r.Node, r.Text)
 	case "dismiss":
-		err = d.answer(r.Node, r.ID, "notice", answer{})
+		resp.Text, err = d.answer(r.Node, r.ID, r.Words, "notice", answer{})
 	case "tell":
 		err = d.tell(r.Node, r.Text)
 	case "transcript":
@@ -687,9 +707,16 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 				delete(d.cleared, node)
 			}
 		}
+		if node == deskNode && (in.Source == "clear" || in.Source == "startup") {
+			// The desk's new conversation holds neither the answers it showed the user nor the user's yes to one.
+			d.said, d.saidBefore = userMessage{}, time.Time{}
+			clear(d.proposed)
+		}
 	case "UserPromptSubmit":
 		if from, text, ok := peerMessage(in.Prompt); ok {
 			d.messageLocked(Event{Kind: "message", Node: node, From: from, Text: text})
+		} else if node == deskNode && !deskPromptFromBosun(in.Prompt) {
+			d.saidLocked(in.Prompt, time.Now())
 		}
 	case "PreToolUse":
 		// A permission still open from an earlier call was denied in the session's own prompt, which runs no tool.
@@ -704,7 +731,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 			if reserved.user || !isWorker(node) {
 				holder = "user"
 			}
-			dec = &Decision{Kind: "permission", Node: node, Holder: holder, Reserved: reserved.reason, Tool: in.ToolName, Input: in.ToolInput, Refused: n.refused, toolUseID: in.ToolUseID, key: key}
+			dec = &Decision{Kind: "permission", Node: node, Holder: holder, Reserved: reserved.reason, UserOnly: reserved.user, Tool: in.ToolName, Input: in.ToolInput, Refused: n.refused, toolUseID: in.ToolUseID, key: key}
 		}
 		if in.ToolName != "SendMessage" {
 			break
@@ -790,6 +817,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 			// The pause stopped the session in its turn, which unpausing resumes.
 		case node == deskNode && len(n.Events) > 0:
 			resp.Behavior, resp.Text = "block", deskReport(n.Events)
+			d.toldLocked(n.Events)
 			n.Taken, n.Events, n.Unseen = append(n.Taken, n.Events...), nil, true
 			d.saveLocked()
 		case node == deskNode:
@@ -1065,6 +1093,7 @@ func (d *daemon) wait(ctx context.Context, dec *Decision) (answer, bool) {
 
 func (d *daemon) settleLocked(dec *Decision, a answer) {
 	delete(d.decisions, dec.ID)
+	delete(d.proposed, dec.ID)
 	dec.answer <- a
 	d.saveLocked()
 	d.broadcastLocked(Event{Kind: "settled", ID: dec.ID})
@@ -1114,24 +1143,23 @@ func (d *daemon) expireOrphans(now time.Time) {
 	}
 }
 
-// answer settles a decision for caller: the master for a decision it holds, or "" for the user, who may answer any.
-func (d *daemon) answer(caller, id, kind string, a answer) error {
-	if caller != "" && caller != masterNode {
-		return errors.New("only the master or the user answers")
-	}
-	if kind == "question" && a.text == "" {
-		return errors.New("the answer is empty")
+// answer settles a decision for caller: the master for a decision it holds, "" for the user, who may answer any, or the desk for the user, on the user's words.
+func (d *daemon) answer(caller, id, words, kind string, a answer) (string, error) {
+	if caller != "" && caller != masterNode && caller != deskNode {
+		return "", errors.New("only the master, the desk or the user answers")
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	dec := d.decisions[id]
 	switch {
 	case dec == nil:
-		return fmt.Errorf("no open decision %s", id)
+		return "", fmt.Errorf("no open decision %s", id)
 	case dec.Kind != kind:
-		return fmt.Errorf("decision %s is a %s", id, dec.Kind)
+		return "", fmt.Errorf("decision %s is a %s", id, dec.Kind)
+	case kind == "question" && a.text == "":
+		return "", errors.New("the answer is empty")
 	case caller == masterNode && dec.Holder != "master":
-		return fmt.Errorf("decision %s waits on the user", id)
+		return "", fmt.Errorf("decision %s waits on the user", id)
 	}
 	if a.behavior == "deny" && a.text == "" {
 		a.text = "The user denied this."
@@ -1139,8 +1167,104 @@ func (d *daemon) answer(caller, id, kind string, a answer) error {
 			a.text = "The bosun master denied this."
 		}
 	}
+	if caller == deskNode {
+		return d.deskAnswerLocked(dec, words, a)
+	}
 	d.settleLocked(dec, a)
-	return nil
+	return "", nil
+}
+
+// inFrontend is where the user answers what the desk may not.
+const inFrontend = "so only the user answers it, in the bosun panel or bosun tui, or with bosun approve, deny or reply"
+
+// deskAnswerLocked gives a to dec for the desk once the user has said yes to it: the desk proposes a, which hands it dec in full to show the user, and the user's next message, which words quote, says yes.
+// A decision that opened after that message cannot have been shown before it. Without the yes, the call proposes a.
+func (d *daemon) deskAnswerLocked(dec *Decision, words string, a answer) (string, error) {
+	switch {
+	case dec.Kind == "notice":
+		return "", errors.New("only the user dismisses a notice")
+	case dec.Holder != "user":
+		return "", fmt.Errorf("decision %s waits on the master, which settles it. Pass on what the user wants done with it with tell_master", dec.ID)
+	case dec.Node == deskNode:
+		return "", fmt.Errorf("decision %s is your own, %s", dec.ID, inFrontend)
+	case dec.UserOnly:
+		return "", fmt.Errorf("decision %s is %s, which is on the user's list, %s", dec.ID, dec.Reserved, inFrontend)
+	}
+	p, ok := d.proposed[dec.ID]
+	why := ""
+	switch {
+	case !ok:
+	case p.answer != a:
+		why = "It differs from the answer you last showed the user. "
+	case words == "":
+	case !p.at.Before(d.said.at):
+		why = "The user has said nothing since you showed it. "
+	case p.at.Before(d.saidBefore):
+		// The user's latest message may answer whatever they wrote of in between.
+		why = "The user has written to you more than once since you showed it. "
+	case !strings.Contains(squash(d.said.text), squash(words)):
+		return "", fmt.Errorf("the user's latest message does not hold %q: quote their words exactly", words)
+	default:
+		rec := Answered{Decision: *dec, Behavior: a.behavior, Text: a.text, Words: words, At: time.Now()}
+		d.answered = append(d.answered, rec)
+		d.answered = d.answered[max(0, len(d.answered)-keptMessages):]
+		d.broadcastLocked(Event{Kind: "answered", Answered: &rec})
+		log.Printf("decision %s: the desk answers it on the user's words %q", dec.ID, words)
+		d.settleLocked(dec, a)
+		return fmt.Sprintf("bosun %s decision %s on the user's word.", given(rec), dec.ID), nil
+	}
+	d.proposed[dec.ID] = proposal{a, time.Now()}
+	data, _ := json.MarshalIndent(dec, "", "  ")
+	return fmt.Sprintf("%sbosun has not answered decision %s, and holds your answer until the user says yes to it. Show the user the whole decision below, and that you will %s. Ask them whether to, and end your turn. Once their next message says yes, call answer again with the same answer and words quoted from that message.\n\n%s", why, dec.ID, proposed(dec.Kind, a), data), nil
+}
+
+// proposed says what answer a to a decision of kind does, completing "you will …".
+func proposed(kind string, a answer) string {
+	switch {
+	case kind == "question":
+		return "answer: " + a.text
+	case a.behavior == "allow":
+		return "allow it"
+	}
+	return "deny it, telling the session: " + a.text
+}
+
+// given says what the desk's answer did, as a verb.
+func given(rec Answered) string {
+	switch rec.Behavior {
+	case "allow":
+		return "allowed"
+	case "deny":
+		return "denied"
+	}
+	return "answered"
+}
+
+// squash collapses each run of white space in s to a space, since the desk may wrap a quote otherwise than the user did.
+func squash(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// deskPromptFromBosun reports whether bosun, rather than the user, sent the desk prompt: the desk's first prompt, the tells and answers bosun hands it, the prompts that unpausing and a usage limit's reset resume it with, or a clear.
+func deskPromptFromBosun(prompt string) bool {
+	prompt = strings.TrimSpace(prompt)
+	return strings.HasPrefix(prompt, "bosun: ") || slices.Contains([]string{deskStart, pauseReset, limitReset, "/clear"}, prompt)
+}
+
+// saidLocked notes a message of the user's to the desk, sent at at.
+func (d *daemon) saidLocked(text string, at time.Time) {
+	d.saidBefore = d.said.at
+	d.said = userMessage{at: at, text: text}
+}
+
+// toldLocked notes each of the user's tells among evs, which bosun hands the desk, as a message of the user's. A tell given back from a cut turn was the user's message once already.
+// A tell that a restart reloaded lost when it was sent, and so comes before every answer the desk proposes.
+func (d *daemon) toldLocked(evs []Event) {
+	for _, ev := range evs {
+		if ev.From == "" && !ev.Again {
+			d.saidLocked(ev.Text, ev.sent)
+		}
+	}
 }
 
 func (d *daemon) escalate(caller, id, note string) error {
@@ -1202,7 +1326,7 @@ func (d *daemon) tell(caller, text string) error {
 	case desk == nil:
 		d.pushLocked(Event{Kind: "tell", Text: text})
 	default:
-		d.queueLocked(desk, Event{Kind: "tell", Text: text})
+		d.queueLocked(desk, Event{Kind: "tell", Text: text, sent: time.Now()})
 	}
 	return nil
 }
@@ -1365,9 +1489,11 @@ func (d *daemon) deliver(name string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	switch {
+	case err == nil && name == deskNode:
+		n.Taken, n.Unseen = append(n.Taken, evs...), true
+		d.toldLocked(evs)
 	case err == nil:
 		n.Taken = append(n.Taken, evs...)
-		n.Unseen = n.Unseen || name == deskNode
 	case errors.Is(err, errInTurn) || errors.Is(err, errStarting) || errors.Is(err, errPaused):
 		n.Events = append(evs, n.Events...)
 	case name == deskNode:
@@ -1670,6 +1796,7 @@ func (d *daemon) snapshotLocked() Response {
 		resp.Decisions = append(resp.Decisions, *dec)
 	}
 	resp.Messages = slices.Clone(d.messages)
+	resp.Answered = slices.Clone(d.answered)
 	slices.SortFunc(resp.Decisions, func(a, b Decision) int {
 		x, _ := strconv.Atoi(a.ID)
 		y, _ := strconv.Atoi(b.ID)

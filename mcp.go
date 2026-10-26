@@ -39,11 +39,19 @@ const (
 
 Read it before you answer a question about the run. desk is you, and master is the session that runs the workers.
 
-You do not answer decisions. When the user asks you to approve, deny or answer one, show it in full, with its id and the whole tool call or question, and point the user at the bosun panel, bosun tui, or bosun approve ID, bosun deny ID MESSAGE and bosun reply ID ANSWER. A decision waiting on the master is the master's to settle: tell the master what the user wants done with it, with tell_master.`
+When the user asks you to approve, deny or answer a decision that waits on them, give the answer with answer. A decision waiting on the master is the master's to settle: tell the master what the user wants done with it, with tell_master. Only the user answers a decision of your own, or one with userOnly set, which marks a reserved action on the user's list. Show such a decision in full, with its id and the whole tool call, and point the user at the bosun panel, bosun tui, or bosun approve ID, bosun deny ID MESSAGE and bosun reply ID ANSWER.`
+
+	answerHelp = `Give the user's answer to a decision that waits on them: allow or deny a permission, or answer a question. Give only the answer the user asks for, never one of your own judgement. It takes two calls, with the user's yes between them.
+
+First call answer with the decision's id and the answer, and leave out words. For a permission, pass allow, and a message when you deny. For a question, pass answer. bosun gives nothing yet: it holds the answer and returns the decision in full. Show the user all of it, with its id, its session and the whole tool call or question, and the answer you will give. Ask whether to give it, and end your turn. When what the user asked could fit more than one decision, show each from status, ask which they mean, and propose only that one.
+
+Only the user's next message, typed to you or sent through bosun tell, can say yes. When it does, call answer again with the same id, with allow, message or answer unchanged, and with words quoted exactly from that message. bosun gives the answer only then, and bosun tui and bosun status show the user what you gave and on which words. When the user replies with anything but a plain yes to that answer, such as a question or a change, there is no yes: deal with the reply, then call answer without words again before you ask anew.
+
+bosun refuses a notice, a decision that waits on the master, a decision of your own, and one with userOnly set. Pass on what the user wants done with one that waits on the master with tell_master. Show the user any other in full, and point them at the bosun panel or bosun tui, as status says.`
 
 	transcriptHelp = `Show the last turns of a session's conversation: the prompt that began each turn, the session's text, and a line for each tool call, oldest first. Use it to answer what a session is doing or did, after status names the sessions. A turn's tool results do not show.`
 
-	tellMasterHelp = `Pass an instruction of the user's on to the master, the session that runs the fleet: it spawns, resumes, merges and stops workers, and settles their decisions. Call it for everything the user asks that would change the fleet or a repository, and never do any of that yourself, by SendMessage to a session or otherwise.
+	tellMasterHelp = `Pass an instruction of the user's on to the master, the session that runs the fleet: it spawns, resumes, merges and stops workers, and settles their decisions. Call it for everything the user asks that would change the fleet or a repository, and never do any of that yourself, by SendMessage to a session or otherwise. The one thing you do yourself is give the user's answer to a decision that waits on them, with answer.
 
 Write it as a spec the master can act on without asking back: what to do, in which repository, what done looks like, and what the user said that settles open choices. The master takes it as the user's own instruction, so pass on only what the user asked for, and ask the user first when you are unsure they want it done.
 
@@ -98,6 +106,13 @@ func tools(node string) []tool {
 			{"transcript", transcriptHelp, object([]string{"name"}, map[string]any{
 				"name":  str("The session's node name, as status shows it."),
 				"turns": map[string]any{"type": "integer", "description": "How many of its last turns to show. 3 when left out."},
+			})},
+			{"answer", answerHelp, object([]string{"id"}, map[string]any{
+				"id":      str("The decision's id, as status shows it."),
+				"allow":   map[string]any{"type": "boolean", "description": "For a permission: true to allow the tool call, false to deny it."},
+				"message": str("For a permission you deny, why. It reaches the session verbatim, so say what to do instead, as the user put it."),
+				"answer":  str("For a question, the user's answer."),
+				"words":   str("Leave it out on the first call. On the second, the user's yes, quoted exactly from their latest message."),
 			})},
 		}
 	}
@@ -316,11 +331,12 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		Question string `json:"question"`
 		ID       string `json:"id"`
 		Answer   string `json:"answer"`
-		Allow    bool   `json:"allow"`
+		Allow    *bool  `json:"allow"`
 		Message  string `json:"message"`
 		Note     string `json:"note"`
 		Text     string `json:"text"`
 		Turns    int    `json:"turns"`
+		Words    string `json:"words"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &args); err != nil {
@@ -348,9 +364,20 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		req.Text = args.Answer
 	case "decide":
 		req.Op, req.Text = "deny", args.Message
-		if args.Allow {
+		if args.Allow != nil && *args.Allow {
 			req.Op = "approve"
 		}
+	case "answer":
+		// A permission takes allow, and a question an answer.
+		switch {
+		case args.Allow == nil:
+			req.Op, req.Text = "reply", args.Answer
+		case *args.Allow:
+			req.Op = "approve"
+		default:
+			req.Op, req.Text = "deny", args.Message
+		}
+		req.Words = args.Words
 	case "escalate":
 		req.Text = args.Note
 	case "notify":
@@ -373,7 +400,7 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	switch name {
 	case "spawn":
 		return fmt.Sprintf("Started %s, session %s, in %s.", resp.Session.Node, resp.Session.ID, resp.Session.Dir), nil
-	case "ask", "merge", "transcript":
+	case "ask", "merge", "transcript", "answer":
 		return resp.Text, nil
 	case "status":
 		return fleetStatus(resp), nil

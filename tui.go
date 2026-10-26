@@ -23,6 +23,7 @@ type tui struct {
 	sessions  []Session
 	decisions []Decision
 	messages  []Event
+	answered  []Answered
 	paused    bool
 	connected bool
 	sel       int
@@ -85,7 +86,7 @@ func (t *tui) selected() tuiItem {
 func (t *tui) apply(r Response) {
 	switch {
 	case r.Type == "snapshot":
-		t.sessions, t.decisions, t.messages, t.paused, t.connected = r.Sessions, r.Decisions, r.Messages, r.Paused, true
+		t.sessions, t.decisions, t.messages, t.answered, t.paused, t.connected = r.Sessions, r.Decisions, r.Messages, r.Answered, r.Paused, true
 	case r.Event == nil:
 	case r.Event.Kind == "paused", r.Event.Kind == "unpaused":
 		t.paused = r.Event.Kind == "paused"
@@ -94,6 +95,9 @@ func (t *tui) apply(r Response) {
 	case r.Event.Kind == "message":
 		t.messages = append(t.messages, *r.Event)
 		t.messages = t.messages[max(0, len(t.messages)-keptMessages):]
+	case r.Event.Kind == "answered" && r.Event.Answered != nil:
+		t.answered = append(t.answered, *r.Event.Answered)
+		t.answered = t.answered[max(0, len(t.answered)-keptMessages):]
 	case r.Event.Kind == "decision" && r.Event.Decision != nil:
 		d := *r.Event.Decision
 		t.decisions = append(slices.DeleteFunc(t.decisions, func(o Decision) bool { return o.ID == d.ID }), d)
@@ -222,6 +226,13 @@ func (t *tui) render(width, height int) []string {
 		}
 		s := it.session
 		add("", fmt.Sprintf("  %s%-*s %-8s %-15s %s", strings.Repeat("  ", it.depth), max(1, 14-2*it.depth), s.Node, s.ID, sessionState(*s), modelLabel(*s)), i == t.sel)
+	}
+	if len(t.answered) > 0 {
+		add("", "", false)
+		add(dim, "Answered by the desk on your word", false)
+	}
+	for _, a := range t.answered {
+		add("", fmt.Sprintf("  %-4s %-14s %s", a.Decision.ID, a.Decision.Node, answeredLine(a)), false)
 	}
 	if len(t.messages) > 0 {
 		add("", "", false)

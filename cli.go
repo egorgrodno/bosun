@@ -151,6 +151,12 @@ func printStatus(w io.Writer, s Response) {
 			}
 		}
 	}
+	if len(s.Answered) > 0 {
+		fmt.Fprintln(w, "Answered by the desk on your word:")
+	}
+	for _, a := range s.Answered {
+		fmt.Fprintf(w, "  %-4s %-12s %s\n", a.Decision.ID, a.Decision.Node, answeredLine(a))
+	}
 	children := map[string][]Session{}
 	for _, n := range s.Sessions {
 		if n.Node == deskNode {
@@ -200,6 +206,15 @@ func sessionState(n Session) string {
 func messageLine(m Event) string {
 	text, _, _ := strings.Cut(m.Text, "\n")
 	return fmt.Sprintf("%s → %s: %s", m.From, m.Node, text)
+}
+
+// answeredLine shows what the desk answered on the user's word, and the words it acted on.
+func answeredLine(a Answered) string {
+	s := given(a) + " " + describe(a.Decision)
+	if a.Text != "" {
+		s += " → " + a.Text
+	}
+	return fmt.Sprintf("%s, on your words %q", s, squash(a.Words))
 }
 
 func describe(dec Decision) string {
