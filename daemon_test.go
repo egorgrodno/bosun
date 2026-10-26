@@ -424,7 +424,91 @@ func TestMasterAnswersQuestion(t *testing.T) {
 	}
 }
 
-func TestReservedSkipsMaster(t *testing.T) {
+// A reserved action outside the user's list reaches the master, which allows it, denies it with what to do instead, or escalates it.
+func TestMasterDecidesReserved(t *testing.T) {
+	d, _ := testDaemon(t)
+	write := func(toolUseID string) chan string {
+		return runHookAsync("a", hookEvent("PreToolUse", toolUseID, "Write", map[string]any{"file_path": "/tmp/cfgprobe.sh", "content": "x"}))
+	}
+	decision := func() Decision {
+		t.Helper()
+		events := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events
+		if len(events) != 1 || events[0].Decision == nil {
+			t.Fatalf("events = %+v", events)
+		}
+		dec := *events[0].Decision
+		if dec.Holder != "master" || dec.Reserved != "a write outside the worktree" {
+			t.Fatalf("decision = %+v", dec)
+		}
+		return dec
+	}
+
+	hook := write("t1")
+	dec := decision()
+	if dec.Refused != "" {
+		t.Fatalf("decision = %+v", dec)
+	}
+	mustCall(t, Request{Op: "deny", Node: masterNode, ID: dec.ID, Text: "write it under $TMPDIR"})
+	want := `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"write it under $TMPDIR"}}`
+	if out := receive(t, hook); out != want {
+		t.Fatalf("hook printed %s, want %s", out, want)
+	}
+
+	// A reserved action that follows a refusal of auto mode's says so.
+	denied, _ := json.Marshal(map[string]any{"hook_event_name": "PermissionDenied", "tool_use_id": "t2", "tool_name": "Bash", "tool_input": bashTest, "reason": "judged dangerous"})
+	receive(t, runHookAsync("a", denied))
+	hook = write("t3")
+	if dec = decision(); dec.Refused != "judged dangerous" {
+		t.Fatalf("decision after a refusal = %+v", dec)
+	}
+	mustCall(t, Request{Op: "approve", Node: masterNode, ID: dec.ID})
+	want = `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow"}}`
+	if out := receive(t, hook); out != want {
+		t.Fatalf("hook printed %s, want %s", out, want)
+	}
+
+	hook = write("t4")
+	dec = decision()
+	mustCall(t, Request{Op: "escalate", Node: masterNode, ID: dec.ID, Text: "outside its task"})
+	if _, err := call(context.Background(), Request{Op: "approve", Node: masterNode, ID: dec.ID}); err == nil {
+		t.Fatal("the master approved a reserved action it escalated")
+	}
+	if got := openDecision(t, 1); got.Holder != "user" || got.Reserved != "a write outside the worktree" || got.Note != "outside its task" {
+		t.Fatalf("escalated decision = %+v", got)
+	}
+	mustCall(t, Request{Op: "approve", ID: dec.ID})
+	if out := receive(t, hook); out != want {
+		t.Fatalf("hook printed %s, want %s", out, want)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if len(d.decisions) != 0 {
+		t.Fatalf("%d decisions open", len(d.decisions))
+	}
+}
+
+// The master's and the desk's own reserved actions go to the user, since nobody sits above them.
+func TestOwnReservedGoesToUser(t *testing.T) {
+	d, _ := testDesk(t)
+	for _, node := range []string{masterNode, deskNode} {
+		hook := runHookAsync(node, hookEvent("PreToolUse", "t1", "Write", map[string]any{"file_path": "/tmp/x", "content": "x"}))
+		dec := openDecision(t, 1)
+		if dec.Holder != "user" || dec.Node != node || dec.Reserved != "a write outside the worktree" {
+			t.Fatalf("decision = %+v", dec)
+		}
+		d.mu.Lock()
+		queued := len(d.events)
+		d.mu.Unlock()
+		if queued != 0 {
+			t.Fatalf("the master was sent %d events", queued)
+		}
+		mustCall(t, Request{Op: "deny", ID: dec.ID})
+		receive(t, hook)
+	}
+}
+
+// A reserved action on the user's list skips the master.
+func TestUserListSkipsMaster(t *testing.T) {
 	d, _ := testDaemon(t)
 	hook := runHookAsync("a", hookEvent("PreToolUse", "t1", "Bash", map[string]any{"command": "git push --force origin HEAD"}))
 	dec := openDecision(t, 1)
@@ -516,7 +600,7 @@ func TestReservedSparesClaudeCodeDirs(t *testing.T) {
 	state := map[string]any{"file_path": filepath.Join(claude, "jobs", "aaaaaaaa", "state.json"), "content": "x"}
 	hook := runHookAsync("a", hookEvent("PreToolUse", "t2", "Write", state))
 	dec := openDecision(t, 1)
-	if dec.Reserved != "a write outside the worktree" {
+	if dec.Holder != "user" || dec.Reserved != "a write to Claude Code's configuration" {
 		t.Fatalf("decision = %+v", dec)
 	}
 	mustCall(t, Request{Op: "deny", ID: dec.ID})

@@ -40,9 +40,9 @@ func hookOutput(node, socket string, stdin io.Reader) any {
 	case "PreToolUse":
 		switch {
 		case errors.Is(err, context.DeadlineExceeded):
-			return preToolUse("deny", fmt.Sprintf("bosun: this needs the user's approval, and none came within %v.", timeout))
+			return preToolUse("deny", fmt.Sprintf("bosun: this is a reserved action, and no approval came within %v.", timeout))
 		case err != nil:
-			return preToolUse("deny", fmt.Sprintf("bosun: checking whether this needs the user's approval failed: %v", err))
+			return preToolUse("deny", fmt.Sprintf("bosun: checking whether this is a reserved action failed: %v", err))
 		case resp.Behavior != "":
 			return preToolUse(resp.Behavior, resp.Text)
 		}

@@ -135,8 +135,8 @@ func TestDeskFenced(t *testing.T) {
 		{deskNode, filepath.Join(deskDir, "notes.md"), false},
 	} {
 		input, _ := json.Marshal(map[string]string{"file_path": c.path, "content": "x"})
-		if r := d.gate(c.node, "").reserved("Write", input); (r != "") != c.refused {
-			t.Errorf("%s writing %s: reserved %q", c.node, c.path, r)
+		if r := d.gate(c.node, "").reserved("Write", input); (r.reason != "") != c.refused {
+			t.Errorf("%s writing %s: reserved %+v", c.node, c.path, r)
 		}
 	}
 

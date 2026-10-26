@@ -62,6 +62,7 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 | Kind | Example | Answered by |
 |---|---|---|
 | Permission | run `npm test`, edit a file | rules, then auto mode, then the master, then you |
+| Reserved action | write `/tmp/x`, a command outside the sandbox | the master, then you, or you alone for the user's list |
 | Question | "X or Y?", "tests fail, keep going?" | the master, then you |
 | Notice | "spawn failed: the repository is not trusted" | you, by dismissing it |
 
@@ -75,7 +76,7 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 **An answer in the session wins.** Answering the session's own prompt through `claude attach` settles the call at once, and the hook keeps running. `PermissionRequest` carries no call id, so the daemon pairs it with the `PreToolUse` event before it, which carries `tool_use_id`. A `PostToolUse` or `PostToolUseFailure` for that id withdraws the decision. A denial in the session runs no tool, so the session's next `PreToolUse` or `Stop` withdraws it instead.
 
-**Reserved actions skip the master.** Only you can approve one:
+**A worker's reserved action reaches the master first, unless it is on the user's list.** A `PreToolUse` hook holds a reserved action before Claude Code's allow rules and auto mode see it. Auto mode would approve even a force push that its task asks for. The master gets the action as a permission whose `reserved` says why, with `refused` as for any permission. It allows the action, denies it, or escalates it to you. The master's and the desk's own go straight to you. The reserved actions:
 
 - a push that forces, deletes a ref or pushes every branch
 - a push to a URL, or to a name that `git remote` does not list in the repository the command runs in
@@ -84,19 +85,30 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 - a write through a file tool outside the session's worktree, memory directory, temporary folder and `$CLAUDE_JOB_DIR/tmp`, or by the master into the desk's directory
 - a Bash command outside the sandbox, through `dangerouslyDisableSandbox`, unless it is on the allowlist
 
+The check holds the call until the answer and returns `allow` or `deny`. A `PreToolUse` hook that times out or fails lets the call through to the normal flow. So the check denies shortly before its `timeout`, and on any error, an unreachable daemon included. Bash writes inside the sandbox are left to the sandbox.
+
+**The user's list stays with you alone.** It holds two kinds of action: those that change code that runs later where no bosun session sees it, and those that reach credentials for other machines. An action on it never reaches the master:
+
+- the pushes above, and a push outside the sandbox from a repository whose git setup does not match its record, or has none
+- a write through a file tool to a credential store, a shell startup file, Claude Code's configuration, git hooks or config, a systemd unit or autostart entry, or bosun's state directory
+- a Bash command outside the sandbox that names such a path or runs in a folder of the list
+- a Bash command outside the sandbox that runs as root, as through `sudo`, or activates a NixOS configuration other than through the allowlist
+
+`userList` in `reserved.go` holds the exact paths. In a worker's own worktree, only what its next start runs outside the sandbox counts, such as `.claude/settings.json`. The merge's review sees the rest.
+
+**The list cannot bind a command outside the sandbox.** Such a command can write anywhere. The check reads two things: the paths a command's words name, and whether a word runs as root. A path built at run time, as by a script or an unknown variable, escapes it. So the `decide` description tells the master to read the command whole, and to escalate anything it cannot follow or that touches the list.
+
 **The allowlist lets a few commands outside the sandbox take the normal flow.** Each must be the whole command: plain words, with nothing chained, piped, substituted, redirected or assigned before it.
 
 - `nixos-rebuild test` or `build` with `--flake` on `/etc/nixos` or a worktree in `/etc/nixos/.claude/worktrees/`, optionally with a `#host` attribute and `--sudo`
 - `nxt` and `nxc`
 - a push that no reserved rule catches, from a repository whose git setup matches its record
 
-Auto mode decides a call outside the sandbox alone. The settings' `ask` rules send every `nixos-rebuild`, `nxt` and `nxc` to the master instead, inside the sandbox too. A push has no such rule, so auto mode decides it, and it reaches the master only when auto mode asks.
+In the normal flow, auto mode decides a call outside the sandbox alone. The settings' `ask` rules send every `nixos-rebuild`, `nxt` and `nxc` to the master instead, inside the sandbox too. A push has no such rule, so auto mode decides it, and it reaches the master only when auto mode asks.
 
 **A push must run outside the sandbox.** Inside it, ssh refuses `~/.ssh/config`. That file is a home-manager link into the nix store, and the sandbox shows the store owned by nobody. Outside it, a push runs the repository's hooks and any command its config names, such as `core.sshCommand`. Its config also decides where the push goes. A worker's sandbox can write all of that in `.git`.
 
 **The daemon records each repository's git setup.** When a spawn finds no worker in a repository and no record of it, the daemon records the repository's own config, its hooks and its remotes' push URLs in `repos/` of the state directory. A push outside the sandbox passes only while the setup matches the record. A record stays until you delete it, and the next spawn into the repository without workers records it anew.
-
-Bash writes are left to the sandbox. A `PreToolUse` hook catches a reserved action before Claude Code's allow rules and auto mode. Auto mode approves even a force push when its task asks for one. The check waits for your answer and returns `allow` or `deny`. A `PreToolUse` hook that times out or fails lets the call through to the normal flow. So the check denies shortly before its `timeout`, and on any error, an unreachable daemon included.
 
 **Questions go to the master, whatever the depth.** Workers run without `AskUserQuestion`, which would wait on a person, and ask through `ask` instead.
 
@@ -182,6 +194,8 @@ A worker's parent must hear of every turn of it that ends or stops, unless a pau
 
 Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `transcript`. Every rule lives in the daemon.
 
+A decision's `reserved` holds the reason it is a reserved action, such as `a force push`.
+
 The snapshot's `paused`, and the `paused` and `unpaused` events, show a pause. A session's `paused` marks a turn that `unpause` resumes.
 
 In the snapshot and the `sessions` event, the desk is the session whose `node` is `desk`. Like the master, it has no `parent`.
@@ -200,4 +214,5 @@ Each leads with the queue of decisions waiting on you, above the tree. The desk 
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
 - **Restarts and pauses.** Only a fake `claude` has run the restart handling and the pause. No real reboot, crash or pause has been measured. The daemon reads transcripts in the 2.1.310 format. Whether `claude stop` runs the `Stop` hook is unmeasured, so the daemon ignores a `Stop` from a session that a pause stopped.
 - **The desk.** No real desk has run. A probe session inside the master's directory measured the desk's trust, `autoMemoryDirectory` from `--settings` and the clear's transcript, and nothing more. Handing an idle desk its queue stops and resumes it, as waking the master does. Whether a `claude attach` open on it survives that is unmeasured. That a file tool's sensitive write asks even in auto mode comes from the 2.1.310 binary.
+- **Reserved actions at the master.** Only the tests' fake hooks have sent one. Whether a file tool writes through a symlink, as the check assumes, is unmeasured.
 - **The allowlist.** No real session has run it. Two things are unmeasured: whether an `ask` rule sends a call outside the sandbox to `PermissionRequest` in auto mode, and whether `Bash(nixos-rebuild:*)` matches a flake with a `#host` attribute. The gate finds a push's repository from the hook's `cwd`. In the 2.1.310 binary that is the session's working directory, which a `cd` in an earlier Bash call moves, but no real session has shown it.

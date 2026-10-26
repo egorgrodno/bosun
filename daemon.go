@@ -466,7 +466,8 @@ func (d *daemon) gate(node, cwd string) *gate {
 	if n == nil {
 		return nil
 	}
-	return &gate{cwd: cmp.Or(cwd, n.Dir), writable: d.writable(n), fenced: d.fenced(n), repos: d.repos()}
+	home, _ := os.UserHomeDir()
+	return &gate{cwd: cmp.Or(cwd, n.Dir), writable: d.writable(n), fenced: d.fenced(n), list: newUserList(home, claudeDir(), d.stateDir, os.Getenv), repos: d.repos()}
 }
 
 // fenced lists the folders within the session's own directory that it may not write: for the master, the desk's, whose settings and hooks would run outside the master's sandbox once the desk starts.
@@ -629,7 +630,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return resp, fmt.Errorf("hook input: %w", err)
 	}
-	var reserved string
+	var reserved reservation
 	// The check may run git, which a worker's repository can hold up, so it runs outside the lock.
 	if in.Event == "PreToolUse" {
 		if g := d.gate(node, in.Cwd); g != nil {
@@ -683,8 +684,13 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 			n.pre = map[string]preCall{}
 		}
 		n.pre[in.ToolUseID] = preCall{in.ToolName, compact(in.ToolInput)}
-		if reserved != "" {
-			dec = &Decision{Kind: "permission", Node: node, Holder: "user", Reserved: reserved, Tool: in.ToolName, Input: in.ToolInput, toolUseID: in.ToolUseID, key: key}
+		if reserved.reason != "" {
+			// The master's and the desk's own go to the user, since nobody sits above them.
+			holder := "master"
+			if reserved.user || !isWorker(node) {
+				holder = "user"
+			}
+			dec = &Decision{Kind: "permission", Node: node, Holder: holder, Reserved: reserved.reason, Tool: in.ToolName, Input: in.ToolInput, Refused: n.refused, toolUseID: in.ToolUseID, key: key}
 		}
 		if in.ToolName != "SendMessage" {
 			break
