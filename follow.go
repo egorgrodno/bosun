@@ -3,9 +3,11 @@ package main
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"time"
 )
 
@@ -47,7 +49,7 @@ func (d *daemon) conversation(name, before string, limit int) ConvLine {
 }
 
 // follow sends session name's conversation until ctx ends or the session is gone: a reset and the last limit entries, then each entry as it lands or changes.
-// A new conversation, as a clear or a switch begins, sends a reset and its own last entries. Beside them go progress lines from the supervisor.
+// A new conversation, as a clear or a switch begins, sends a reset and its own last entries. Beside them go progress lines from the supervisor, and a suggestion line each time the reply Claude Code suggests changes.
 func (d *daemon) follow(ctx context.Context, cancel context.CancelFunc, o *out, name string, limit int) {
 	defer cancel()
 	if limit <= 0 {
@@ -62,6 +64,8 @@ func (d *daemon) follow(ctx context.Context, cancel context.CancelFunc, o *out, 
 		paged       bool
 		first       int
 		progressing bool
+		// suggested is the suggestion the frontend holds since the reset.
+		suggested string
 	)
 	defer func() {
 		if f != nil {
@@ -72,7 +76,7 @@ func (d *daemon) follow(ctx context.Context, cancel context.CancelFunc, o *out, 
 	tick := time.NewTicker(poll)
 	defer tick.Stop()
 	for {
-		next, _, err := d.conversationID(name)
+		next, short, err := d.conversationID(name)
 		if err != nil {
 			o.send(ConvLine{Type: "result", Error: err.Error()})
 			return
@@ -83,6 +87,7 @@ func (d *daemon) follow(ctx context.Context, cancel context.CancelFunc, o *out, 
 				f = nil
 			}
 			sid, c, read, paged = next, newConversation(d.senderOf(name)), 0, false
+			suggested = ""
 			o.send(ConvLine{Type: "reset", Session: sid})
 		}
 		if c != nil && f == nil {
@@ -110,6 +115,10 @@ func (d *daemon) follow(ctx context.Context, cancel context.CancelFunc, o *out, 
 				o.send(ConvLine{Type: "entries", Entries: es})
 			}
 		}
+		if s := jobSuggestion(short); paged && s != suggested {
+			suggested = s
+			o.send(Suggestion{Type: "suggestion", Name: name, Text: s})
+		}
 		if paged && !progressing {
 			progressing = true
 			go d.progress(ctx, o, name, poll, resubscribeWait)
@@ -120,6 +129,31 @@ func (d *daemon) follow(ctx context.Context, cancel context.CancelFunc, o *out, 
 		case <-tick.C:
 		}
 	}
+}
+
+// Suggestion is a "suggestion" line of a follow: the reply Claude Code suggests to what session Name's turn ended asking, empty once it suggests none.
+type Suggestion struct {
+	Type string `json:"type"`
+	Name string `json:"name"`
+	Text string `json:"text"`
+}
+
+// jobSuggestion reads the reply that Claude Code's job state for session short suggests, or "" for none.
+// Claude Code's agents view shows suggestedReply only while the session is blocked outside a question dialog, and so does bosun.
+func jobSuggestion(short string) string {
+	data, err := os.ReadFile(filepath.Join(claudeDir(), "jobs", short, "state.json"))
+	if err != nil {
+		return ""
+	}
+	var st struct {
+		Tempo          string          `json:"tempo"`
+		Block          json.RawMessage `json:"block"`
+		SuggestedReply string          `json:"suggestedReply"`
+	}
+	if json.Unmarshal(data, &st) != nil || st.Tempo != "blocked" || len(st.Block) > 0 && string(st.Block) != "null" {
+		return ""
+	}
+	return st.SuggestedReply
 }
 
 // rewritten reports whether the transcript that f holds, read up to read, was cut short or replaced, so that its entries must be read again.

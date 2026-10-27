@@ -1,0 +1,17 @@
+{
+  "backend": "daemon",
+  "cliVersion": "2.1.311",
+  "createdAt": "2026-10-27T14:02:11.418Z",
+  "cwd": "/repo/.claude/worktrees/a",
+  "detail": "Asked which of two layouts to keep",
+  "intent": "Pick a layout for the panel",
+  "name": "a",
+  "needs": "pick the stacked or the tabbed layout",
+  "output": null,
+  "sessionId": "s-probe",
+  "state": "running",
+  "suggestedReply": "keep the stacked one",
+  "tempo": "blocked",
+  "tokens": 41210,
+  "updatedAt": "2026-10-27T14:09:52.006Z"
+}
