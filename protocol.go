@@ -146,6 +146,8 @@ type Decision struct {
 	Prompt bool `json:"prompt,omitempty"`
 	// Asked is when the decision opened, as RFC 3339.
 	Asked string `json:"asked,omitempty"`
+	// Expires is when the daemon stops holding the decision, as RFC 3339, and is left out for a decision it holds until answered.
+	Expires string `json:"expires,omitempty"`
 
 	toolUseID string
 	// key is the Key of the request that waits on the decision.

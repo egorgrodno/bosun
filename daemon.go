@@ -390,6 +390,10 @@ func (d *daemon) load() error {
 		}
 	}
 	d.orphansUntil = now.Add(reconnectWait)
+	for _, dec := range d.orphans {
+		// Until its request comes back, the daemon holds the decision only till orphansUntil.
+		dec.Expires = orphanDeadline(dec, d.orphansUntil)
+	}
 	return nil
 }
 
@@ -1125,6 +1129,11 @@ func (d *daemon) adoptLocked(dec *Decision) *Decision {
 	for id, o := range d.orphans {
 		if dec.key != "" && o.key == dec.key {
 			delete(d.orphans, id)
+			if e := holdDeadline(o); e != o.Expires {
+				o.Expires = e
+				c := *o
+				d.broadcastLocked(Event{Kind: "decision", Decision: &c})
+			}
 			log.Printf("decision %s: taken up again by %s", id, o.Node)
 			return o
 		}
@@ -1138,6 +1147,7 @@ func (d *daemon) openLocked(dec *Decision) {
 	dec.ID = strconv.Itoa(d.nextID)
 	dec.opened = time.Now()
 	dec.Asked = dec.opened.UTC().Format(time.RFC3339)
+	dec.Expires = holdDeadline(dec)
 	dec.answer = make(chan answer, 1)
 	d.decisions[dec.ID] = dec
 	d.saveLocked()
@@ -1158,9 +1168,32 @@ func (d *daemon) openLocked(dec *Decision) {
 	log.Printf("decision %s: %s from %s, for the %s", dec.ID, dec.Kind, dec.Node, dec.Holder)
 }
 
+// holdTimed reports whether the daemon stops holding dec on a timer: a permission that no reserved rule caught.
+// A reserved action's hook denies the call itself before its timeout, and a question or a notice waits until answered.
+func holdTimed(dec *Decision) bool {
+	return dec.Kind == "permission" && dec.Reserved == ""
+}
+
+// holdDeadline is when the daemon leaves dec to its session's own prompt, as RFC 3339, or "" where it holds dec until answered.
+func holdDeadline(dec *Decision) string {
+	if !holdTimed(dec) {
+		return ""
+	}
+	return dec.opened.Add(promptAfter).UTC().Format(time.RFC3339)
+}
+
+// orphanDeadline is when the daemon stops holding orphan dec, a decision of an earlier run, if its request does not come back by until.
+// A permission whose own deadline falls sooner expires then.
+func orphanDeadline(dec *Decision, until time.Time) string {
+	if holdTimed(dec) && dec.opened.Add(promptAfter).Before(until) {
+		until = dec.opened.Add(promptAfter)
+	}
+	return until.UTC().Format(time.RFC3339)
+}
+
 func (d *daemon) wait(ctx context.Context, dec *Decision) (answer, bool) {
 	var expired <-chan time.Time
-	if dec.Kind == "permission" && dec.Reserved == "" {
+	if holdTimed(dec) {
 		t := time.NewTimer(time.Until(dec.opened.Add(promptAfter)))
 		defer t.Stop()
 		expired = t.C
