@@ -771,7 +771,11 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 	wasSettled := n.settled()
 	d.stirred = true
 	if contextEvents[in.Event] {
-		d.touchContextLocked(n, in.Event)
+		event := in.Event
+		if event == "SessionStart" && in.Source == "compact" {
+			event = "PostCompact"
+		}
+		d.touchContextLocked(n, event)
 	}
 	switch in.Event {
 	case "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "PostToolUseFailure":

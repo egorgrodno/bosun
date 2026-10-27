@@ -123,6 +123,12 @@ func TestUsageTail(t *testing.T) {
 		t.Fatalf("after the compaction's first reply used = %d", used)
 	}
 
+	// A boundary that reports the tokens it left sets the use to them.
+	appendTo(t, path, `{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"manual","preTokens":694742,"postTokens":25594}}`+"\n")
+	if used, _, seen := readTail(t, tail, path); used != 25594 || !seen {
+		t.Fatalf("after a compaction that left 25594 tokens used = %d, seen %v", used, seen)
+	}
+
 	// A transcript replaced by a shorter one starts the reading over.
 	if err := os.WriteFile(path, []byte(userLine+reply("claude-opus-5-5", 1, 1, 1)), 0o600); err != nil {
 		t.Fatal(err)
@@ -226,6 +232,13 @@ func TestDaemonReportsContext(t *testing.T) {
 	receive(t, runHookAsync("a", hookEvent("Stop", "", "", nil)))
 	if e := next(); e.Context == nil || e.Context.Used != 90001 {
 		t.Fatalf("the context event after the Stop is %+v", e)
+	}
+
+	// A boundary lands a moment after the PostCompact, and the read that follows it finds it.
+	receive(t, runHookAsync("a", hookEvent("PostCompact", "", "", nil)))
+	appendTo(t, path, `{"type":"system","subtype":"compact_boundary","compactMetadata":{"postTokens":25594}}`+"\n")
+	if e := next(); e.Context == nil || e.Context.Used != 25594 {
+		t.Fatalf("the context event after the PostCompact is %+v", e)
 	}
 
 	// A clear starts the new conversation from zero.

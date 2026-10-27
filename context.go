@@ -143,7 +143,11 @@ type usageRecord struct {
 	Type      string `json:"type"`
 	Subtype   string `json:"subtype"`
 	Sidechain bool   `json:"isSidechain"`
-	Message   struct {
+	// CompactMetadata is what a compact_boundary record reports of the compaction, with the tokens of the context it left.
+	CompactMetadata struct {
+		PostTokens int `json:"postTokens"`
+	} `json:"compactMetadata"`
+	Message struct {
 		Model string `json:"model"`
 		Usage *struct {
 			Input         int `json:"input_tokens"`
@@ -237,11 +241,11 @@ func (t *usageTail) add(line []byte) {
 		t.used, t.seen = u.Input+u.CacheCreation+u.CacheRead, true
 		t.model = cmp.Or(r.Message.Model, t.model)
 	case r.Type == "system" && r.Subtype == "compact_boundary":
-		t.used, t.seen = 0, true
+		t.used, t.seen = r.CompactMetadata.PostTokens, true
 	}
 }
 
-// contextFollowDelay is how long after a Stop the daemon reads the transcript once more, since Claude Code writes the last message a moment after the hook.
+// contextFollowDelay is how long after a Stop or a compaction the daemon reads the transcript once more, since Claude Code writes the last message, or the compaction's boundary record, a moment after the hook.
 var contextFollowDelay = 1500 * time.Millisecond
 
 // contextEvents are the hooks after which a session's transcript may hold a new assistant message, or begin a new conversation.
@@ -250,13 +254,14 @@ var contextEvents = map[string]bool{
 	"Stop": true, "StopFailure": true, "PostCompact": true,
 }
 
-// touchContextLocked has the daemon read session n's context use, and again a moment later at the end of a turn.
+// touchContextLocked has the daemon read session n's context use, and again a moment later at the end of a turn or a compaction.
+// The SessionStart that reports a compaction counts as its end too, by the event "PostCompact".
 func (d *daemon) touchContextLocked(n *Session, event string) {
 	if n.usage == nil {
 		n.usage = &usageTail{}
 	}
 	go d.refreshContext(n.Node)
-	if event == "Stop" || event == "StopFailure" {
+	if event == "Stop" || event == "StopFailure" || event == "PostCompact" {
 		time.AfterFunc(contextFollowDelay, func() { d.refreshContext(n.Node) })
 	}
 }
