@@ -173,9 +173,11 @@ type proposal struct {
 }
 
 // preCall is a PreToolUse not yet followed by its PostToolUse.
+// allowedBy is the id of the call's reserved decision once allowed, until a PermissionRequest for the call takes it.
 type preCall struct {
-	tool  string
-	input string
+	tool      string
+	input     string
+	allowedBy string
 }
 
 type savedState struct {
@@ -823,7 +825,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 		if n.pre == nil {
 			n.pre = map[string]preCall{}
 		}
-		n.pre[in.ToolUseID] = preCall{in.ToolName, compact(in.ToolInput)}
+		n.pre[in.ToolUseID] = preCall{tool: in.ToolName, input: compact(in.ToolInput)}
 		d.setActivityLocked(n, activityOf(in.ToolName, in.ToolInput))
 		if reserved.reason != "" {
 			// The master's and the desk's own go to the user, since nobody sits above them.
@@ -865,6 +867,16 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 			peer, peerID, peerSocket = to.Node, to.ID, socketAddress(msg.To)
 		}
 	case "PermissionRequest":
+		// Claude Code still runs its own permission check on some calls that a PreToolUse allowed, such as one outside the sandbox, and the reserved decision's allow answers it.
+		if id, by := n.allowedCall(in.ToolName, in.ToolInput); by != "" {
+			p := n.pre[id]
+			p.allowedBy = ""
+			n.pre[id] = p
+			resp.Behavior = "allow"
+			d.logLocked(Entry{Kind: "allowed", By: "bosun", Node: node, Behavior: "allow", Text: fmt.Sprintf("Claude Code asked again for the call that decision %s allowed.", by), Decision: &Decision{ID: by, Kind: "permission", Node: node, Tool: in.ToolName, Input: in.ToolInput}})
+			log.Printf("decision %s: allowed %s's permission request for the same call", by, node)
+			break
+		}
 		holder := "master"
 		if !isWorker(node) {
 			holder = "user"
@@ -1051,6 +1063,23 @@ func (n *Session) match(tool string, input json.RawMessage) string {
 		return id
 	}
 	return ""
+}
+
+// allowedCall returns the tool_use_id of the one call of tool with input that has not run, and the id of its reserved decision if that was allowed.
+// Two such calls leave no way to tell which one a PermissionRequest asks about, so neither counts.
+func (n *Session) allowedCall(tool string, input json.RawMessage) (id, by string) {
+	want := compact(input)
+	found := 0
+	for k, p := range n.pre {
+		if p.tool == tool && p.input == want {
+			id, by = k, p.allowedBy
+			found++
+		}
+	}
+	if found != 1 {
+		return "", ""
+	}
+	return id, by
 }
 
 var (
@@ -1245,6 +1274,12 @@ func (d *daemon) wait(ctx context.Context, dec *Decision) (answer, bool) {
 func (d *daemon) settleLocked(dec *Decision, a answer, o outcome) {
 	delete(d.decisions, dec.ID)
 	delete(d.proposed, dec.ID)
+	if n := d.nodes[dec.Node]; n != nil && dec.Reserved != "" && dec.toolUseID != "" && !a.withdrawn && a.behavior == "allow" {
+		if p, ok := n.pre[dec.toolUseID]; ok && p.tool == dec.Tool && p.input == compact(dec.Input) {
+			p.allowedBy = dec.ID
+			n.pre[dec.toolUseID] = p
+		}
+	}
 	dec.answer <- a
 	d.saveLocked()
 	d.broadcastLocked(Event{Kind: "settled", ID: dec.ID})

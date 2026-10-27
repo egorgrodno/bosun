@@ -101,6 +101,8 @@ The daemon holds each session's parent and the queue of decisions waiting on an 
 
 The check holds the call until the answer and returns `allow` or `deny`. A `PreToolUse` hook that times out or fails lets the call through to the normal flow. So the check denies shortly before its `timeout`, and on any error, an unreachable daemon included. Bash writes inside the sandbox are left to the sandbox.
 
+**An allowed reserved action is not asked again.** Claude Code still runs its own permission check on some calls that a `PreToolUse` allowed, such as one outside the sandbox, so a `PermissionRequest` follows. That request carries no `tool_use_id`. The daemon allows it at once when exactly one of the session's calls not yet run has the request's tool and input, and that call's reserved decision was allowed. The log records an `allowed` entry naming that decision. One request uses the allow up. The call's `PostToolUse` or `PostToolUseFailure`, the turn's `Stop` or `StopFailure`, an interrupt, the session's next start and a restart of the daemon each drop it.
+
 **The user's list stays with you alone.** It holds two kinds of action: those that change code that runs later where no bosun session sees it, and those that reach credentials for other machines. An action on it never reaches the master:
 
 - the pushes above, and a push outside the sandbox from a repository whose git setup does not match its record, or has none
@@ -335,6 +337,7 @@ A session's `activity` shows what it does: `tool` with `arg`, the main argument 
 | `interrupt` | the user ended `node`'s turn | `via`, `error` |
 | `compact`, `clear` | the user compacted or cleared the conversation of `node`, the master or the desk | `via`, `error` |
 | `prompt` | the user answered `node`'s own permission prompt | `behavior`, `text`: a denial's message, `via`, `error` |
+| `allowed` | bosun allowed `node`'s `PermissionRequest` for a call whose reserved decision was allowed | `decision`: that decision's `id` with the call, `behavior`, `text` |
 
 `via` is `supervisor` where the daemon presented the control key, and `resume` where it stopped or resumed the session instead. `error` says why the action failed.
 

@@ -105,7 +105,7 @@ type Entry struct {
 	From string    `json:"from,omitempty"`
 	Node string    `json:"node,omitempty"`
 	Text string    `json:"text,omitempty"`
-	// Decision is what a decision, escalated or settled entry is about, with each long string of its input cut short.
+	// Decision is what a decision, escalated, settled or allowed entry is about, with each long string of its input cut short.
 	Decision *Decision `json:"decision,omitempty"`
 	// Behavior is a settled permission's answer, allow or deny. Withdrawn marks a decision nobody answered, and Cause completes "withdrawn when …".
 	Behavior  string `json:"behavior,omitempty"`

@@ -356,6 +356,11 @@ func logLine(e Entry) string {
 		what = "compacted " + e.Node + "'s conversation"
 	case "clear":
 		what = "cleared " + e.Node + "'s conversation"
+	case "allowed":
+		what = "allowed " + e.Node + "'s call again"
+		if e.Decision != nil {
+			what = fmt.Sprintf("allowed %s's %s again, as decision %s did", e.Node, describe(*e.Decision), e.Decision.ID)
+		}
 	case "prompt":
 		what = with(fmt.Sprintf("answered %s's own prompt: %s", e.Node, e.Behavior))
 	case "turn_end":
