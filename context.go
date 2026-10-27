@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -19,6 +20,45 @@ import (
 type Context struct {
 	Used  int `json:"used"`
 	Total int `json:"total"`
+}
+
+// Runs is what a session's default resolves to. Model is the id on the latest assistant message of its transcript, and ModelName its display name, such as "Opus 5.5". Effort is the level the user's settings set for that model, and empty where they set none, since neither the transcript nor the job state records the effort a session runs at.
+type Runs struct {
+	Model     string `json:"model,omitempty"`
+	ModelName string `json:"modelName,omitempty"`
+	Effort    string `json:"effort,omitempty"`
+}
+
+// modelName turns a model id such as claude-opus-5-5 into "Opus 5.5", and returns "" for an id of another shape.
+func modelName(id string) string {
+	m := modelVersion.FindStringSubmatch(id)
+	if m == nil {
+		return ""
+	}
+	v := m[2]
+	if m[3] != "" {
+		v += "." + m[3]
+	}
+	return strings.ToUpper(m[1][:1]) + m[1][1:] + " " + v
+}
+
+// settingsEffort is the effort the user's settings.json sets for model: its modelSettings entry, or else its top-level effortLevel.
+// Which of the two Claude Code prefers is unmeasured, so the more specific entry wins.
+func settingsEffort(model string) string {
+	data, err := os.ReadFile(filepath.Join(claudeDir(), "settings.json"))
+	if err != nil {
+		return ""
+	}
+	var s struct {
+		EffortLevel   string `json:"effortLevel"`
+		ModelSettings map[string]struct {
+			EffortLevel string `json:"effortLevel"`
+		} `json:"modelSettings"`
+	}
+	if json.Unmarshal(data, &s) != nil {
+		return ""
+	}
+	return cmp.Or(s.ModelSettings[model].EffortLevel, s.EffortLevel)
 }
 
 // defaultWindow is the context window of a model that none of the rules below name, as Claude Code assumes.
@@ -243,10 +283,21 @@ func (d *daemon) refreshContext(node string) {
 	}
 	// A conversation without a message yet, as a clear leaves it, starts from zero in the window of the model before it.
 	next := &Context{Used: used, Total: contextWindow(model, flag)}
+	var runs *Runs
+	if model != "" {
+		runs = &Runs{Model: model, ModelName: modelName(model)}
+		if n.Effort == "" {
+			runs.Effort = settingsEffort(model)
+		}
+	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if d.nodes[node] != n || n.usage != tail || cmp.Or(n.Conversation, n.SessionID) != sid {
 		return
+	}
+	if runs != nil && (n.Runs == nil || *n.Runs != *runs) {
+		n.Runs = runs
+		d.broadcastLocked(Event{Kind: "runs", Node: node, Runs: runs})
 	}
 	if prev := n.Context; prev != nil && *prev == *next {
 		return

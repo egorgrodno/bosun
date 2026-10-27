@@ -88,6 +88,8 @@ type Event struct {
 	Activity *Activity `json:"activity,omitempty"`
 	// Context is the context use of session Node, in a context event.
 	Context *Context `json:"context,omitempty"`
+	// Runs is what session Node's default resolves to, in a runs event.
+	Runs *Runs `json:"runs,omitempty"`
 
 	// sent is when the user sent a tell to the desk, which may hand it over only after an answer it proposed since.
 	sent time.Time
@@ -198,6 +200,8 @@ type Session struct {
 	Activity *Activity `json:"activity,omitempty"`
 	// Context is how full the window of the session's current conversation is, left out until its transcript shows an assistant message.
 	Context *Context `json:"context,omitempty"`
+	// Runs is what the session's default model and effort resolve to, left out until its transcript names a model.
+	Runs *Runs `json:"runs,omitempty"`
 	// Socket is the messaging socket of the session's running process, forgotten once the process stops, since another process may take the path.
 	Socket string `json:"socket,omitempty"`
 	// Events holds what waits for a session that runs no next_event until bosun hands it over: the turn ends and exits of a worker's children, or the desk's tells. Taken holds the reports handed to a worker in its current turn.
