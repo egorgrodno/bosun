@@ -122,7 +122,7 @@ func runCommand(cmd string, args []string) error {
 		_ = flags.Parse(args)
 		req.Model, req.Effort, args = *model, *effort, flags.Args()
 	}
-	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "say": 2, "interrupt": 1}[cmd]
+	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "say": 2, "interrupt": 1, "compact": 1, "clear": 1}[cmd]
 	if len(args) < need {
 		return errors.New(usage)
 	}
@@ -135,7 +135,7 @@ func runCommand(cmd string, args []string) error {
 		req.Text = strings.Join(args, " ")
 	case "spawn":
 		req.Name, req.Repo, req.Text = args[0], args[1], strings.Join(args[2:], " ")
-	case "kill", "interrupt":
+	case "kill", "interrupt", "compact", "clear":
 		req.Name = args[0]
 	case "say":
 		req.Name, req.Text = args[0], strings.Join(args[1:], " ")
@@ -352,6 +352,10 @@ func logLine(e Entry) string {
 		what = with("→ " + e.Node)
 	case "interrupt":
 		what = "interrupted " + e.Node + "'s turn"
+	case "compact":
+		what = "compacted " + e.Node + "'s conversation"
+	case "clear":
+		what = "cleared " + e.Node + "'s conversation"
 	case "prompt":
 		what = with(fmt.Sprintf("answered %s's own prompt: %s", e.Node, e.Behavior))
 	case "turn_end":

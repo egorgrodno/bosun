@@ -33,6 +33,8 @@ bosun attach <id>
 
 `bosun say` types into one of bosun's sessions as you, a slash command such as `/compact` included, and `bosun interrupt` ends its turn. The daemon does both through Claude Code's supervisor with its control key, which nothing else in bosun reads. When the supervisor's protocol has changed, it stops the session and resumes it instead.
 
+`bosun compact master` runs `/compact` on the master, and `bosun clear desk` starts the desk in a new conversation. Each takes `master` or `desk`. The master clears only once no worker is left, and both keep what they must remember in their memory directory.
+
 Talk to the desk: type into it through `bosun attach`, or send it a line with `bosun tell`. The master and the desk refuse messages from your other Claude Code sessions, though the sender's `SendMessage` reports success.
 
 The flake's default package builds `bosun`, so `nix run github:egorgrodno/bosun -- daemon` runs the daemon. As a systemd user service, the daemon needs `KillMode=process`, so that stopping the daemon leaves the sessions running.

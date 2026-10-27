@@ -129,6 +129,8 @@ type daemon struct {
 	asleep bool
 	// cleared holds by node a channel that closes once the session's SessionStart reports the conversation that a clear began.
 	cleared map[string]chan struct{}
+	// compacted holds by node a channel that closes once the session's SessionStart reports that the /compact the user sent has run.
+	compacted map[string]chan struct{}
 	// recovering holds while the daemon resumes the sessions that a usage limit stopped, and limitNotice is the last notice of a limit.
 	recovering  bool
 	limitNotice string
@@ -209,6 +211,7 @@ func newDaemon(exe, socket, stateDir, masterDir string, claude claudeCLI) *daemo
 		decisions:   map[string]*Decision{},
 		orphans:     map[string]*Decision{},
 		cleared:     map[string]chan struct{}{},
+		compacted:   map[string]chan struct{}{},
 		proposed:    map[string]proposal{},
 		wake:        make(chan struct{}),
 		watchers:    map[*watcher]bool{},
@@ -686,6 +689,10 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 		resp.Text, err = d.say(ctx, r.Node, r.Name, r.Text)
 	case "interrupt":
 		resp.Text, err = d.interrupt(ctx, r.Node, r.Name)
+	case "compact":
+		resp.Text, err = d.compactConversation(ctx, r.Node, r.Name)
+	case "clear":
+		resp.Text, err = d.clearConversation(ctx, r.Node, r.Name)
 	case "transcript":
 		resp.Text, err = d.transcript(r.Name, r.Turns)
 	case "spawn":
@@ -790,6 +797,10 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 				close(ch)
 				delete(d.cleared, node)
 			}
+		}
+		if ch := d.compacted[node]; in.Source == "compact" && ch != nil {
+			close(ch)
+			delete(d.compacted, node)
 		}
 		if node == deskNode && (in.Source == "clear" || in.Source == "startup") {
 			// The desk's new conversation holds neither the answers it showed the user nor the user's yes to one.

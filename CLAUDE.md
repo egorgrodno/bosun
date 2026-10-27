@@ -21,7 +21,7 @@ One binary carries every part:
 | `bosun mcp` | the stdio MCP server each session starts, relaying to the daemon |
 | `bosun hook` | every hook each session runs |
 | `bosun tui` | the terminal frontend |
-| `bosun status`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `watch`, `conversation`, `follow` | the command-line frontend |
+| `bosun status`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `compact`, `clear`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `watch`, `conversation`, `follow` | the command-line frontend |
 
 The daemon holds each session's parent and the queue of decisions waiting on an answer. It reads each session's state from `claude agents --json --all`, which also lists sessions bosun did not start.
 
@@ -279,9 +279,14 @@ The daemon refuses each of these ops from a request that names a node, as every 
 
 **A session's own prompt.** `approve` presses Enter on the dialog's first option, Yes. `deny` presses Esc, and its message follows as a `reply`. The daemon first checks that `needs` still asks for the notice's tool. With the protocol changed, it refuses and points at `bosun attach`. A question in `needs` takes `say` with an option's label.
 
+**`compact` and `clear`.** Each takes the master or the desk, and refuses a worker, whose conversation holds its task. Each logs an entry of its kind with `via`.
+
+- `compact` sends `/compact` as `say` does, and refuses a session waiting in a permission prompt. A stopped session takes it in a resume. Without the supervisor, it waits up to 30 seconds for the turn to end, then stops the session and resumes it with `/compact`. It holds the session's lock until `SessionStart` reports the compaction, for up to 5 minutes. So a wake of the master, or a hand-off of the desk's tells, cannot stop the session while it compacts. A compact sent in the master's turn makes `next_event` return, since `/compact` waits for the turn's `Stop`.
+- `clear` moves the session to a new conversation, as the stale clear does. For the master, it refuses while any worker exists. A session in its turn is stopped first, as `interrupt` stops it, except that what the turn took waits again: the master's batch, marked `again`, and the desk's tells, as `giveBackLocked` hands them. The master then sleeps, or wakes for the events that wait.
+
 ## Frontends
 
-Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `attached`, `transcript`, `conversation`, `follow`. Every rule lives in the daemon.
+Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `compact`, `clear`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `attached`, `transcript`, `conversation`, `follow`. Every rule lives in the daemon.
 
 A decision's `asked` is when it opened, as RFC 3339, and a frontend may show its age. Its `expires` is when the daemon stops holding it, as RFC 3339, for a frontend's countdown. Only a permission that is not a reserved action expires, `promptAfter` after `asked`, and then the daemon leaves it to the session's own prompt and opens a notice. A reserved action, a question and a notice carry no `expires`: a reserved action's hook denies the call itself before its timeout, and the others wait until answered. After a restart, a decision whose request has not come back expires 30 seconds after the start, or at its own deadline if that comes sooner, since the daemon then settles it or leaves it to the session's prompt. A request that comes back restores the decision's own `expires`, and the daemon sends the decision again. A decision's `reserved` holds the reason it is a reserved action, such as `a force push`. Its `userOnly` marks an action on your list. A notice's `prompt` marks a permission waiting in its session's own prompt, with the call in `tool` and `input`, which `approve` and `deny` answer there.
 
@@ -328,6 +333,7 @@ A session's `activity` shows what it does: `tool` with `arg`, the main argument 
 | `turn_end`, `exit` | worker `node` ended its turn, or stopped in it, other than by a kill | `text` |
 | `say` | the user typed into `node` | `text`, `via`, `error` |
 | `interrupt` | the user ended `node`'s turn | `via`, `error` |
+| `compact`, `clear` | the user compacted or cleared the conversation of `node`, the master or the desk | `via`, `error` |
 | `prompt` | the user answered `node`'s own permission prompt | `behavior`, `text`: a denial's message, `via`, `error` |
 
 `via` is `supervisor` where the daemon presented the control key, and `resume` where it stopped or resumed the session instead. `error` says why the action failed.
@@ -395,3 +401,4 @@ Each leads with the queue of decisions waiting on you, above the tree. The desk 
   1. Enter on a permission dialog runs the call, which `PostToolUse` shows. Esc denies it, and a `reply` after the Esc reaches the session as your message. Check whether the denied turn runs `Stop`, and that the parent gets exactly one `turn_end`.
   2. A 120 by 40 attach, once closed, leaves the session's terminal at its size, and a `claude attach` you have open on it stays connected and redraws whole.
   3. A `reply` of `/btw`, which the binary marks to run at once, runs during a turn rather than after its `Stop`. `say` answers `runs it once its turn ends` for every command, which would then be wrong. The check was inconclusive: Claude Code stores no `/btw` answer in the transcript, which holds the text only as queued.
+  4. Only the fakes have run `compact` and `clear`. Check that a `reply` of `/compact` to a running master or desk compacts it and runs `SessionStart` with `source` `compact`, which `compact` waits for. Check whether the listing shows the session busy while it compacts.

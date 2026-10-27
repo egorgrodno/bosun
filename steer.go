@@ -88,7 +88,10 @@ func (d *daemon) say(ctx context.Context, caller, name, text string) (string, er
 	if strings.TrimSpace(text) == "" {
 		return "", errors.New("the text is empty")
 	}
-	if f := strings.Fields(text); slices.Contains(refusedCommands, f[0]) {
+	switch f := strings.Fields(text); {
+	case f[0] == "/clear":
+		return "", errors.New("bosun does not send /clear, which would change the session behind bosun's record of it: bosun clear clears the master's or the desk's conversation")
+	case slices.Contains(refusedCommands, f[0]):
 		return "", fmt.Errorf("bosun does not send %s, which would change the session behind bosun's record of it: bosun model switches the master's or the desk's model, and the master's resume a worker's", f[0])
 	}
 	unlock := d.lockSession(name)
