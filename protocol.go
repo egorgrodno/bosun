@@ -70,7 +70,7 @@ type ConvLine struct {
 	More    bool   `json:"more,omitempty"`
 }
 
-// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, tell and message; the desk gets tell; a frontend gets decision, settled, answered, sessions, activity, message, paused, unpaused and log.
+// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, tell and message; the desk gets tell; a frontend gets decision, settled, answered, sessions, activity, context, message, paused, unpaused and log.
 // A message is what session From told session Node through Claude Code's SendMessage. A tell is From's text: the user's when From is empty, or the desk's or the master's.
 // Again marks an event the master took once already, in a turn that was cut short.
 type Event struct {
@@ -86,6 +86,8 @@ type Event struct {
 	Again    bool      `json:"again,omitempty"`
 	// Activity is the latest activity of session Node, in an activity event.
 	Activity *Activity `json:"activity,omitempty"`
+	// Context is the context use of session Node, in a context event.
+	Context *Context `json:"context,omitempty"`
 
 	// sent is when the user sent a tell to the desk, which may hand it over only after an answer it proposed since.
 	sent time.Time
@@ -194,6 +196,8 @@ type Session struct {
 	Connectors bool     `json:"connectors,omitempty"`
 	// Activity is the latest tool call of the session or, with none in its turn, the start of its last message.
 	Activity *Activity `json:"activity,omitempty"`
+	// Context is how full the window of the session's current conversation is, left out until its transcript shows an assistant message.
+	Context *Context `json:"context,omitempty"`
 	// Socket is the messaging socket of the session's running process, forgotten once the process stops, since another process may take the path.
 	Socket string `json:"socket,omitempty"`
 	// Events holds what waits for a session that runs no next_event until bosun hands it over: the turn ends and exits of a worker's children, or the desk's tells. Taken holds the reports handed to a worker in its current turn.
@@ -221,6 +225,8 @@ type Session struct {
 	// actSent is when the frontends last heard of the session's activity, and actTimer the send held back until the window ends.
 	actSent  time.Time
 	actTimer *time.Timer
+	// usage follows the end of the session's transcript for Context.
+	usage *usageTail
 }
 
 func socketPath() string {

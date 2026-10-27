@@ -457,7 +457,7 @@ func (d *daemon) sortedLocked() []*Session {
 
 func (s *Session) public() Session {
 	c := *s
-	c.pre, c.Events, c.Taken, c.Prompts = nil, nil, nil, nil
+	c.pre, c.Events, c.Taken, c.Prompts, c.usage = nil, nil, nil, nil, nil
 	if s.settled() {
 		c.Status, c.State = "idle", ""
 	}
@@ -763,6 +763,9 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 	}
 	wasSettled := n.settled()
 	d.stirred = true
+	if contextEvents[in.Event] {
+		d.touchContextLocked(n, in.Event)
+	}
 	switch in.Event {
 	case "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "PostToolUseFailure":
 		d.turnLocked(n)
@@ -3330,11 +3333,17 @@ func (d *daemon) refresh(byID map[string]agent, listed time.Time) (masterMoved b
 		if n.ID == "" || n.held {
 			continue
 		}
-		status, state := "exited", ""
+		status, state, moved := "exited", "", false
 		a, ok := byID[n.ID]
 		if ok {
 			// The listing outranks a hook, which a stopped session may still send after a switch.
+			was := n.SessionID
 			n.SessionID = cmp.Or(a.SessionID, n.SessionID)
+			moved = n.SessionID != was
+		}
+		if n.SessionID != "" && (moved || n.usage == nil) {
+			// A new session id is a new conversation, as a clear begins.
+			d.touchContextLocked(n, "")
 		}
 		switch {
 		case ok && a.Status != "":

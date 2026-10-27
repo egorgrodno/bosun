@@ -99,6 +99,12 @@ func (t *tui) apply(r Response) {
 				t.sessions[i].Activity = r.Event.Activity
 			}
 		}
+	case r.Event.Kind == "context":
+		for i := range t.sessions {
+			if t.sessions[i].Node == r.Event.Node {
+				t.sessions[i].Context = r.Event.Context
+			}
+		}
 	case r.Event.Kind == "log" && r.Event.Entry != nil:
 		t.log = append(t.log, *r.Event.Entry)
 		t.log = t.log[max(0, len(t.log)-shownLog):]
@@ -238,7 +244,7 @@ func (t *tui) render(width, height int) []string {
 			continue
 		}
 		s := it.session
-		add("", fmt.Sprintf("  %s%-*s %-8s %-15s %s", strings.Repeat("  ", it.depth), max(1, 14-2*it.depth), s.Node, s.ID, sessionState(*s), modelLabel(*s)), i == t.sel)
+		add("", fmt.Sprintf("  %s%-*s %-8s %-15s %s", strings.Repeat("  ", it.depth), max(1, 14-2*it.depth), s.Node, s.ID, sessionState(*s), strings.TrimSpace(modelLabel(*s)+" "+contextLabel(s.Context))), i == t.sel)
 		if line := activityLine(s.Activity); line != "" {
 			add(dim, "    "+strings.Repeat("  ", it.depth)+line, false)
 		}

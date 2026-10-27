@@ -258,7 +258,7 @@ func printStatus(w io.Writer, s Response) {
 	var walk func(parent string, depth int)
 	walk = func(parent string, depth int) {
 		for _, n := range children[parent] {
-			fmt.Fprintf(w, "  %s%-*s %-8s %-15s %s\n", strings.Repeat("  ", depth), 14-2*depth, n.Node, n.ID, sessionState(n), modelLabel(n))
+			fmt.Fprintf(w, "  %s%-*s %-8s %-15s %s\n", strings.Repeat("  ", depth), 14-2*depth, n.Node, n.ID, sessionState(n), strings.TrimSpace(modelLabel(n)+" "+contextLabel(n.Context)))
 			if line := activityLine(n.Activity); line != "" {
 				fmt.Fprintf(w, "  %s    %s\n", strings.Repeat("  ", depth), clip(line, 100))
 			}
