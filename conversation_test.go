@@ -124,7 +124,6 @@ var probeLines = []string{
 	`u-compact prompt user "/compact"`,
 	`s-boundary compact "This session is being continu…"`,
 	`u-caveat meta user`,
-	`u-command command /compact "Compacted (ctrl+o to see full summary)"`,
 	`at-ref meta attachment/compact_file_reference`,
 }
 
@@ -283,11 +282,11 @@ func TestConversationPage(t *testing.T) {
 	}
 	// Meta entries count against no limit, so the page reaches back past those before its oldest entry.
 	got, more, err := page(c.entries, "", 3)
-	if want := []string{"s-duration", "L26", "u-compact", "s-boundary", "u-caveat", "u-command", "at-ref"}; err != nil || !more || !slices.Equal(ids(got), want) {
+	if want := []string{"a-done", "s-duration", "L26", "u-compact", "s-boundary", "u-caveat", "at-ref"}; err != nil || !more || !slices.Equal(ids(got), want) {
 		t.Fatalf("the last page is %v, more %v (%v), want %v", ids(got), more, err, want)
 	}
 	got, more, err = page(c.entries, "s-duration", 100)
-	if err != nil || more || len(got) != len(probeLines)-7 || got[0].ID != "L1" {
+	if err != nil || more || len(got) != len(probeLines)-6 || got[0].ID != "L1" {
 		t.Fatalf("the page before s-duration is %v, more %v (%v)", ids(got), more, err)
 	}
 	got, more, _ = page(c.entries, "a-text", 2)

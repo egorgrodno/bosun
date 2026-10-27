@@ -132,8 +132,10 @@ type conversation struct {
 	queued []int
 	// command is the place of the last slash command still without its output, and compacted of the last compaction without its summary, or -1.
 	command, compacted int
-	line               int
-	changed            []int
+	// skipOutput marks that the next command output belongs to a compaction's command record, which was left out.
+	skipOutput bool
+	line       int
+	changed    []int
 	// sender names who sent a prompt that bosun handed the session, or returns "" for one it did not.
 	sender func(text string) string
 
@@ -379,6 +381,10 @@ func (c *conversation) user(r record, base Said, line []byte) {
 			return
 		}
 		if m := commandName.FindStringSubmatch(text); m != nil && strings.HasPrefix(text, "<command-") {
+			if m[1] == "/compact" && c.afterCompactPrompt() {
+				c.skipOutput = true
+				return
+			}
 			e := base
 			e.Kind, e.Name = "command", m[1]
 			if a := commandArgs.FindStringSubmatch(text); a != nil {
@@ -442,6 +448,23 @@ func (c *conversation) result(r record, base Said, i int, raw json.RawMessage) {
 	c.calls[b.ID] = c.put(e)
 }
 
+// afterCompactPrompt reports whether the entries so far end in a /compact prompt and its compaction, which a /compact command record then repeats.
+func (c *conversation) afterCompactPrompt() bool {
+	compacted := false
+	for i := len(c.entries) - 1; i >= 0; i-- {
+		switch e := c.entries[i]; e.Kind {
+		case "meta":
+		case "compact":
+			compacted = true
+		case "prompt":
+			return compacted && e.Text == "/compact"
+		default:
+			return false
+		}
+	}
+	return false
+}
+
 // output lands a slash command's output on its command entry, or begins one for output with no command before it.
 func (c *conversation) output(base Said, name, args, text string) {
 	out := text
@@ -449,6 +472,10 @@ func (c *conversation) output(base Said, name, args, text string) {
 		out = m[1]
 	}
 	out = ansi.ReplaceAllString(out, "")
+	if c.skipOutput {
+		c.skipOutput = false
+		return
+	}
 	if c.command >= 0 {
 		c.entries[c.command].Output = out
 		c.touch(c.command)
