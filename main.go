@@ -14,7 +14,8 @@ const usage = `usage:
   bosun mcp                        the MCP server each session starts
   bosun hook                       every hook each session runs
 
-  bosun tui                        the decisions waiting and the tree, in the terminal
+  bosun tui [-layout qwerty|hallmack]
+                                   the decisions waiting and the tree, in the terminal
   bosun status [--json]            the decisions waiting, and the tree
   bosun watch                      stream the daemon's snapshot and events
   bosun conversation [-before ID] [-limit N] NAME
@@ -59,7 +60,7 @@ func main() {
 	case "conversation", "follow":
 		err = runConversation(cmd, args)
 	case "tui":
-		err = runTUI()
+		err = runTUI(args)
 	case "attach":
 		err = runAttach(args)
 	case "model":

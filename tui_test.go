@@ -40,8 +40,8 @@ func TestTUIItems(t *testing.T) {
 
 func TestTUIKeys(t *testing.T) {
 	tu := testTUI()
-	if a, ok := tu.key("a"); !ok || a != (tuiAction{op: "approve", id: "3"}) {
-		t.Fatalf("a on a permission: %+v %v", a, ok)
+	if a, ok := tu.key("y"); !ok || a != (tuiAction{op: "approve", id: "3"}) {
+		t.Fatalf("y on a permission: %+v %v", a, ok)
 	}
 	if _, ok := tu.key("x"); ok {
 		t.Fatal("dismissed a permission")
@@ -74,7 +74,7 @@ func TestTUIKeys(t *testing.T) {
 func TestTUIRender(t *testing.T) {
 	tu := testTUI()
 	screen := strings.Join(tu.render(80, 20), "\n")
-	for _, want := range []string{"Waiting on you", "git push", "[a git push]", "spawn failed", "Waiting on the master", "X or Y?", "Sessions", "    b ", "a approve"} {
+	for _, want := range []string{"Waiting on you", "git push", "[a git push]", "spawn failed", "Waiting on the master", "X or Y?", "Sessions", "    b ", "y approve"} {
 		if !strings.Contains(screen, want) {
 			t.Errorf("the screen lacks %q:\n%s", want, screen)
 		}
@@ -161,5 +161,56 @@ func TestTUISwitch(t *testing.T) {
 func TestSplitKeys(t *testing.T) {
 	if got := splitKeys([]byte("j\x1b[Bé\r")); !slices.Equal(got, []string{"j", "\x1b[B", "é", "\r"}) {
 		t.Fatalf("keys %q", got)
+	}
+}
+
+// Only the movement keys follow the layout: j/k on qwerty, the default, and a/e on hallmack. Arrows work on both, and y approves on both.
+func TestTUILayouts(t *testing.T) {
+	for _, c := range []struct{ layout, down, up, other string }{
+		{"", "j", "k", "a"},
+		{"qwerty", "j", "k", "a"},
+		{"bogus", "j", "k", "a"},
+		{layoutHallmack, "a", "e", "j"},
+	} {
+		tu := testTUI()
+		tu.layout = c.layout
+		tu.key(c.down)
+		if tu.sel != 1 {
+			t.Fatalf("%q: %s left sel at %d", c.layout, c.down, tu.sel)
+		}
+		tu.key(c.up)
+		if tu.sel != 0 {
+			t.Fatalf("%q: %s left sel at %d", c.layout, c.up, tu.sel)
+		}
+		tu.key(c.other)
+		if tu.sel != 0 {
+			t.Fatalf("%q: the other layout key %s moved to %d", c.layout, c.other, tu.sel)
+		}
+		tu.key("\x1b[B")
+		if tu.sel != 1 {
+			t.Fatalf("%q: the down arrow left sel at %d", c.layout, tu.sel)
+		}
+		tu.key("\x1b[A")
+		if a, ok := tu.key("y"); !ok || a != (tuiAction{op: "approve", id: "3"}) {
+			t.Fatalf("%q: y: %+v %v", c.layout, a, ok)
+		}
+		if a, ok := tu.key("a"); ok && a.op == "approve" {
+			t.Fatalf("%q: a still approves", c.layout)
+		}
+		tu.sel = 0
+		if got := strings.Join(tu.render(80, 20), "\n"); !strings.Contains(got, "y approve") || !strings.Contains(got, c.down+"/"+c.up+" move") {
+			t.Fatalf("%q: the hint lacks the keys:\n%s", c.layout, got)
+		}
+	}
+}
+
+func TestLayoutFor(t *testing.T) {
+	t.Setenv("BOSUN_LAYOUT", "hallmack")
+	if layoutFor("") != layoutHallmack || layoutFor("qwerty") != "qwerty" {
+		t.Fatal("the variable sets the layout and the flag overrides it")
+	}
+	t.Setenv("BOSUN_LAYOUT", "dvorak")
+	if layoutFor("") != "qwerty" || layoutFor("hallmack") != layoutHallmack {
+		t.Fatal("an unknown layout is qwerty")
 	}
 }

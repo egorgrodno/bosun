@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"net"
 	"os"
@@ -32,6 +33,25 @@ type tui struct {
 	switching string
 	answer    []rune
 	err       string
+	// layout is the keyboard layout, qwerty or hallmack, which picks the movement keys.
+	layout string
+}
+
+// layoutHallmack is the one layout name that changes the keys. Anything else is qwerty.
+const layoutHallmack = "hallmack"
+
+// moveKeys returns the letters that move down and up on the layout. Arrows work on both.
+func moveKeys(layout string) (down, up string) {
+	if layout == layoutHallmack {
+		return "a", "e"
+	}
+	return "j", "k"
+}
+
+// moveHint is the footer's text for the movement keys.
+func moveHint(layout string) string {
+	down, up := moveKeys(layout)
+	return down + "/" + up + " move"
 }
 
 // tuiItem is a selectable line: a decision, or a session at its depth in the tree.
@@ -160,6 +180,7 @@ func (t *tui) key(k string) (tuiAction, bool) {
 	if it.decision != nil {
 		kind = it.decision.Kind
 	}
+	down, up := moveKeys(t.layout)
 	switch {
 	case k == "q" || k == "\x03":
 		return tuiAction{op: "quit"}, true
@@ -167,11 +188,11 @@ func (t *tui) key(k string) (tuiAction, bool) {
 		return tuiAction{op: "unpause"}, true
 	case k == "p":
 		return tuiAction{op: "pause"}, true
-	case k == "j" || k == "\x1b[B":
+	case k == down || k == "\x1b[B":
 		t.sel = min(t.sel+1, len(t.items())-1)
-	case k == "k" || k == "\x1b[A":
+	case k == up || k == "\x1b[A":
 		t.sel = max(t.sel-1, 0)
-	case k == "a" && kind == "permission":
+	case k == "y" && kind == "permission":
 		return tuiAction{op: "approve", id: it.decision.ID}, true
 	case k == "d" && kind == "permission":
 		return tuiAction{op: "deny", id: it.decision.ID}, true
@@ -269,13 +290,13 @@ func (t *tui) render(width, height int) []string {
 	case t.answering != "":
 		foot = append(foot, fmt.Sprintf("answer %s: %s_", t.answering, string(t.answer)), dim+clip("enter send · esc cancel", width)+plain)
 	case it.decision != nil && it.decision.Kind == "permission":
-		foot = append(foot, dim+clip("a approve · d deny · j/k move · q quit", width)+plain)
+		foot = append(foot, dim+clip("y approve · d deny · "+moveHint(t.layout)+" · q quit", width)+plain)
 	case it.decision != nil && it.decision.Kind == "question":
-		foot = append(foot, dim+clip("r answer · j/k move · q quit", width)+plain)
+		foot = append(foot, dim+clip("r answer · "+moveHint(t.layout)+" · q quit", width)+plain)
 	case t.switching != "":
 		foot = append(foot, fmt.Sprintf("switch %s to: %s_", t.switching, string(t.answer)), dim+clip("a model, an effort ("+strings.Join(efforts, ", ")+") or both · enter switch · esc cancel", width)+plain)
 	case it.decision != nil:
-		foot = append(foot, dim+clip("x dismiss · j/k move · q quit", width)+plain)
+		foot = append(foot, dim+clip("x dismiss · "+moveHint(t.layout)+" · q quit", width)+plain)
 	case it.session != nil:
 		keys := "enter attach, then ctrl+z to come back · "
 		if it.session.Node == masterNode || it.session.Node == deskNode {
@@ -286,7 +307,7 @@ func (t *tui) render(width, height int) []string {
 		} else {
 			keys += "p pause all · "
 		}
-		foot = append(foot, dim+clip(keys+"j/k move · q quit", width)+plain)
+		foot = append(foot, dim+clip(keys+moveHint(t.layout)+" · q quit", width)+plain)
 	default:
 		foot = append(foot, dim+"q quit"+plain)
 	}
@@ -347,7 +368,21 @@ type tuiMessage struct {
 	failed  string
 }
 
-func runTUI() error {
+// layoutFor picks the layout from the flag, else from BOSUN_LAYOUT.
+func layoutFor(flagValue string) string {
+	if flagValue == "" {
+		flagValue = os.Getenv("BOSUN_LAYOUT")
+	}
+	if flagValue == layoutHallmack {
+		return layoutHallmack
+	}
+	return "qwerty"
+}
+
+func runTUI(args []string) error {
+	flags := flag.NewFlagSet("tui", flag.ExitOnError)
+	layout := flags.String("layout", "", "keyboard layout, qwerty or hallmack (default $BOSUN_LAYOUT, else qwerty)")
+	_ = flags.Parse(args)
 	in := int(os.Stdin.Fd())
 	old, err := makeRaw(in)
 	if err != nil {
@@ -381,7 +416,7 @@ func runTUI() error {
 		}
 	}()
 
-	t := &tui{}
+	t := &tui{layout: layoutFor(*layout)}
 	draw := func() {
 		w, h := termSize(in)
 		var b strings.Builder

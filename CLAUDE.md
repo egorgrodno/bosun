@@ -365,7 +365,7 @@ A prompt's `from` is `user`, `bosun` for a prompt bosun wrote, `claude` for Clau
 Each leads with the queue of decisions waiting on you, above the tree. The desk is its own row above the master's tree. Under each session's row, `bosun tui` and `bosun status` show its activity as the tool, a space and the argument, or as the text. Below the tree they show the log's latest 10 entries.
 
 - **Quickshell panel.** It lives in the NixOS configuration's `modules/quickshell/`, as the `Agents` bar module and `BosunPanel`, and reads the protocol through `bosun watch`. Opening a session runs `bosun attach <id>` in a new kitty window. `quickshell ipc call bosun toggle` opens it.
-- **`bosun tui`.** Opening a session runs `claude attach` in the TUI's terminal. `Ctrl+Z` exits `claude attach` with status 0, leaving the session running.
+- **`bosun tui`.** Opening a session runs `claude attach` in the TUI's terminal. `Ctrl+Z` exits `claude attach` with status 0, leaving the session running. Only its movement keys follow the keyboard layout, from `-layout` or else `BOSUN_LAYOUT`, which the NixOS configuration sets from `config.base.keyboard.layout`: `j`/`k` on qwerty, the default and the value of anything but `hallmack`, and `a`/`e` on hallmack. No action key uses a letter of either movement set (`h j k l g a e o`), so approve is `y` on both layouts.
 
 ## Open questions
 
