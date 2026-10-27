@@ -35,6 +35,29 @@ type tui struct {
 	err       string
 	// layout is the keyboard layout, qwerty or hallmack, which picks the movement keys.
 	layout string
+	// armed is the key a first press armed, y, d or p, and armedAt when. A second press of it within armTimeout acts, as in the panel. Any other key or the timeout disarms it.
+	armed   string
+	armedAt time.Time
+	// now is the clock, time.Now unless a test sets it.
+	now func() time.Time
+}
+
+// armTimeout is how long a first press stays armed.
+const armTimeout = 3 * time.Second
+
+func (t *tui) clock() time.Time {
+	if t.now != nil {
+		return t.now()
+	}
+	return time.Now()
+}
+
+// armedKey returns the key still armed, or "".
+func (t *tui) armedKey() string {
+	if t.armed != "" && t.clock().Sub(t.armedAt) < armTimeout {
+		return t.armed
+	}
+	return ""
 }
 
 // layoutHallmack is the one layout name that changes the keys. Anything else is qwerty.
@@ -150,6 +173,16 @@ func (t *tui) apply(r Response) {
 
 // key handles one key, and returns what it asks for, if anything.
 func (t *tui) key(k string) (tuiAction, bool) {
+	was := t.armedKey()
+	t.armed = ""
+	// twice acts on the second press of k, and otherwise arms it.
+	twice := func(a tuiAction) (tuiAction, bool) {
+		if was == k {
+			return a, true
+		}
+		t.armed, t.armedAt = k, t.clock()
+		return tuiAction{}, false
+	}
 	if t.answering != "" || t.switching != "" {
 		switch k {
 		case "\x1b":
@@ -185,17 +218,17 @@ func (t *tui) key(k string) (tuiAction, bool) {
 	case k == "q" || k == "\x03":
 		return tuiAction{op: "quit"}, true
 	case k == "p" && t.paused:
-		return tuiAction{op: "unpause"}, true
+		return twice(tuiAction{op: "unpause"})
 	case k == "p":
-		return tuiAction{op: "pause"}, true
+		return twice(tuiAction{op: "pause"})
 	case k == down || k == "\x1b[B":
 		t.sel = min(t.sel+1, len(t.items())-1)
 	case k == up || k == "\x1b[A":
 		t.sel = max(t.sel-1, 0)
 	case k == "y" && kind == "permission":
-		return tuiAction{op: "approve", id: it.decision.ID}, true
+		return twice(tuiAction{op: "approve", id: it.decision.ID})
 	case k == "d" && kind == "permission":
-		return tuiAction{op: "deny", id: it.decision.ID}, true
+		return twice(tuiAction{op: "deny", id: it.decision.ID})
 	case k == "x" && kind == "notice":
 		return tuiAction{op: "dismiss", id: it.decision.ID}, true
 	case (k == "r" || k == "\r") && kind == "question":
@@ -287,6 +320,12 @@ func (t *tui) render(width, height int) []string {
 
 	var foot []string
 	switch it := t.selected(); {
+	case t.armedKey() != "":
+		hint := map[string]string{"y": "approve", "d": "deny", "p": "pause"}[t.armed]
+		if t.armed == "p" && t.paused {
+			hint = "unpause"
+		}
+		foot = append(foot, yellow+"Press "+t.armed+" again to "+hint+plain)
 	case t.answering != "":
 		foot = append(foot, fmt.Sprintf("answer %s: %s_", t.answering, string(t.answer)), dim+clip("enter send · esc cancel", width)+plain)
 	case it.decision != nil && it.decision.Kind == "permission":
@@ -433,7 +472,7 @@ func runTUI(args []string) error {
 	draw()
 	buf := make([]byte, 256)
 	for {
-		readable, err := waitReadable(in, int(wakeR.Fd()))
+		readable, err := waitReadable(in, int(wakeR.Fd()), t.armedKey() != "")
 		if err != nil {
 			return err
 		}
@@ -536,12 +575,18 @@ func watchStream(post func(tuiMessage)) {
 }
 
 // waitReadable blocks until fd a or fd b has input, and reports which.
-func waitReadable(a, b int) ([2]bool, error) {
+func waitReadable(a, b int, armed bool) ([2]bool, error) {
 	for {
+		// An armed key times out, so the hint goes without a key press.
+		var timeout *syscall.Timeval
+		if armed {
+			tv := syscall.NsecToTimeval(int64(armTimeout))
+			timeout = &tv
+		}
 		var set syscall.FdSet
 		set.Bits[a/64] |= 1 << (uint(a) % 64)
 		set.Bits[b/64] |= 1 << (uint(b) % 64)
-		_, err := syscall.Select(max(a, b)+1, &set, nil, nil, nil)
+		_, err := syscall.Select(max(a, b)+1, &set, nil, nil, timeout)
 		if errors.Is(err, syscall.EINTR) {
 			continue
 		}

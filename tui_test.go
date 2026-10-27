@@ -40,6 +40,9 @@ func TestTUIItems(t *testing.T) {
 
 func TestTUIKeys(t *testing.T) {
 	tu := testTUI()
+	if _, ok := tu.key("y"); ok {
+		t.Fatal("one y approved")
+	}
 	if a, ok := tu.key("y"); !ok || a != (tuiAction{op: "approve", id: "3"}) {
 		t.Fatalf("y on a permission: %+v %v", a, ok)
 	}
@@ -113,6 +116,9 @@ func TestTUIApply(t *testing.T) {
 
 func TestTUIPause(t *testing.T) {
 	tu := testTUI()
+	if _, ok := tu.key("p"); ok {
+		t.Fatal("one p paused")
+	}
 	if a, ok := tu.key("p"); !ok || a.op != "pause" {
 		t.Fatalf("p: %+v %v", a, ok)
 	}
@@ -121,6 +127,9 @@ func TestTUIPause(t *testing.T) {
 	screen := strings.Join(tu.render(80, 20), "\n")
 	if !strings.Contains(screen, "Paused") || !strings.Contains(screen, "paused ") {
 		t.Fatalf("the screen does not show the pause:\n%s", screen)
+	}
+	if _, ok := tu.key("p"); ok {
+		t.Fatal("one p unpaused")
 	}
 	if a, ok := tu.key("p"); !ok || a.op != "unpause" {
 		t.Fatalf("p while paused: %+v %v", a, ok)
@@ -191,6 +200,7 @@ func TestTUILayouts(t *testing.T) {
 			t.Fatalf("%q: the down arrow left sel at %d", c.layout, tu.sel)
 		}
 		tu.key("\x1b[A")
+		tu.key("y")
 		if a, ok := tu.key("y"); !ok || a != (tuiAction{op: "approve", id: "3"}) {
 			t.Fatalf("%q: y: %+v %v", c.layout, a, ok)
 		}
@@ -212,5 +222,34 @@ func TestLayoutFor(t *testing.T) {
 	t.Setenv("BOSUN_LAYOUT", "dvorak")
 	if layoutFor("") != "qwerty" || layoutFor("hallmack") != layoutHallmack {
 		t.Fatal("an unknown layout is qwerty")
+	}
+}
+
+// A first y, d or p arms the key and shows a hint. A second press within three seconds acts, and another key or the timeout disarms it.
+func TestTUIArmed(t *testing.T) {
+	tu := testTUI()
+	now := time.Date(2026, 10, 27, 12, 0, 0, 0, time.UTC)
+	tu.now = func() time.Time { return now }
+	tu.key("y")
+	if screen := strings.Join(tu.render(80, 20), "\n"); !strings.Contains(screen, "Press y again to approve") {
+		t.Fatalf("no hint after the first y:\n%s", screen)
+	}
+	if _, ok := tu.key("d"); ok {
+		t.Fatal("y then d denied")
+	}
+	if a, ok := tu.key("d"); !ok || a.op != "deny" {
+		t.Fatalf("d d: %+v %v", a, ok)
+	}
+	tu.key("y")
+	now = now.Add(armTimeout)
+	if screen := strings.Join(tu.render(80, 20), "\n"); strings.Contains(screen, "again to") {
+		t.Fatalf("the hint outlived the timeout:\n%s", screen)
+	}
+	if _, ok := tu.key("y"); ok {
+		t.Fatal("a y after the timeout approved")
+	}
+	tu.key("j")
+	if _, ok := tu.key("y"); ok {
+		t.Fatal("a movement key left y armed")
 	}
 }
