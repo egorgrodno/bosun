@@ -67,6 +67,7 @@ var (
 	metaTypes = []string{
 		"api-request", "api-request-blob", "api-request-shape", "cost-state", "last-prompt", "atis-latch", "mode", "permission-mode",
 		"agent-name", "custom-title", "ai-title", "worktree-state", "file-history-delta", "file-history-snapshot", "summary",
+		"tools-used", "bridge-session", "agent-setting", "continued-in",
 	}
 	metaAttachments = []string{
 		"total_tokens_reminder", "deferred_tools_record", "deferred_tools_delta", "task_reminder", "silent_turn_reminder", "diagnostics",
@@ -74,8 +75,9 @@ var (
 		"hook_non_blocking_error", "edited_text_file", "mcp_instructions_delta", "command_permissions", "instructions", "model",
 		"skill_listing", "skill_mention", "date", "agent_listing_delta", "sandbox_instructions", "credential_org", "session_context",
 		"auto_mode", "nested_memory", "thinking_drop", "read_truncation_notice", "compact_file_reference",
+		"file", "remote_session_change", "hook_system_message", "session_cron_carry", "plan_mode_exit", "invoked_skills",
 	}
-	metaSystem = []string{"stop_hook_summary", "turn_duration", "away_summary", "informational"}
+	metaSystem = []string{"stop_hook_summary", "turn_duration", "away_summary", "informational", "bridge_status"}
 )
 
 var localStdout = regexp.MustCompile(`(?s)<local-command-stdout>(.*?)</local-command-stdout>`)

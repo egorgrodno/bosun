@@ -162,6 +162,29 @@ func TestConversationEntries(t *testing.T) {
 	}
 }
 
+// The routine bookkeeping records of Claude Code go out as meta, not unsupported.
+func TestConversationMapsRoutineRecords(t *testing.T) {
+	c := newConversation(nil)
+	for _, l := range []string{
+		`{"type":"tools-used","tools":["Bash"],"sessionId":"s"}`,
+		`{"type":"bridge-session","bridgeSessionId":"b","sessionId":"s"}`,
+		`{"type":"agent-setting","agentSetting":"x","sessionId":"s"}`,
+		`{"type":"continued-in","continuedInSessionId":"t","sessionId":"s"}`,
+		`{"type":"attachment","uuid":"a1","attachment":{"type":"hook_system_message"}}`,
+		`{"type":"attachment","uuid":"a2","attachment":{"type":"remote_session_change"}}`,
+		`{"type":"system","subtype":"bridge_status","uuid":"s1"}`,
+	} {
+		c.add([]byte(l))
+	}
+	want := []string{
+		`L1 meta tools-used`, `L2 meta bridge-session`, `L3 meta agent-setting`, `L4 meta continued-in`,
+		`a1 meta attachment/hook_system_message`, `a2 meta attachment/remote_session_change`, `s1 meta system/bridge_status`,
+	}
+	if got := lines(c.entries); !slices.Equal(got, want) {
+		t.Fatalf("entries are\n%q\nwant\n%q", got, want)
+	}
+}
+
 // A long string of a record goes out cut, as the log cuts a decision's input.
 func TestConversationCutsRaw(t *testing.T) {
 	c := newConversation(nil)
