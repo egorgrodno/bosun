@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Said is an entry of a session's conversation, as the frontends get it. Kind picks the fields that apply:
@@ -685,7 +686,15 @@ func page(entries []Said, before string, limit int) ([]Said, bool, error) {
 }
 
 // promptSum identifies a prompt bosun handed a session, without keeping its text.
+// It hashes the text without the invisible characters Claude Code drops before it writes a prompt to the transcript: the format characters (Unicode Cf, such as U+2060 and U+FEFF) and the private-use ones (Co).
+// Claude Code does not normalise the rest, an ellipsis stays one.
 func promptSum(text string) string {
+	text = strings.Map(func(r rune) rune {
+		if unicode.In(r, unicode.Cf, unicode.Co) {
+			return -1
+		}
+		return r
+	}, text)
 	sum := sha256.Sum256([]byte(strings.TrimSpace(text)))
 	return hex.EncodeToString(sum[:8])
 }

@@ -347,6 +347,24 @@ func TestConversationRequest(t *testing.T) {
 	}
 }
 
+func TestSenderOfIgnoresInvisibleCharacters(t *testing.T) {
+	d, _ := testDaemon(t)
+	d.mu.Lock()
+	d.nodes["a"].handedLocked(masterNode, "Fix the parser\u2060 and run the tests…")
+	d.mu.Unlock()
+
+	send := d.senderOf("a")
+	if got := send("Fix the parser and run the tests…"); got != masterNode {
+		t.Fatalf("the prompt without its word joiner came from %q, want the master", got)
+	}
+	if got := send("\ufeffFix the parser and run the tests…\n"); got != masterNode {
+		t.Fatalf("the prompt with a byte order mark came from %q, want the master", got)
+	}
+	if got := send("Fix the parser and run the tests..."); got != "" {
+		t.Fatalf("the prompt with an ellipsis spelled out came from %q, want nobody", got)
+	}
+}
+
 // fakeSocket is the socket of the fake supervisor that runs, which controlSocket names once a test has installed it.
 var fakeSocket struct {
 	once sync.Once
