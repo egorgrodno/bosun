@@ -117,6 +117,10 @@ func TestRestartKeepsDecisions(t *testing.T) {
 		answer <- text
 	}()
 	question := openDecision(t, 1)
+	asked, err := time.Parse(time.RFC3339, question.Asked)
+	if err != nil || time.Since(asked) > time.Minute {
+		t.Fatalf("asked = %q (%v)", question.Asked, err)
+	}
 	mustCall(t, Request{Op: "escalate", Node: masterNode, ID: question.ID, Text: "the user's call"})
 	receive(t, runHookAsync("a", hookEvent("PreToolUse", "t1", "Bash", bashTest)))
 	hook := runHookAsync("a", hookEvent("PermissionRequest", "", "Bash", bashTest))
@@ -130,7 +134,7 @@ func TestRestartKeepsDecisions(t *testing.T) {
 		t.Fatalf("decision = %+v", got)
 	}
 	decs := mustCall(t, Request{Op: "status"}).Decisions
-	if decs[0].ID != question.ID || decs[0].Holder != "user" || decs[0].Note != "the user's call" || decs[1].ID != permission.ID {
+	if decs[0].ID != question.ID || decs[0].Holder != "user" || decs[0].Note != "the user's call" || decs[1].ID != permission.ID || decs[0].Asked != question.Asked {
 		t.Fatalf("decisions = %+v", decs)
 	}
 	events := mustCall(t, Request{Op: "next_event", Node: masterNode}).Events

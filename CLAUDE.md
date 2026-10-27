@@ -281,13 +281,13 @@ The daemon refuses each of these ops from a request that names a node, as every 
 
 Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `attached`, `transcript`, `conversation`, `follow`. Every rule lives in the daemon.
 
-A decision's `reserved` holds the reason it is a reserved action, such as `a force push`. Its `userOnly` marks an action on your list. A notice's `prompt` marks a permission waiting in its session's own prompt, with the call in `tool` and `input`, which `approve` and `deny` answer there.
+A decision's `asked` is when it opened, as RFC 3339, and a frontend may show its age. A decision's `reserved` holds the reason it is a reserved action, such as `a force push`. Its `userOnly` marks an action on your list. A notice's `prompt` marks a permission waiting in its session's own prompt, with the call in `tool` and `input`, which `approve` and `deny` answer there.
 
 A frontend should show the `answered` event and the snapshot's `answered`: each decision the desk answered on your word, with the answer given and the words the desk quoted.
 
 The snapshot's `paused`, and the `paused` and `unpaused` events, show a pause. A session's `paused` marks a turn that `unpause` resumes.
 
-A session's `status` comes from Claude Code's listing, which shows it busy for a few seconds after its turn ended, as after a turn that ended on a backgrounded command. For 10 seconds after a `Stop` or `StopFailure` with no hook of a new turn since, the snapshot and the `sessions` event show it `idle` with no `state`, and `say` and `interrupt` treat it as idle.
+A session's `status` comes from Claude Code's listing, which shows it busy after its turn ended while a background command still runs, and for a few seconds after any turn. From a `Stop` or `StopFailure` until a hook of a new turn or a listing that shows the session idle or stopped, the snapshot and the `sessions` event show it `idle` with no `state`, and `say` and `interrupt` treat it as idle. The daemon's own record keeps the listing's status.
 
 In the snapshot and the `sessions` event, the desk is the session whose `node` is `desk`. Like the master, it has no `parent`.
 
@@ -337,6 +337,7 @@ Every entry has `id` and `kind`, and each from a record with a `timestamp` has `
 | `kind` | Carries | From |
 |---|---|---|
 | `prompt` | `from`, `text`, `midTurn` | a prompt, or a `queued_command` attachment, which sets `midTurn` |
+| `task` | `from` (`claude`), `text` (the raw XML), `task`, `call`, `outputFile`, `status`, `summary`, `exit` | a `<task-notification>` prompt: a finished background command, monitor or agent. `call` is the tool-use id, `exit` the code in a summary ending `(exit code N)` and absent otherwise, and any field absent from the XML is absent |
 | `queued` | `text`, `taken` | a `queue-operation` `enqueue`, which a later `remove`, `dequeue` or `popAll` marks `taken` |
 | `text`, `thinking` | `text` | an assistant block |
 | `tool` | `call`, `name`, `input`, and once it lands `result`: `at`, `text`, `error`, `interrupted`, `diff` | a `tool_use` block and its `tool_result` |

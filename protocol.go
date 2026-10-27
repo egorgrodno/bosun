@@ -144,6 +144,8 @@ type Decision struct {
 	UserOnly bool `json:"userOnly,omitempty"`
 	// Prompt marks a notice that a permission waits in its session's own prompt, which the session moving on withdraws, and which the user's approve or deny answers there.
 	Prompt bool `json:"prompt,omitempty"`
+	// Asked is when the decision opened, as RFC 3339.
+	Asked string `json:"asked,omitempty"`
 
 	toolUseID string
 	// key is the Key of the request that waits on the decision.

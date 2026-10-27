@@ -380,6 +380,9 @@ func (d *daemon) load() error {
 	for _, sd := range st.Decisions {
 		dec := sd.Decision
 		dec.toolUseID, dec.key, dec.opened = sd.ToolUseID, sd.Key, sd.Opened
+		if dec.Asked == "" {
+			dec.Asked = sd.Opened.UTC().Format(time.RFC3339)
+		}
 		dec.answer = make(chan answer, 1)
 		d.decisions[dec.ID] = &dec
 		if dec.Kind != "notice" {
@@ -457,10 +460,10 @@ func (s *Session) public() Session {
 	return c
 }
 
-// settled reports whether session s ended its turn within turnSettle, while Claude Code's listing may still show it running.
-// The Stop hook outranks the listing, which lags it by a few seconds, as when the turn ended on a backgrounded command.
+// settled reports whether session s ended its turn while Claude Code's listing still shows it running.
+// The Stop hook outranks the listing until a hook of a new turn or a listing between turns, since the listing shows a turn that ended on a backgrounded command busy until the command finishes.
 func (s *Session) settled() bool {
-	return !s.Turn && s.stopAt.After(s.turnAt) && time.Since(s.stopAt) < turnSettle && !betweenTurns(s.Status) && s.Status != "" && s.Status != "starting"
+	return !s.Turn && s.stopAt.After(s.turnAt) && !betweenTurns(s.Status) && s.Status != "" && s.Status != "starting"
 }
 
 // sentPrompt is a prompt that From handed a session, known by its promptSum.
@@ -754,10 +757,14 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 		n.Socket = socket
 		d.saveLocked()
 	}
+	wasSettled := n.settled()
 	d.stirred = true
 	switch in.Event {
 	case "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "PostToolUseFailure":
 		d.turnLocked(n)
+	}
+	if wasSettled && !n.settled() {
+		d.broadcastSessionsLocked()
 	}
 	var dec *Decision
 	var worktree string
@@ -1130,6 +1137,7 @@ func (d *daemon) openLocked(dec *Decision) {
 	d.nextID++
 	dec.ID = strconv.Itoa(d.nextID)
 	dec.opened = time.Now()
+	dec.Asked = dec.opened.UTC().Format(time.RFC3339)
 	dec.answer = make(chan answer, 1)
 	d.decisions[dec.ID] = dec
 	d.saveLocked()
@@ -3304,6 +3312,9 @@ func (d *daemon) refresh(byID map[string]agent, listed time.Time) (masterMoved b
 			status = "stopped"
 		}
 		// A deliver that found the session in its turn or held put its reports back, and only this retries it.
+		if betweenTurns(status) {
+			n.stopAt = time.Time{}
+		}
 		if betweenTurns(status) && status != "exited" && len(n.Events) > 0 {
 			go d.deliver(n.Node)
 		}

@@ -472,3 +472,40 @@ func TestFollow(t *testing.T) {
 		t.Fatalf("follow of a session gone sent %+v", got)
 	}
 }
+
+// Claude Code's <task-notification> goes out as a task entry with its fields read, and its text whole.
+func TestConversationReadsTaskNotifications(t *testing.T) {
+	data, err := os.ReadFile("testdata/tasks.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := newConversation(nil)
+	for _, l := range bytes.Split(bytes.TrimSpace(data), []byte("\n")) {
+		c.add(l)
+	}
+	exit := func(n int) *int { return &n }
+	want := map[string]Said{
+		"u-done":  {Kind: "task", From: "claude", Task: "bcx0xj4v7", Call: "toolu_01SwBmyVY5JU4JasJoKjrMxh", OutputFile: "/tmp/claude-1000/-home-egor-Projects-bosun/26b1c4e0/tasks/bcx0xj4v7.output", Status: "completed", Summary: `Background command "Run the bosun daemon on haiku for the e2e test" completed (exit code 0)`, Exit: exit(0)},
+		"u-fail":  {Kind: "task", From: "claude", Task: "k7f2", Call: "toolu_02Failed", OutputFile: "/tmp/claude-1000/tasks/k7f2.output", Status: "failed", Summary: `Background command "make" failed (exit code 2)`, Exit: exit(2)},
+		"u-agent": {Kind: "task", From: "claude", Task: "ae2c8306d03d40f96", Status: "completed", Summary: `Agent "Review doc edits" finished`},
+	}
+	for id, w := range want {
+		i, ok := c.at[id]
+		if !ok {
+			t.Fatalf("no entry %s", id)
+		}
+		g := c.entries[i]
+		if !strings.HasPrefix(g.Text, "<task-notification>") || !strings.Contains(g.Text, "<task-id>"+w.Task+"</task-id>") {
+			t.Fatalf("%s lost its text: %q", id, g.Text)
+		}
+		g.ID, g.At, g.Text = "", time.Time{}, ""
+		gj, _ := json.Marshal(g)
+		wj, _ := json.Marshal(w)
+		if string(gj) != string(wj) {
+			t.Fatalf("%s is %s, want %s", id, gj, wj)
+		}
+	}
+	if e := c.entries[0]; e.Kind != "queued" {
+		t.Fatalf("the first entry is %+v", e)
+	}
+}

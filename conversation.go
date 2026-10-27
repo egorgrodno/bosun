@@ -13,12 +13,14 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // Said is an entry of a session's conversation, as the frontends get it. Kind picks the fields that apply:
 //   - prompt: From, Text and MidTurn
+//   - task: From, Text, Task, Call, OutputFile, Status, Summary and Exit, for Claude Code's <task-notification>
 //   - queued: Text and Taken
 //   - text, thinking: Text
 //   - tool: Call, Name, Input and, once it lands, Result
@@ -42,8 +44,14 @@ type Said struct {
 	Result *ToolResult     `json:"result,omitempty"`
 
 	Summary string `json:"summary,omitempty"`
-	Args    string `json:"args,omitempty"`
-	Output  string `json:"output,omitempty"`
+	// Task, OutputFile, Status and Exit read a <task-notification>. Exit is the exit code that a finished background command's summary names, and nil for any other task.
+	Task       string `json:"task,omitempty"`
+	OutputFile string `json:"outputFile,omitempty"`
+	Status     string `json:"status,omitempty"`
+	Exit       *int   `json:"exit,omitempty"`
+
+	Args   string `json:"args,omitempty"`
+	Output string `json:"output,omitempty"`
 
 	RecordType string          `json:"recordType,omitempty"`
 	Raw        json.RawMessage `json:"raw,omitempty"`
@@ -516,6 +524,41 @@ func (c *conversation) prompt(e *Said, o origin, text string) {
 		e.From = "bosun"
 	case o.Kind == "task-notification":
 		e.From = "claude"
+	}
+	taskNotification(e, text)
+}
+
+var (
+	taskField = regexp.MustCompile(`(?s)<(task-id|tool-use-id|output-file|status|summary)>(.*?)</(?:task-id|tool-use-id|output-file|status|summary)>`)
+	taskExit  = regexp.MustCompile(`\(exit code (-?\d+)\)\s*$`)
+)
+
+// taskNotification turns e into a task entry when text is Claude Code's <task-notification>, which reports a finished background command, a monitor or an agent. Text stays whole.
+func taskNotification(e *Said, text string) {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, "<task-notification>") || !strings.HasSuffix(text, "</task-notification>") {
+		return
+	}
+	e.Kind, e.From = "task", "claude"
+	for _, m := range taskField.FindAllStringSubmatch(text, -1) {
+		v := strings.TrimSpace(m[2])
+		switch m[1] {
+		case "task-id":
+			e.Task = v
+		case "tool-use-id":
+			e.Call = v
+		case "output-file":
+			e.OutputFile = v
+		case "status":
+			e.Status = v
+		case "summary":
+			e.Summary = v
+		}
+	}
+	if m := taskExit.FindStringSubmatch(e.Summary); m != nil {
+		if n, err := strconv.Atoi(m[1]); err == nil {
+			e.Exit = &n
+		}
 	}
 }
 

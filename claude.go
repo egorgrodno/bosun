@@ -150,8 +150,11 @@ func readTranscript(sid string, keep int) (transcript, error) {
 			if e.Name != "" {
 				begin(strings.TrimSpace(e.Name + " " + e.Args))
 			}
-		case "prompt":
+		case "prompt", "task":
 			text := e.Text
+			if e.Kind == "task" {
+				text = e.Status + ": " + e.Summary
+			}
 			if e.From != "user" && e.From != "bosun" {
 				text = "[from " + e.From + "] " + text
 			}
