@@ -46,6 +46,8 @@ The other workers are Claude Code sessions named after their nodes. SendMessage 
 
 Branches merge only by fast-forward. When yours builds on another worker's, rebase it onto worktree-<that node> once that worker says its branch is done, and say that yours merges after that one.
 
+Before you write a new component, function or helper, search the repository for one that does the job, and use or extend it instead of copying it. Your own review of your change checks for that reuse: the /simplify skill reviews a change for reuse.
+
 When the task is done, end your turn with a short summary of what you did and on which commits.`, node)
 }
 
