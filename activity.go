@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -24,8 +26,24 @@ const activityWidth = 200
 // activityKeys are the fields of a tool's input that hold its main argument, in the order tried.
 var activityKeys = []string{"command", "file_path", "notebook_path", "path", "url", "pattern", "query", "description", "name", "prompt"}
 
+// bosunToolArgs are the input fields that sum up a call of bosun's own MCP tools. A tool absent here, such as next_event, has no Arg.
+var bosunToolArgs = map[string]string{
+	"spawn": "name", "resume": "name", "merge": "name", "transcript": "name",
+	"reply": "id", "escalate": "id", "answer": "id",
+	"tell_desk": "text", "tell_master": "text", "notify": "message", "ask": "question",
+}
+
+// mcpPrefix starts the name of every tool of bosun's MCP server.
+const mcpPrefix = "mcp__bosun__"
+
 // activityOf reads the activity of a PreToolUse, which is empty when the call has no tool name.
 func activityOf(tool string, input json.RawMessage) Activity {
+	if name, ok := strings.CutPrefix(tool, mcpPrefix); ok {
+		return Activity{Tool: tool, Arg: bosunArg(name, input)}
+	}
+	if strings.HasPrefix(tool, "mcp__") {
+		return Activity{Tool: tool, Arg: firstString(input)}
+	}
 	fields := map[string]any{}
 	_ = json.Unmarshal(input, &fields)
 	a := Activity{Tool: tool}
@@ -36,6 +54,57 @@ func activityOf(tool string, input json.RawMessage) Activity {
 		}
 	}
 	return a
+}
+
+// bosunArg sums up a call of bosun's MCP tool name: decide as "147 allow", the others by the field in bosunToolArgs.
+func bosunArg(name string, input json.RawMessage) string {
+	var fields map[string]any
+	_ = json.Unmarshal(input, &fields)
+	scalar := func(k string) string {
+		switch v := fields[k].(type) {
+		case string:
+			return oneLine(v, activityWidth)
+		case float64:
+			return strconv.FormatFloat(v, 'f', -1, 64)
+		}
+		return ""
+	}
+	if name == "decide" {
+		verdict := "deny"
+		if allow, _ := fields["allow"].(bool); allow {
+			verdict = "allow"
+		}
+		if id := scalar("id"); id != "" {
+			return id + " " + verdict
+		}
+		return ""
+	}
+	if k := bosunToolArgs[name]; k != "" {
+		return scalar(k)
+	}
+	return ""
+}
+
+// firstString is the first top-level string field of a JSON object, in the order the object holds them.
+func firstString(input json.RawMessage) string {
+	dec := json.NewDecoder(bytes.NewReader(input))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return ""
+	}
+	for dec.More() {
+		if _, err := dec.Token(); err != nil {
+			return ""
+		}
+		var v json.RawMessage
+		if dec.Decode(&v) != nil {
+			return ""
+		}
+		var s string
+		if json.Unmarshal(v, &s) == nil && strings.TrimSpace(s) != "" {
+			return oneLine(s, activityWidth)
+		}
+	}
+	return ""
 }
 
 // oneLine collapses s to one line of at most width runes, cut with an ellipsis.

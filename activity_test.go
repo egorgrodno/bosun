@@ -36,6 +36,17 @@ func TestActivityOf(t *testing.T) {
 		{"Edit", `{"file_path":"/r/daemon.go","old_string":"a"}`, "/r/daemon.go"},
 		{"Bash", `{"command":"a\n  b"}`, "a b"},
 		{"Task", `{}`, ""},
+		{"mcp__bosun__decide", `{"id":"147","allow":true}`, "147 allow"},
+		{"mcp__bosun__decide", `{"id":147,"allow":false,"message":"no"}`, "147 deny"},
+		{"mcp__bosun__spawn", `{"name":"app-fix","repo":"/r","prompt":"do it"}`, "app-fix"},
+		{"mcp__bosun__resume", `{"name":"app-fix","prompt":"again"}`, "app-fix"},
+		{"mcp__bosun__merge", `{"name":"app-fix"}`, "app-fix"},
+		{"mcp__bosun__tell_desk", `{"text":"app-fix\nmerged"}`, "app-fix merged"},
+		{"mcp__bosun__notify", `{"message":"spawn failed"}`, "spawn failed"},
+		{"mcp__bosun__reply", `{"id":"9","answer":"yes"}`, "9"},
+		{"mcp__bosun__next_event", `{}`, ""},
+		{"mcp__other__search", `{"limit":3,"q":"cats","lang":"en"}`, "cats"},
+		{"mcp__other__search", `{}`, ""},
 		{"Bash", `{"command":"` + long + `"}`, strings.Repeat("x", activityWidth-1) + "…"},
 	} {
 		if got := activityOf(tc.tool, []byte(tc.input)); got.Tool != tc.tool || got.Arg != tc.arg {
