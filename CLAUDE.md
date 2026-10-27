@@ -108,11 +108,11 @@ The check holds the call until the answer and returns `allow` or `deny`. A `PreT
 - the pushes above, and a push outside the sandbox from a repository whose git setup does not match its record, or has none
 - a write through a file tool to a credential store, a shell startup file, Claude Code's configuration, git hooks or config, a systemd unit or autostart entry, or bosun's state directory
 - a Bash command outside the sandbox that names such a path or runs in a folder of the list
-- a Bash command outside the sandbox that runs as root, as through `sudo`, or activates a NixOS configuration other than through the allowlist
+- a Bash command outside the sandbox that runs as root, as through `sudo`, or activates a NixOS configuration other than through a rebuild on the allowlist
 
 `userList` in `reserved.go` holds the exact paths. In a worker's own worktree, only what its next start runs outside the sandbox counts, such as `.claude/settings.json`. The merge's review sees the rest.
 
-**The list cannot bind a command outside the sandbox.** Such a command can write anywhere. The check reads two things: the paths a command's words name, and whether a word runs as root. A path built at run time, as by a script or an unknown variable, escapes it. So the `decide` description tells the master to read the command whole, and to escalate anything it cannot follow or that touches the list.
+**The list cannot bind a command outside the sandbox.** Such a command can write anywhere. The check reads two things: the paths a command's words and redirections name, and whether a word runs as root. Some words name no path. A redirection's descriptor, as in `2>&1`, is one. A `/` or `..` that leads to the root is another when it is a piece of a longer word, such as jq's `//` or the end of sed's `s/x//`. jq's program is a third, since jq opens no file it names. A path built at run time, as by a script or an unknown variable, escapes it. So the `decide` description tells the master to read the command whole, and to escalate anything it cannot follow or that touches the list.
 
 **The allowlist lets a few commands outside the sandbox take the normal flow.** Each must be the whole command: plain words, with nothing chained, piped, substituted, redirected or assigned before it.
 
@@ -121,6 +121,8 @@ The check holds the call until the answer and returns `allow` or `deny`. A `PreT
 - a push that no reserved rule catches, from a repository whose git setup matches its record
 
 In the normal flow, auto mode decides a call outside the sandbox alone. The settings' `ask` rules send every `nixos-rebuild`, `nxt` and `nxc` to the master instead, inside the sandbox too. A push has no such rule, so auto mode decides it, and it reaches the master only when auto mode asks.
+
+A rebuild on the allowlist that shares its command with others, as in `nxt 2>&1 | tail -15`, is held for the master, unless another part of the command is on the user's list. A push that shares its command goes to the master as well when it runs outside the sandbox.
 
 **A push must run outside the sandbox.** Inside it, ssh refuses `~/.ssh/config`. That file is a home-manager link into the nix store, and the sandbox shows the store owned by nobody. Outside it, a push runs the repository's hooks and any command its config names, such as `core.sshCommand`. Its config also decides where the push goes. A worker's sandbox can write all of that in `.git`.
 

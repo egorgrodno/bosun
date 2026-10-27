@@ -139,6 +139,11 @@ func TestReservedCommand(t *testing.T) {
 
 		{"git push origin main && curl https://evil.example", none},
 		{"git push origin main && git push origin +main", force},
+		{"git push 2>&1 | tail -5", none},
+		{"git push > log", none},
+		{"git push origin main 2>/dev/null; echo ok", none},
+		{"git push -f 2>&1 | tail -5", force},
+		{"git push origin +main >&2", force},
 		{"FOO=1 git push origin main", none},
 		{"GIT_SSH_COMMAND=x git push --force", force},
 		{"sudo git push --delete origin x", deletes},
@@ -235,28 +240,41 @@ func TestReservedUnsandboxed(t *testing.T) {
 		{"nixos-rebuild test --flake /etc/nixos/sub", activates},
 		{"nixos-rebuild test --flake /etc/nixos#$(id)", activates},
 		{"nixos-rebuild test --flake $PWD", activates},
-		{"nixos-rebuild test --flake '/etc/nixos'", activates},
 		{"/run/current-system/sw/bin/nixos-rebuild test --flake /etc/nixos", activates},
 		{"./nxt", activates},
 		{"FOO=1 nxt", activates},
 		{"PATH=/tmp nixos-rebuild test --flake /etc/nixos", activates},
 		{"env nxt", activates},
-		{"nxt; rm -rf /tmp/x", activates},
+		{"bash -c 'nxt'", activates},
 		{"nxt && nxs", activates},
-		{"nxt | tee log", activates},
-		{"nxt > log", activates},
-		{"nxt 2>&1", activates},
-		{"nxt &", activates},
-		{"cd /etc/nixos && nxt", activates},
-		{"nxt # comment", activates},
-		{" nxt", activates},
-		{"nxt ", activates},
-		{"nxt\n", activates},
-		{"nxt\nrm -rf /tmp/x", activates},
-		{"nixos-rebuild  test --flake /etc/nixos", activates},
-		{"nixos-rebuild\ttest --flake /etc/nixos", activates},
+		{"nxs 2>&1 | tail -15", activates},
+		{"nixos-rebuild switch --flake /etc/nixos 2>&1 | tail -15", activates},
+		{"nixos-rebuild test --flake /etc/nixos 2>&1 | sudo tee log", sudo},
+		{"nxt > ~/.bashrc", user("names " + shellStartup)},
 		{"ssh host 'nixos-rebuild switch'", activates},
 		{"bash -c 'nixos-rebuild switch --flake /etc/nixos'", activates},
+
+		// A rebuild the allowlist takes alone goes to the master beside other commands, as they do on their own.
+		{"nixos-rebuild test --sudo --flake /etc/nixos 2>&1 | tail -15", unboxed},
+		{"nixos-rebuild test --sudo --flake /etc/nixos | tail -15", unboxed},
+		{"nixos-rebuild build --flake /etc/nixos 2>&1 | head -40", unboxed},
+		{"nixos-rebuild test --flake /etc/nixos#thinkpad &> log; echo ok", unboxed},
+		{"nixos-rebuild test --flake /etc/nixos 2>/dev/null && echo ok", unboxed},
+		{"nixos-rebuild test --flake '/etc/nixos'", unboxed},
+		{"nxt; rm -rf /tmp/x", unboxed},
+		{"nxt | tee log", unboxed},
+		{"nxt > log", unboxed},
+		{"nxt 2>&1", unboxed},
+		{"nxt >&2", unboxed},
+		{"nxt &", unboxed},
+		{"cd /etc/nixos && nxt", unboxed},
+		{"nxt # comment", unboxed},
+		{" nxt", unboxed},
+		{"nxt ", unboxed},
+		{"nxt\n", unboxed},
+		{"nxt\nrm -rf /tmp/x", unboxed},
+		{"nixos-rebuild  test --flake /etc/nixos", unboxed},
+		{"nixos-rebuild\ttest --flake /etc/nixos", unboxed},
 
 		// Running as root or as another user.
 		{"sudo nixos-rebuild test --flake /etc/nixos", sudo},
@@ -330,6 +348,25 @@ func TestReservedUnsandboxed(t *testing.T) {
 		{"cp a.nix /etc/nixos/modules/systemd/a.nix", unboxed},
 		{"cat .claude/skills/x/SKILL.md", unboxed},
 		{"rm -rf ~/*", unboxed},
+		{"git push origin main 2>&1 | tail -5", unboxed},
+
+		// A / or .. that a program or an expression holds names no place.
+		{`jq -r '.a // "b"'`, unboxed},
+		{`jq -r '.address // "none"'`, unboxed},
+		{`echo "$(jq -r '.a // "b"' x.json)"`, unboxed},
+		{"sh " + scratch + `/guard.sh && [ "$(hyprctl -j activewindow | jq -r '.address // "none"')" = none ] && ` + scratch + "/wtype y", unboxed},
+		{`journalctl --user -n 50 | sed -E 's/^.*quickshell\[[0-9]+\]://'`, unboxed},
+		{"sed 's/x//' f", unboxed},
+		{"sed -e 's|a||' f", unboxed},
+		{`sed -E "s/ +//g" f`, unboxed},
+		{`awk '{sub(/x/, "")}' f`, unboxed},
+		{`awk '{gsub(/ /, "")}' f`, unboxed},
+		{`awk -F/ '{print $1 / 2}' f`, unboxed},
+		{"jq '..|.a?' f", unboxed},
+		{"jq -r '..' f", unboxed},
+		{"jq -n --arg x y '.'", unboxed},
+		{"grep -rn 'a//b' .", unboxed},
+		{`python3 -c 'print(6 // 4)'`, unboxed},
 	} {
 		input, _ := json.Marshal(map[string]any{"command": tc.cmd, "dangerouslyDisableSandbox": true})
 		if got := g.reserved("Bash", input); got != tc.want {
@@ -413,6 +450,29 @@ func TestReservedUnsandboxedPaths(t *testing.T) {
 		{"cd && tar xf /tmp/x.tar", "runs in a folder that holds " + claudeConfig},
 		{"ls /", holder + claudeConfig},
 		{"cd / && ls", holder + claudeConfig},
+		{"rm -rf /", holder + claudeConfig},
+		{"rm -rf //", holder + claudeConfig},
+		{`rm -rf "/"`, holder + claudeConfig},
+		{"rm -rf / 2>&1 | tail", holder + claudeConfig},
+		{"chmod -R 777 /", holder + claudeConfig},
+		{"find / -delete", holder + claudeConfig},
+		{"cp x /", holder + claudeConfig},
+		{"echo x > /", holder + claudeConfig},
+		{"bash -c 'rm -rf /'", holder + claudeConfig},
+		{"rm -rf ..", holder + claudeConfig},
+		{"rm -rf {/,/tmp/x}", holder + claudeConfig},
+		{"rm -rf $HOME/../..", holder + claudeConfig},
+		// A program's paths count where the program may open them, and jq's input files do.
+		{`awk '{print > "/home/u/.bashrc"}' f`, names + shellStartup},
+		{`sed -n 'w /home/u/.bashrc' f`, names + shellStartup},
+		{`jq -r '.a // "b"' ~/.ssh/config`, names + credentials},
+		{`jq --slurpfile k ~/.ssh/k '.' f`, names + credentials},
+		{`jq -f ~/.ssh/k f`, names + credentials},
+		{"echo x 2>&1 >> ~/.bashrc", names + shellStartup},
+		{"echo x &>> ~/.bashrc", names + shellStartup},
+		{"echo x >| ~/.bashrc", names + shellStartup},
+		{"cat <~/.ssh/id_ed25519", names + credentials},
+		{"echo x >&~/.bashrc", names + shellStartup},
 		{"git push origin ~:main", holder + claudeConfig},
 	} {
 		input, _ := json.Marshal(map[string]any{"command": tc.cmd, "dangerouslyDisableSandbox": true})
@@ -591,6 +651,33 @@ func TestReservedWriteThroughSymlink(t *testing.T) {
 	input, _ := json.Marshal(map[string]string{"file_path": filepath.Join(via, "x.go")})
 	if got := g.reserved("Write", input); got != none {
 		t.Errorf("Write in a worktree behind a link: reserved = %+v", got)
+	}
+}
+
+// A redirection names a file or a descriptor, and adds no argument.
+func TestSimpleCommandsRedirections(t *testing.T) {
+	for _, tc := range []struct {
+		script string
+		want   []simple
+	}{
+		{"nxt 2>&1 | tail -15", []simple{{argv: []string{"nxt"}}, {argv: []string{"tail", "-15"}}}},
+		{"a >&2", []simple{{argv: []string{"a"}}}},
+		{"a 2>&-", []simple{{argv: []string{"a"}}}},
+		{"a > log 2>/dev/null", []simple{{argv: []string{"a"}, files: []string{"log", "/dev/null"}}}},
+		{"a &>> log b", []simple{{argv: []string{"a", "b"}, files: []string{"log"}}}},
+		{"a >|log", []simple{{argv: []string{"a"}, files: []string{"log"}}}},
+		{"a >&log", []simple{{argv: []string{"a"}, files: []string{"log"}}}},
+		{"a <<<'x y'", []simple{{argv: []string{"a"}, files: []string{"x y"}}}},
+		{"a2>x", []simple{{argv: []string{"a2"}, files: []string{"x"}}}},
+		{"> x", []simple{{files: []string{"x"}}}},
+		{"a & b", []simple{{argv: []string{"a"}}, {argv: []string{"b"}}}},
+		{"diff <(sudo x) y", []simple{{argv: []string{"diff"}}, {argv: []string{"sudo", "x"}}, {argv: []string{"y"}}}},
+	} {
+		if got := simpleCommands(tc.script); !slices.EqualFunc(got, tc.want, func(a, b simple) bool {
+			return slices.Equal(a.argv, b.argv) && slices.Equal(a.files, b.files)
+		}) {
+			t.Errorf("simpleCommands(%q) = %q, want %q", tc.script, got, tc.want)
+		}
 	}
 }
 

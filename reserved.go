@@ -166,7 +166,11 @@ func within(dirs []string, path string) bool {
 // command checks a script that may run in each of dirs. Each cd adds where it leads, or "" when bosun cannot tell.
 func (g gate) command(script string, dirs []string) reservation {
 	var r reservation
-	for _, argv := range simpleCommands(script) {
+	for _, cmd := range simpleCommands(script) {
+		argv := cmd.argv
+		if len(argv) == 0 {
+			continue
+		}
 		if r = r.or(g.argv(argv, dirs)); r.user {
 			return r
 		}
@@ -387,18 +391,30 @@ func (g gate) outside(script string) reservation {
 // userUnboxed names what in script, run outside the sandbox in dir, only the user may allow, or returns "". dir is "" when bosun cannot tell where a command runs.
 // A command there can write anywhere, so this catches only what a word names: a path on the user's list, wherever in the word, or a command that runs as root.
 func (g gate) userUnboxed(script, dir string) string {
-	for _, argv := range simpleCommands(script) {
-		var words []string
-		for _, w := range argv {
-			words = append(words, g.list.words(w, dir)...)
+	for _, cmd := range simpleCommands(script) {
+		argv := cmd.argv
+		var words, paths []string
+		for i, w := range argv {
+			ws := g.list.words(w, dir)
+			words = append(words, ws...)
+			if i != jqProgram(argv) {
+				paths = append(paths, ws...)
+			}
 		}
-		if r := asRoot(words); r != "" {
+		for _, w := range cmd.files {
+			paths = append(paths, g.list.words(w, dir)...)
+		}
+		// A rebuild the allowlist takes stays the master's beside other commands, which this checks apart.
+		if r := asRoot(words); r != "" && !rebuild(argv) {
 			return r
 		}
-		for _, w := range words {
+		for _, w := range paths {
 			if what := g.names(w, dir); what != "" {
 				return "a command outside the sandbox that names " + what
 			}
+		}
+		if len(argv) == 0 {
+			continue
 		}
 		for i := range argv {
 			if s, ok := inner(argv, i); ok {
@@ -435,6 +451,33 @@ func (g gate) names(word, dir string) string {
 		return ""
 	}
 	return g.list.holds(path, within(g.writable[:1], path))
+}
+
+// jqProgram is the index of jq's program in argv, or -1. jq opens no file its program names.
+func jqProgram(argv []string) int {
+	if len(argv) == 0 || filepath.Base(argv[0]) != "jq" {
+		return -1
+	}
+	for i := 1; i < len(argv); i++ {
+		switch a := argv[i]; {
+		case a == "--":
+			if i+1 < len(argv) {
+				return i + 1
+			}
+			return -1
+		case a == "--from-file", len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.ContainsRune(a, 'f'):
+			// The program comes from a file, and every other argument is an input file.
+			return -1
+		case a == "--arg", a == "--argjson", a == "--slurpfile", a == "--rawfile":
+			i += 2
+		case a == "--indent", a == "-L":
+			i++
+		case len(a) > 1 && a[0] == '-':
+		default:
+			return i
+		}
+	}
+	return -1
 }
 
 // rootCommands run what follows them as root or as another user.
@@ -598,6 +641,10 @@ func (l userList) words(word, dir string) []string {
 	var out []string
 	for _, e := range braces(strings.ReplaceAll(word, `\`, ""), 256) {
 		for _, w := range strings.FieldsFunc(e, func(r rune) bool { return unicode.IsSpace(r) || strings.ContainsRune("'\"`=:,;|&<>(){}!", r) }) {
+			// A piece of a longer word that leads to the root, such as jq's // or the end of sed's s/x//, is an operator rather than a place.
+			if w != e && (filepath.IsAbs(w) && filepath.Clean(w) == "/" || !filepath.IsAbs(w) && dir != "" && filepath.Join(dir, w) == "/") {
+				continue
+			}
 			switch {
 			case w == "~" || strings.HasPrefix(w, "~/"):
 				w = l.home + w[1:]
@@ -706,27 +753,37 @@ func rebuild(argv []string) bool {
 // ownFlake matches /etc/nixos or a worker's worktree of it, with a host attribute or without.
 var ownFlake = regexp.MustCompile(`^/etc/nixos(/\.claude/worktrees/[a-z0-9][a-z0-9-]*)?/?(#[A-Za-z0-9_-]+)?$`)
 
-// simpleCommands splits a shell script into the argument lists of its simple commands, closely enough to find a git call. It honours quotes and comments, splits at operators, parentheses and backticks, and adds the commands substituted inside double quotes.
-func simpleCommands(script string) [][]string {
+// simple is a simple command: its arguments, and the words its redirections name.
+type simple struct{ argv, files []string }
+
+// simpleCommands splits a shell script into its simple commands, closely enough to find a git call. It honours quotes and comments, splits at operators, parentheses and backticks, and adds the commands substituted inside double quotes.
+func simpleCommands(script string) []simple {
 	var (
-		cmds   [][]string
-		argv   []string
+		cmds   []simple
+		cmd    simple
 		word   strings.Builder
 		inWord bool
+		// file marks the next word as what a redirection names.
+		file bool
 	)
 	endWord := func() {
 		if inWord {
-			argv = append(argv, word.String())
+			if file {
+				cmd.files = append(cmd.files, word.String())
+			} else {
+				cmd.argv = append(cmd.argv, word.String())
+			}
 			word.Reset()
-			inWord = false
+			inWord, file = false, false
 		}
 	}
 	endCmd := func() {
 		endWord()
-		if len(argv) > 0 {
-			cmds = append(cmds, argv)
-			argv = nil
+		if len(cmd.argv) > 0 || len(cmd.files) > 0 {
+			cmds = append(cmds, cmd)
+			cmd = simple{}
 		}
+		file = false
 	}
 	for i := 0; i < len(script); i++ {
 		c := script[i]
@@ -772,7 +829,15 @@ func simpleCommands(script string) [][]string {
 				i++
 			}
 			endCmd()
-		case c == ' ' || c == '\t' || c == '<' || c == '>':
+		case c == '<' || c == '>' || c == '&' && strings.HasPrefix(script[i+1:], ">"):
+			// The descriptor number before a redirection, as in 2>&1, is no argument.
+			if s := word.String(); inWord && s != "" && strings.Trim(s, "0123456789") == "" {
+				word.Reset()
+				inWord = false
+			}
+			endWord()
+			i, file = redirection(script, i)
+		case c == ' ' || c == '\t':
 			endWord()
 		case strings.IndexByte(";&|\n()`", c) >= 0:
 			endCmd()
@@ -783,6 +848,34 @@ func simpleCommands(script string) [][]string {
 	}
 	endCmd()
 	return cmds
+}
+
+// redirection reads the redirection operator at script[i]. It returns the index of the operator's last byte, and whether a word naming a file follows, which a descriptor that >&2 duplicates or >&- closes is not.
+func redirection(script string, i int) (int, bool) {
+	j := i + 1
+	if script[i] == '&' {
+		j++
+	}
+	for j < len(script) && (script[j] == '<' || script[j] == '>') {
+		j++
+	}
+	switch {
+	case j < len(script) && (script[j] == '|' || script[j] == '-'):
+		j++
+	case j < len(script) && script[j] == '&':
+		k := j + 1
+		for k < len(script) && script[k] >= '0' && script[k] <= '9' {
+			k++
+		}
+		if k < len(script) && script[k] == '-' {
+			k++
+		}
+		if k > j+1 && (k == len(script) || strings.IndexByte(" \t\n;&|()<>", script[k]) >= 0) {
+			return k - 1, false
+		}
+		j++
+	}
+	return j - 1, true
 }
 
 func closingParen(s string, i int) int {
