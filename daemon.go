@@ -451,7 +451,16 @@ func (d *daemon) sortedLocked() []*Session {
 func (s *Session) public() Session {
 	c := *s
 	c.pre, c.Events, c.Taken, c.Prompts = nil, nil, nil, nil
+	if s.settled() {
+		c.Status, c.State = "idle", ""
+	}
 	return c
+}
+
+// settled reports whether session s ended its turn within turnSettle, while Claude Code's listing may still show it running.
+// The Stop hook outranks the listing, which lags it by a few seconds, as when the turn ended on a backgrounded command.
+func (s *Session) settled() bool {
+	return !s.Turn && s.stopAt.After(s.turnAt) && time.Since(s.stopAt) < turnSettle && !betweenTurns(s.Status) && s.Status != "" && s.Status != "starting"
 }
 
 // sentPrompt is a prompt that From handed a session, known by its promptSum.
@@ -839,6 +848,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 		delete(n.pre, in.ToolUseID)
 		d.withdrawLocked(node, func(dec *Decision) bool { return dec.toolUseID == in.ToolUseID }, outcome{by: "session", behavior: "allow", cause: node + " moved past the call"})
 	case "StopFailure":
+		n.stopAt = time.Now()
 		// The turn ended on an API error, and Stop does not run.
 		n.pre = nil
 		d.withdrawLocked(node, func(*Decision) bool { return true }, outcome{by: "bosun", cause: node + "'s turn failed on an API error"})
@@ -871,6 +881,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 			d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("The master's turn failed on an API error, %s: %s. The next event resumes it.", in.Error, in.LastMessage)})
 		}
 	case "Stop":
+		n.stopAt = time.Now()
 		n.pre = nil
 		n.LimitedUntil = nil
 		if text := oneLine(in.LastMessage, activityWidth); text != "" {
@@ -914,6 +925,9 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 			d.asleep = true
 			d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("The master ended its turn twice in a row while events waited, so it has not read them. claude attach %s shows why, and the next event resumes it.", n.ID)})
 		}
+	}
+	if (in.Event == "Stop" || in.Event == "StopFailure") && n.settled() {
+		d.broadcastSessionsLocked()
 	}
 	if dec != nil {
 		dec = d.adoptLocked(dec)

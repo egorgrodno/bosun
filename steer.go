@@ -102,6 +102,10 @@ func (d *daemon) say(ctx context.Context, caller, name, text string) (string, er
 		return "", err
 	}
 	command := strings.HasPrefix(strings.TrimSpace(text), "/")
+	// The Stop hook outranks the listing, which still shows a session busy for a moment after a turn that ended on a backgrounded call.
+	d.mu.Lock()
+	idle := a.Status == "idle" || n.settled()
+	d.mu.Unlock()
 	if a.Status == "" {
 		err := d.resumeWith(ctx, n, id, dir, text)
 		d.mu.Lock()
@@ -124,7 +128,7 @@ func (d *daemon) say(ctx context.Context, caller, name, text string) (string, er
 		err = c.reply(id, text)
 		d.mu.Lock()
 		d.logUseLocked(Entry{Kind: "say", Node: name, Text: text, Via: "supervisor"}, err)
-		if err == nil && name == masterNode && a.Status != "idle" {
+		if err == nil && name == masterNode && !idle {
 			d.saidMaster = true
 			close(d.wake)
 			d.wake = make(chan struct{})
@@ -132,9 +136,9 @@ func (d *daemon) say(ctx context.Context, caller, name, text string) (string, er
 		d.mu.Unlock()
 	}
 	switch {
-	case err == nil && a.Status == "idle" && command:
+	case err == nil && idle && command:
 		return fmt.Sprintf("%s runs it.", name), nil
-	case err == nil && a.Status == "idle":
+	case err == nil && idle:
 		return fmt.Sprintf("%s takes it as a new turn.", name), nil
 	case err == nil && needs != "":
 		return fmt.Sprintf("%s takes it as its answer if it names an option of: %s", name, needs), nil
@@ -146,7 +150,7 @@ func (d *daemon) say(ctx context.Context, caller, name, text string) (string, er
 		return "", err
 	}
 	log.Printf("say to %s: %v, so bosun stops and resumes it", name, err)
-	inTurn, why := a.Status != "idle", err
+	inTurn, why := !idle, err
 	err = d.resumeWith(ctx, n, id, dir, text)
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -174,12 +178,15 @@ func (d *daemon) interrupt(ctx context.Context, caller, name string) (string, er
 		return "", err
 	}
 	_, a, err := d.listed(id)
+	d.mu.Lock()
+	settled := n.settled()
+	d.mu.Unlock()
 	switch {
 	case err != nil:
 		return "", err
 	case a.Status == "":
 		return "", fmt.Errorf("%s has stopped, so it runs no turn", name)
-	case a.Status == "idle":
+	case a.Status == "idle" || settled:
 		return "", fmt.Errorf("%s is not in its turn", name)
 	}
 	// Held, the session is off the poll, which would report the turn's end too.

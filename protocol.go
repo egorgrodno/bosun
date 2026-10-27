@@ -208,6 +208,8 @@ type Session struct {
 	pre map[string]preCall
 	// turnAt is when a hook of the session's turn last ran.
 	turnAt time.Time
+	// stopAt is when a Stop or StopFailure of the session last ran.
+	stopAt time.Time
 	// held keeps poll, resume, merge and kill off the session while one of them stops or resumes it.
 	held bool
 	// refused is the reason auto mode gave for refusing the session's last call, until a call runs.
