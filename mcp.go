@@ -61,10 +61,7 @@ Turning it off returns the list of what was parked, the one whose approval unblo
 
 	grantHelp = `Give a standing grant when the user asks ahead of time that bosun settle a class of the master's calls without them, such as "push whatever you merge tonight". Call it on their word alone, quoting it exactly from their latest message. A grant acts only while away mode is on, and ends at until or when revoked. bosun status lists the grants.
 
-The classes, each one the master's own permission, which would otherwise wait on the user:
-- push: the master's push to a remote of the repository, as one whole command with nothing chained or piped, from a repository whose git setup is as bosun recorded it. A force push, deleting a ref and a push to a URL stay with the user.
-- rebuild: the master's nixos-rebuild test or build of /etc/nixos itself, or nxt or nxc, as one whole command.
-No grant covers anything else, such as a worker's call, a reserved action on the user's list or a question. Tell the user so when they ask for more.`
+No grant covers anything but its class, such as a worker's call, a reserved action on the user's list or a question. Tell the user so when they ask for more. The classes:`
 
 	revokeHelp = "End a standing grant when the user asks, quoting their words exactly from their latest message."
 
@@ -98,7 +95,6 @@ Once you have merged every worker and an hour has passed since your last turn, b
 When the user leaves the fleet to work without them, as overnight, they turn on the away mode, and each batch next_event returns begins with a line that says so. Until a batch comes without that line:
 - escalate and notify reach nobody. bosun parks what they get on a list for the user's return, and denies a parked permission or answers a parked question with a note that it waits for the user. Escalate what needs the user as you would, then move on: the user gets the list once they are back.
 - Your own permissions and the reserved actions on the user's list park the same way, such as a push of yours. Do not try them again, nor another way to the same end.
-- The away line may name standing grants of the user's, such as one for your pushes. bosun allows a call of yours that a grant covers, run exactly as the line describes it.
 - Carry on with everything else. Decide and reply as you would. Merge on into the local checkout rather than wait on a push, and start the next piece of work on what merged. A worker whose call was parked carries on with the rest of its task, and its turn_end says what waits.
 - Answer tells with tell_desk as you would: the desk keeps your answers for the user, and without a desk they park.
 
@@ -183,7 +179,7 @@ func roleTools(node string) []tool {
 				"on":    map[string]any{"type": "boolean", "description": "true when the user leaves, false when they are back."},
 				"words": str("The user's words that say so, quoted exactly from their latest message."),
 			})},
-			{"grant", grantHelp, object([]string{"class", "until", "words"}, map[string]any{
+			{"grant", grantHelp + classList(), object([]string{"class", "until", "words"}, map[string]any{
 				"class": str("push or rebuild."),
 				"until": str("When it ends, at most a day away: a time of day such as 09:00, which means its next coming, or a duration such as 8h."),
 				"words": str("The user's words that ask for it, quoted exactly from their latest message."),

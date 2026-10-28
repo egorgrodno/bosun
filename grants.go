@@ -18,7 +18,7 @@ type grantClass struct {
 
 // grantClasses are the only classes a grant names. Each covers a permission of the master's own, which waits on the user since nobody sits above the master.
 var grantClasses = []grantClass{
-	{"push", "the master's push to a remote of the repository, as one whole command: git -C <repo> push [<remote> [<refspec>...]], with no option but -u, --set-upstream, --follow-tags, -q, -v or --porcelain, from a repository whose git setup is as bosun recorded it"},
+	{"push", "the master's push to a remote of the repository, as one whole command: git -C <repo> push [<remote> [<refspec>...]], with no option but -C and " + strings.Join(grantPushFlags, ", ") + ", from a repository whose git setup is as bosun recorded it"},
 	{"rebuild", "the master's nixos-rebuild test or build with --flake on /etc/nixos itself, or nxt or nxc, as one whole command"},
 }
 
@@ -83,6 +83,15 @@ func classWhat(name string) string {
 		return grantClasses[i].what
 	}
 	return ""
+}
+
+// classList lists each class with what it covers, one to a line.
+func classList() string {
+	var b strings.Builder
+	for _, c := range grantClasses {
+		fmt.Fprintf(&b, "\n- %s: %s", c.name, c.what)
+	}
+	return b.String()
 }
 
 func classNames() string {
