@@ -57,18 +57,21 @@ func parkedAnswer(dec *Decision) answer {
 
 // reachesUser says why dec waits on the user rather than the master, completing "parked because …".
 func reachesUser(dec *Decision) string {
-	switch {
-	case dec.Kind == "notice" && dec.from == masterNode:
-		return "it is a notice from the master"
-	case dec.Kind == "notice":
+	switch routeOf(dec) {
+	case routeNotice, routePrompt:
+		if dec.from == masterNode {
+			return "it is a notice from the master"
+		}
 		return "it is a notice from bosun"
-	case dec.UserOnly:
+	case routeUserOnly:
 		return "it is " + dec.Reserved + ", which is on your list"
-	case dec.Node == masterNode:
-		return "it is the master's own permission"
-	case dec.Node == deskNode:
+	case routeRequester:
+		if dec.Node == masterNode {
+			return "it is the master's own permission"
+		}
 		return "it is the desk's own permission"
-	case dec.Note != "":
+	}
+	if dec.Note != "" {
 		return "the master escalated it: " + dec.Note
 	}
 	return "the master escalated it"
