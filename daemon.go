@@ -118,6 +118,8 @@ type daemon struct {
 	// logged holds the fleet's latest log entries, and logSeq the Seq of the last.
 	logged []Entry
 	logSeq int
+	// logLines counts the lines of log.jsonl.
+	logLines int
 	// said is the user's latest message to the desk, typed into it or told through bosun, and saidBefore when the one before it came.
 	said       userMessage
 	saidBefore time.Time
@@ -207,6 +209,8 @@ type savedDecision struct {
 	ToolUseID string    `json:"toolUseId,omitempty"`
 	Key       string    `json:"key,omitempty"`
 	Opened    time.Time `json:"opened"`
+	Rule      string    `json:"rule,omitempty"`
+	Match     string    `json:"match,omitempty"`
 }
 
 func newDaemon(exe, socket, stateDir, masterDir string, claude claudeCLI) *daemon {
@@ -409,7 +413,7 @@ func (d *daemon) load() error {
 	d.away, d.parked = st.Away, st.Parked
 	for _, sd := range st.Decisions {
 		dec := sd.Decision
-		dec.toolUseID, dec.key, dec.opened = sd.ToolUseID, sd.Key, sd.Opened
+		dec.toolUseID, dec.key, dec.opened, dec.rule, dec.match = sd.ToolUseID, sd.Key, sd.Opened, sd.Rule, sd.Match
 		if dec.Asked == "" {
 			dec.Asked = sd.Opened.UTC().Format(time.RFC3339)
 		}
@@ -438,7 +442,7 @@ func (d *daemon) saveLocked() {
 	}
 	for _, dec := range d.snapshotLocked().Decisions {
 		o := d.decisions[dec.ID]
-		st.Decisions = append(st.Decisions, savedDecision{Decision: dec, ToolUseID: o.toolUseID, Key: o.key, Opened: o.opened})
+		st.Decisions = append(st.Decisions, savedDecision{Decision: dec, ToolUseID: o.toolUseID, Key: o.key, Opened: o.opened, Rule: o.rule, Match: o.match})
 	}
 	data, _ := json.MarshalIndent(st, "", "  ")
 	if err := writeDurably(filepath.Join(d.stateDir, "state.json"), data); err != nil {
@@ -874,7 +878,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 			if reserved.user || !isWorker(node) {
 				holder = "user"
 			}
-			dec = &Decision{Kind: "permission", Node: node, Holder: holder, Reserved: reserved.reason, UserOnly: reserved.user, Tool: in.ToolName, Input: in.ToolInput, Refused: n.refused, toolUseID: in.ToolUseID, key: key}
+			dec = &Decision{Kind: "permission", Node: node, Holder: holder, Reserved: reserved.reason, UserOnly: reserved.user, Tool: in.ToolName, Input: in.ToolInput, Refused: n.refused, toolUseID: in.ToolUseID, rule: reserved.rule, match: reserved.match, key: key}
 		}
 		if in.ToolName != "SendMessage" {
 			break
@@ -1256,6 +1260,7 @@ func (d *daemon) openLocked(dec *Decision) (parked bool) {
 		if e.From != "" {
 			e.By = role(e.From)
 		}
+		e.why(dec)
 		d.logLocked(e)
 	}
 	log.Printf("decision %s: %s from %s, for the %s", dec.ID, dec.Kind, dec.Node, dec.Holder)
@@ -1530,7 +1535,9 @@ func (d *daemon) escalate(caller, id, note string) (string, error) {
 	}
 	dec.Holder, dec.Note = "user", note
 	c := *dec
-	d.logLocked(Entry{Kind: "escalated", By: masterNode, From: masterNode, Node: dec.Node, Decision: &c, Text: note})
+	e := Entry{Kind: "escalated", By: masterNode, From: masterNode, Node: dec.Node, Decision: &c, Text: note}
+	e.why(dec)
+	d.logLocked(e)
 	log.Printf("decision %s: escalated", id)
 	if d.parkLocked(dec) {
 		return fmt.Sprintf("The user is away, so bosun parked decision %s for their return, and told %s so. Carry on.", id, dec.Node), nil

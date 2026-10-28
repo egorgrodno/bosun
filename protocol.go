@@ -131,8 +131,13 @@ type Entry struct {
 	Repo   string `json:"repo,omitempty"`
 	Model  string `json:"model,omitempty"`
 	Effort string `json:"effort,omitempty"`
-	// Route is how a decision reached its holder: master, escalated, requester, userOnly, prompt or notice. A decision reached the user when Route is neither empty nor master.
+	// Rule is the id of the reserved rule that caught a decision, and Match the word or path it matched.
+	Rule  string `json:"rule,omitempty"`
+	Match string `json:"match,omitempty"`
+	// Route is how a decision reached its holder, as routeOf says: master, escalated, requester, userOnly, prompt or notice. A decision reached the user when Route is neither empty nor master.
 	Route string `json:"route,omitempty"`
+	// Waited is how many seconds a settled decision waited.
+	Waited float64 `json:"waited,omitempty"`
 }
 
 // Away is the user's away mode, on since Since. By is user or desk, and Words the user's words that turned it on, if any.
@@ -184,6 +189,8 @@ type Decision struct {
 	// stalled marks a decision whose long wait on the user the master has heard of.
 	stalled   bool
 	toolUseID string
+	// rule and match are the reserved rule that caught the call and what it matched, for the log.
+	rule, match string
 	// key is the Key of the request that waits on the decision.
 	key    string
 	opened time.Time

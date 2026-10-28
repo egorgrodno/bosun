@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +53,44 @@ func TestLogSettledByMasterAndUser(t *testing.T) {
 	}
 	if !(esc[0].Seq < settled[1].Seq) || settled[1].At.IsZero() {
 		t.Fatalf("entries out of order: %+v then %+v", esc[0], settled[1])
+	}
+	if settled[0].Route != routeMaster || esc[0].Route != routeEscalated || settled[1].Route != routeEscalated || settled[1].Rule != "" {
+		t.Fatalf("routes %q, %q and %q, rule %q", settled[0].Route, esc[0].Route, settled[1].Route, settled[1].Rule)
+	}
+}
+
+// Each decision that reaches the user logs the rule that sent it there, what the rule matched, its route and its wait, and a restart keeps the rule.
+func TestLogRoutes(t *testing.T) {
+	d, _ := testDesk(t)
+	hook := runHookAsync("a", hookEvent("PreToolUse", "t1", "Bash", map[string]any{"command": "git push --force origin HEAD"}))
+	dec := openDecision(t, 1)
+	opened := logOf(d, "decision")
+	if len(opened) != 1 || opened[0].Rule != rulePushForce || opened[0].Match != "--force" || opened[0].Route != routeUserOnly {
+		t.Fatalf("decision entries %+v", opened)
+	}
+	d.mu.Lock()
+	d.saveLocked()
+	d.mu.Unlock()
+	restarted := newDaemon("/bin/bosun", "", d.stateDir, d.masterDir, &fakeClaude{})
+	if err := restarted.load(); err != nil {
+		t.Fatal(err)
+	}
+	if r := restarted.decisions[dec.ID]; r == nil || r.rule != rulePushForce || r.match != "--force" {
+		t.Fatalf("the restart restored %+v", r)
+	}
+	mustCall(t, Request{Op: "deny", ID: dec.ID})
+	receive(t, hook)
+	settled := logOf(d, "settled")
+	if len(settled) != 1 || settled[0].Rule != rulePushForce || settled[0].Route != routeUserOnly || settled[0].By != "user" || settled[0].Waited < 0 {
+		t.Fatalf("settled entries %+v", settled)
+	}
+
+	hook = runHookAsync(deskNode, hookEvent("PreToolUse", "t2", "Write", map[string]any{"file_path": "/tmp/x", "content": "x"}))
+	dec = openDecision(t, 1)
+	mustCall(t, Request{Op: "deny", ID: dec.ID})
+	receive(t, hook)
+	if e := logOf(d, "settled")[1]; e.Rule != ruleWriteOut || e.Match != "/tmp/x" || e.Route != routeRequester {
+		t.Fatalf("the desk's own write settled as %+v", e)
 	}
 }
 
@@ -152,12 +191,14 @@ func TestLogPauseAndUnpause(t *testing.T) {
 	}
 }
 
-// The log outlasts a restart, and its file keeps only the latest entries once it holds twice as many.
+// The log outlasts a restart, moves to log.1.jsonl once it holds logRotate entries, and keeps Seq rising across both.
 func TestLogOutlastsRestart(t *testing.T) {
+	defer func(n int) { logRotate = n }(logRotate)
+	logRotate = 2 * keptLog
 	dir := t.TempDir()
 	d := newDaemon("/bin/bosun", "", dir, dir, &fakeClaude{})
 	d.mu.Lock()
-	for i := range 2*keptLog - 1 {
+	for i := range 2*keptLog - 2 {
 		d.logLocked(Entry{Kind: "message", By: "worker", From: "b", Node: "a", Text: strings.Repeat("x", i%3)})
 	}
 	d.mu.Unlock()
@@ -166,29 +207,53 @@ func TestLogOutlastsRestart(t *testing.T) {
 	_, _ = f.WriteString(`{"seq":`)
 	f.Close()
 
-	d = newDaemon("/bin/bosun", "", dir, dir, &fakeClaude{})
-	if err := d.load(); err != nil {
-		t.Fatal(err)
+	load := func() *daemon {
+		t.Helper()
+		d := newDaemon("/bin/bosun", "", dir, dir, &fakeClaude{})
+		if err := d.load(); err != nil {
+			t.Fatal(err)
+		}
+		return d
 	}
-	if len(d.logged) != keptLog || d.logSeq != 2*keptLog-1 || d.logged[keptLog-1].Seq != 2*keptLog-1 {
+	lines := func(path string) int {
+		data, _ := os.ReadFile(path)
+		return bytes.Count(data, []byte("\n"))
+	}
+	d = load()
+	if len(d.logged) != keptLog || d.logSeq != 2*keptLog-2 || d.logged[keptLog-1].Seq != 2*keptLog-2 {
 		t.Fatalf("loaded %d entries up to %d", len(d.logged), d.logSeq)
 	}
-	data, _ := os.ReadFile(d.logPath())
-	// The cut line ends, and the file keeps it until it holds twice the entries the daemon keeps.
-	if n := bytes.Count(data, []byte("\n")); n != 2*keptLog {
+	// The cut line ends, and stays until the file moves.
+	if n := lines(d.logPath()); n != 2*keptLog-1 {
 		t.Fatalf("log.jsonl holds %d lines", n)
 	}
+
 	d.mu.Lock()
 	d.logLocked(Entry{Kind: "paused", By: "user"})
 	d.mu.Unlock()
+	if n, old := lines(d.logPath()), lines(oldLogPath(dir)); n != keptLog || old != 2*keptLog {
+		t.Fatalf("after the rotation log.jsonl holds %d lines and log.1.jsonl %d", n, old)
+	}
 
-	d = newDaemon("/bin/bosun", "", dir, dir, &fakeClaude{})
-	if err := d.load(); err != nil {
+	d = load()
+	if d.logged[keptLog-1].Kind != "paused" || d.logSeq != 2*keptLog-1 {
+		t.Fatalf("after the rotation loaded up to %d, the last %+v", d.logSeq, d.logged[keptLog-1])
+	}
+	d.mu.Lock()
+	d.logLocked(Entry{Kind: "unpaused", By: "user"})
+	d.mu.Unlock()
+	var seqs []int
+	if err := readLogs(dir, func(e Entry) { seqs = append(seqs, e.Seq) }); err != nil {
 		t.Fatal(err)
 	}
-	data, _ = os.ReadFile(d.logPath())
-	if n := bytes.Count(data, []byte("\n")); n != keptLog || d.logged[keptLog-1].Kind != "paused" || d.logSeq != 2*keptLog {
-		t.Fatalf("log.jsonl holds %d lines after the trim, the last %+v", n, d.logged[keptLog-1])
+	if len(seqs) != 2*keptLog || seqs[0] != 1 || !slices.IsSorted(seqs) || seqs[len(seqs)-1] != 2*keptLog {
+		t.Fatalf("readLogs read %d entries, %v to %v", len(seqs), seqs[0], seqs[len(seqs)-1])
+	}
+
+	// A crash between a rotation's two steps leaves log.1.jsonl alone, and Seq still rises.
+	os.Remove(d.logPath())
+	if d = load(); d.logSeq != 2*keptLog-1 {
+		t.Fatalf("with log.1.jsonl alone loaded up to %d", d.logSeq)
 	}
 }
 

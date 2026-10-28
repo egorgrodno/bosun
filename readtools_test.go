@@ -216,8 +216,8 @@ func TestReadLogFilters(t *testing.T) {
 		"duration":     {LogQuery{Since: "30m"}, seq(4, 5, 6, 7, 8, 9)},
 		"rfc3339":      {LogQuery{Since: time.Now().Add(-2 * time.Minute).Format(time.RFC3339)}, seq(4, 5, 6, 7, 8, 9)},
 		"limit":        {LogQuery{Limit: 2}, seq(8, 9)},
-		// Entry 6 took the master's route and entry 9 is a notice. Entries without a route count by their decision's holder.
-		"reached user":      {LogQuery{ReachedUser: true}, seq(1, 2, 4, 5, 7)},
+		// Entry 6 took the master's route. Entries without a route count by the route their decision took, and a notice reaches the user.
+		"reached user":      {LogQuery{ReachedUser: true}, seq(1, 2, 4, 5, 7, 9)},
 		"reached user kind": {LogQuery{ReachedUser: true, Kind: "settled"}, seq(2, 5, 7)},
 	} {
 		if got := readLogSeqs(t, "", tc.q); !slices.Equal(got, tc.want) {

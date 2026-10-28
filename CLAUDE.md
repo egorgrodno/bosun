@@ -21,7 +21,7 @@ One binary carries every part:
 | `bosun mcp` | the stdio MCP server each session starts, relaying to the daemon |
 | `bosun hook` | every hook each session runs |
 | `bosun tui` | the terminal frontend |
-| `bosun status`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `compact`, `clear`, `spawn`, `kill`, `pause`, `unpause`, `away`, `model`, `attach`, `watch`, `conversation`, `follow` | the command-line frontend |
+| `bosun status`, `log`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `compact`, `clear`, `spawn`, `kill`, `pause`, `unpause`, `away`, `model`, `attach`, `watch`, `conversation`, `follow` | the command-line frontend |
 
 The daemon holds each session's parent and the queue of decisions waiting on an answer. It reads each session's state from `claude agents --json --all`, which also lists sessions bosun did not start.
 
@@ -262,7 +262,7 @@ A worker's parent must hear of every turn of it that ends or stops, unless a pau
 
 **The daemon's state survives a power loss.** `state.json` holds the sessions, the master's queue and the open decisions, and each save syncs it to disk.
 
-**The log outlasts a restart.** The daemon appends each entry to `log.jsonl` in the state directory, without a sync, so a power loss may drop the latest. On start it reads the latest 200 entries. Once the file holds 400 entries, it rewrites the file to those 200. `seq` carries on from the highest it read.
+**The log outlasts a restart.** The daemon appends each entry to `log.jsonl` in the state directory, without a sync, so a power loss may drop the latest. On start it reads the latest 200 entries. Once the file holds 10,000 entries, the daemon moves it to `log.1.jsonl`, in place of the one before, and starts `log.jsonl` with those 200. `seq` carries on from the highest it read, so a reader of both files tells a repeated entry by its `seq`. `bosun log` reads both files without the daemon.
 
 **The desk outlasts a restart.** On start the daemon adopts the desk while Claude Code lists it, and otherwise starts a new one that gets the old one's queue. A desk that cannot start leaves a notice.
 
@@ -373,9 +373,9 @@ A session's `activity` shows what it does: `tool` with `arg`, the main argument 
 
 | `kind` | Means | Also carries |
 |---|---|---|
-| `decision` | a decision or notice began to wait on you | `decision` |
-| `escalated` | the master passed a decision to you | `decision`, `text`: the master's note |
-| `settled` | a decision was settled | `decision`, and `behavior`, `text`, `words` or `withdrawn` with `cause` |
+| `decision` | a decision or notice began to wait on you | `decision`, `rule`, `match`, `route` |
+| `escalated` | the master passed a decision to you | `decision`, `text`: the master's note, `rule`, `match`, `route` |
+| `settled` | a decision was settled | `decision`, and `behavior`, `text`, `words` or `withdrawn` with `cause`, `rule`, `match`, `route`, `waited` |
 | `tell` | the user, the desk or the master told `node`, `master` or `desk` | `text` |
 | `message` | session `from` messaged `node` | `text` |
 | `spawned` | the user or a session started worker `node` | `text`: the prompt, `repo`, `model`, `effort` |
@@ -400,6 +400,19 @@ A session's `activity` shows what it does: `tool` with `arg`, the main argument 
 `via` is `supervisor` where the daemon presented the control key, and `resume` where it stopped or resumed the session instead. `error` says why the action failed.
 
 A `decision` entry's `by` is the role of the session that asks, or that sent the notice, and `bosun` for bosun's own notices. A `settled` entry says who settled the decision. `by` is `master`, `user`, `desk` with the quoted `words`, `session` for the session's own prompt, or `bosun`. `behavior` is a permission's `allow` or `deny`, and `text` a denial's message or a question's answer. A dismissed notice carries no `behavior` or `text`. A decision nobody answered carries `withdrawn`, and `cause` ends the sentence "withdrawn when …", such as `the pause stopped worker-a`. An entry's `decision` is the decision as it stood then, with each string of its input cut to 2000 characters and `…`.
+
+**Why a decision reached you.** A `decision`, `escalated` or `settled` entry carries the decision's `route`, and for a reserved action its `rule` and `match`. A `settled` entry also carries `waited`, the seconds it waited.
+
+| `route` | The decision |
+|---|---|
+| `master` | stayed with the master |
+| `escalated` | went from a worker to the master, which passed it to you |
+| `requester` | is the master's or the desk's own, which nobody sits above |
+| `userOnly` | is a reserved action on your list |
+| `prompt` | is a notice of a permission left in its session's own prompt |
+| `notice` | is any other notice |
+
+`rule` is a stable id from the `rule…` constants in `reserved.go`, such as `push.force`, `unboxed.write` or `write.list`. `match` is the word or path the rule matched. `bosun log -reached-user [-since T]` groups the decisions of every route but `master` by rule, with counts, how they were settled and an example each. An entry from before routes were logged gets its route from its `decision`, and is grouped by its `reserved` reason.
 
 - `tell` goes to the desk, or to the master when there is no desk, and its result does not say which. During a pause it waits for `unpause`.
 - `model` switches the master or the desk, as `{"op":"model","name":"desk","model":"opus","effort":"high"}`. `name` is `master` or `desk`, and the master when empty. It needs `model`, `effort` or both, and refuses a switch to what the session runs at already, and any switch during a pause. The result comes once the copy has started, and for a busy desk that can take 30 seconds. The `sessions` event then shows the new `id`, `model` and `effort`.

@@ -18,6 +18,8 @@ const usage = `usage:
                                    the decisions waiting and the tree, in the terminal
   bosun status [--json]            the decisions waiting, and the tree
   bosun watch                      stream the daemon's snapshot and events
+  bosun log [-since T] [-reached-user] [-json]
+                                   print the fleet's log, or group the decisions that reached you by the rule that sent them
   bosun conversation [-before ID] [-limit N] NAME
                                    print a session's latest conversation entries, or those before entry ID, as JSON
   bosun follow [-limit N] NAME     stream a session's conversation as JSON lines: its latest entries, each new one, and its turn in progress
@@ -61,6 +63,8 @@ func main() {
 		err = runStatus(args)
 	case "watch":
 		err = runWatch()
+	case "log":
+		err = runLog(args)
 	case "conversation", "follow":
 		err = runConversation(cmd, args)
 	case "tui":

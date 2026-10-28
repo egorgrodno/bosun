@@ -84,34 +84,12 @@ func inScope(in map[string]bool, e Entry) bool {
 	return in[e.Node] || in[e.From] || e.Decision != nil && in[e.Decision.Node]
 }
 
-// reachedUser reports whether log entry e is about a decision that reached the user. An entry with a Route says so by it. An older one has none, so it counts when its decision waited on the user, was escalated, or settled in their hands.
-func reachedUser(e Entry) bool {
-	if e.Route != "" {
-		return e.Route != "master"
-	}
-	if e.Decision == nil || e.Decision.Kind == "notice" {
-		return false
-	}
-	return e.Kind == "decision" || e.Kind == "escalated" || e.Decision.Holder == "user"
-}
-
-// parseSince reads a log query's Since as an RFC 3339 time or as a duration back from now.
-func parseSince(s string) (time.Time, error) {
-	if t, err := time.Parse(time.RFC3339, s); err == nil {
-		return t, nil
-	}
-	if age, err := time.ParseDuration(s); err == nil {
-		return time.Now().Add(-age), nil
-	}
-	return time.Time{}, fmt.Errorf("since %q is neither an RFC 3339 time nor a duration such as 2h", s)
-}
-
 // readLog returns the entries of the fleet's log that caller may read and q matches, oldest first, the latest q.Limit of them.
 func (d *daemon) readLog(caller string, q LogQuery) ([]Entry, error) {
 	var since time.Time
 	if q.Since != "" {
 		var err error
-		if since, err = parseSince(q.Since); err != nil {
+		if since, err = parseSince(q.Since, time.Now()); err != nil {
 			return nil, err
 		}
 	}
