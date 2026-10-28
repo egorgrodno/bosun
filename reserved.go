@@ -56,6 +56,7 @@ const (
 	ruleWriteOut    = "write.outside"
 	ruleRoot        = "unboxed.root"
 	ruleCron        = "unboxed.cron"
+	ruleSteer       = "unboxed.steer"
 	ruleActivate    = "unboxed.activate"
 	ruleUnboxWrite  = "unboxed.write"
 	ruleUnboxRead   = "unboxed.read"
@@ -444,6 +445,9 @@ func (g gate) userUnboxed(script, dir string) reservation {
 		if r := asRoot(words); r.reason != "" && !rebuild(argv) {
 			return r
 		}
+		if r := steers(argv); r.reason != "" {
+			return r
+		}
 		acc, reader := accesses(argv)
 		var scripts []string
 		for i := range argv {
@@ -527,9 +531,8 @@ var (
 	assignment = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
 )
 
-// accesses says what argv does with the path each of its words may name, and whether it writes none of them.
-func accesses(argv []string) (acc []access, reader bool) {
-	acc = make([]access, len(argv))
+// commandAt is the index of the program argv runs, past the assignments and wrappers before it, or len(argv) when it runs none.
+func commandAt(argv []string) int {
 	i := 0
 	for i < len(argv) && assignment.MatchString(argv[i]) {
 		i++
@@ -542,6 +545,38 @@ func accesses(argv []string) (acc []access, reader bool) {
 			i++
 		}
 	}
+	return i
+}
+
+// bosunReads are the bosun subcommands that only read. The empty one prints the usage.
+var bosunReads = []string{"", "status", "conversation", "log", "follow", "watch", "help", "-h", "-help", "--help"}
+
+// steers says whether argv runs a bosun subcommand that acts as the user, which the daemon cannot tell from the user's own frontend, or one bosun does not know.
+// xargs runs bosun with the words that follow its options, so bosun counts anywhere after it.
+func steers(argv []string) reservation {
+	i := commandAt(argv)
+	if i < len(argv) && filepath.Base(argv[i]) == "xargs" {
+		if j := slices.IndexFunc(argv[i:], func(w string) bool { return filepath.Base(w) == "bosun" }); j >= 0 {
+			i += j
+		}
+	}
+	if i == len(argv) || filepath.Base(argv[i]) != "bosun" {
+		return reservation{}
+	}
+	sub := ""
+	if i+1 < len(argv) {
+		sub = argv[i+1]
+	}
+	if slices.Contains(bosunReads, sub) {
+		return reservation{}
+	}
+	return reservation{"a command outside the sandbox that steers bosun as the user", true, ruleSteer, strings.TrimSpace("bosun " + sub)}
+}
+
+// accesses says what argv does with the path each of its words may name, and whether it writes none of them.
+func accesses(argv []string) (acc []access, reader bool) {
+	acc = make([]access, len(argv))
+	i := commandAt(argv)
 	if i == len(argv) {
 		return acc, true
 	}
@@ -557,8 +592,8 @@ func accesses(argv []string) (acc []access, reader bool) {
 		}
 	}
 	switch name := filepath.Base(argv[i]); {
-	// bosun's commands other than daemon write nothing but what the daemon keeps.
-	case slices.Contains(texters, name), name == "bosun" && (i+1 == len(argv) || argv[i+1] != "daemon"):
+	// bosun's reading commands take words, not paths. steers holds the rest for the user.
+	case slices.Contains(texters, name), name == "bosun" && (i+1 == len(argv) || slices.Contains(bosunReads, argv[i+1])):
 		set(text)
 		return acc, true
 	case name == "jq":

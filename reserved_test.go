@@ -565,6 +565,50 @@ func TestReservedRules(t *testing.T) {
 }
 
 // What only reads the user's list, other than a credential, goes to the master, as does a scratch folder and running bosun (egor/bosun#62, #63, #72).
+// A bosun subcommand that acts as the user stays with the user however the command runs it, since the daemon cannot tell it from the user's own frontend. Its reading subcommands go to the master.
+func TestReservedSteersBosun(t *testing.T) {
+	g := testGate()
+	state := home + "/.local/state/bosun"
+	for _, sub := range []string{"approve 5", "deny 5 no", "reply 5 yes", "dismiss 5", "answer 5 allow", "tell hi", "say a hi", "interrupt a", "compact master", "clear desk", "spawn x /repo go", "kill a", "pause", "unpause", "model opus", "attach 1234", "away on", "tui", "daemon", "frobnicate"} {
+		name, _, _ := strings.Cut(sub, " ")
+		for _, cmd := range []string{
+			"bosun " + sub,
+			state + "/bosun " + sub,
+			"~/.local/state/bosun/bosun " + sub,
+			"env FOO=1 bosun " + sub,
+			"timeout 5 bosun " + sub,
+			"sh -c 'bosun " + sub + "'",
+			"bash -c \"cd /tmp && bosun " + sub + "\"",
+			"bosun status --json | jq -r '.decisions[0].id' | xargs bosun " + sub,
+			"bosun " + sub + " 2>&1 | tail -3",
+			"true && bosun " + sub,
+		} {
+			input, _ := json.Marshal(map[string]any{"command": cmd, "dangerouslyDisableSandbox": true})
+			got := g.reserved("Bash", input)
+			if want := (reservation{reason: "a command outside the sandbox that steers bosun as the user", user: true}); bare(got) != want || got.rule != ruleSteer || got.match != "bosun "+name {
+				t.Errorf("unsandboxed %q: reserved = %+v", cmd, got)
+			}
+		}
+	}
+	for _, cmd := range []string{
+		"bosun",
+		"bosun help",
+		"bosun status --json | jq '.sessions[] | .node'",
+		"bosun conversation x",
+		"bosun log -reached-user -since 24h",
+		"bosun follow -limit 5 x | head -3",
+		"timeout 5 bosun watch",
+		state + "/bosun status",
+		"grep 'bosun say' " + state + "/log.jsonl",
+		`git commit -m "bosun approve runs outside"`,
+	} {
+		input, _ := json.Marshal(map[string]any{"command": cmd, "dangerouslyDisableSandbox": true})
+		if got := g.reserved("Bash", input); bare(got) != unboxed {
+			t.Errorf("unsandboxed %q: reserved = %+v, want the master's", cmd, got)
+		}
+	}
+}
+
 func TestReservedUnsandboxedReads(t *testing.T) {
 	g := testGate()
 	state := home + "/.local/state/bosun"
@@ -573,7 +617,6 @@ func TestReservedUnsandboxedReads(t *testing.T) {
 		// The calls #62 found reaching the user.
 		`bosun status --json | jq -r '.sessions[] | select(.node == "visual-check") | .status // "gone"'`,
 		`bosun conversation visual-check | jq -r '.entries[-1].text // ""'`,
-		`bosun say visual-check "look at ~/.claude/settings.json again" | jq .`,
 		state + "/bosun status --json",
 		state + `/bosun status --json | jq '.decisions[] | select(.userOnly) // empty'`,
 		"~/.local/state/bosun/bosun conversation desk --json | jq -c '.entries[]' | tail -5",
