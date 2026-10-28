@@ -218,6 +218,9 @@ func TestDeskAway(t *testing.T) {
 		t.Fatal("the desk turned away mode on with no word of the user's")
 	}
 	deskSays(t, "ok, I'm logging off for the night")
+	if _, err := desk.run(context.Background(), "away", json.RawMessage(`{"words":"I'm logging off"}`)); err == nil {
+		t.Fatal("the desk switched away mode without saying which way")
+	}
 	if _, err := desk.run(context.Background(), "away", json.RawMessage(`{"on":true,"words":"I'm logging off"}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -250,6 +253,7 @@ func TestParkedList(t *testing.T) {
 		p("3", "b", "question", "", "which db?"),
 		p("4", "master", "permission", "cd /repo && git push", ""),
 		{Decision: Decision{ID: "5", Node: masterNode, Kind: "notice", Note: "b failed"}, Why: "why 5", At: at},
+		{Decision: Decision{ID: "6", Node: masterNode, Kind: "permission", Tool: "Bash", Input: json.RawMessage(`{"command":"cd /repo && git push","description":"Push again"}`)}, Why: "why 6", At: at},
 	})
 	var heads []string
 	for line := range strings.SplitSeq(got, "\n") {
@@ -258,7 +262,7 @@ func TestParkedList(t *testing.T) {
 		}
 	}
 	want := []string{
-		"1. master, at 23:00 (4): Bash: cd /repo && git push",
+		"1. master, at 23:00 (4, 6): Bash: cd /repo && git push",
 		"2. a, b, at 23:00 (1, 3): asks: which db?",
 		"3. b, at 23:00 (2): Bash: npm publish",
 		"4. master, at 23:00 (5): notice: b failed",
@@ -269,6 +273,18 @@ func TestParkedList(t *testing.T) {
 	if !strings.Contains(got, "Parked because why 1.") || strings.Count(got, "A push") != 1 {
 		t.Fatalf("list\n%s", got)
 	}
+}
+
+// A usage limit that stops several sessions parks one notice, as it opens one.
+func TestAwayLimit(t *testing.T) {
+	testDaemon(t)
+	goAway(t, "")
+	stopFailure(t, "a", "rate_limit", "You've hit your limit · resets 3pm (Europe/Berlin)")
+	stopFailure(t, masterNode, "rate_limit", "You've hit your limit · resets 3pm (Europe/Berlin)")
+	if p := awaitParked(t, 1); p[0].Decision.Kind != "notice" {
+		t.Fatalf("parked %+v", p)
+	}
+	noDecisions(t)
 }
 
 func TestPushes(t *testing.T) {

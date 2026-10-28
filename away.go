@@ -80,7 +80,7 @@ func (d *daemon) setAway(caller string, on bool, words string) (string, error) {
 	switch caller {
 	case "":
 	case deskNode:
-		if words == "" {
+		if squash(words) == "" {
 			return "", errors.New("quote the user's words that ask for it")
 		}
 	default:
@@ -170,7 +170,7 @@ func parkedList(parked []Parked) string {
 	for _, p := range parked {
 		dec := p.Decision
 		// An escalation's note is the master's, so it does not tell requests apart.
-		key := strings.Join([]string{dec.Kind, dec.Tool, compact(dec.Input), dec.Question}, "\x00")
+		key := strings.Join([]string{dec.Kind, dec.Tool, request(dec), dec.Question}, "\x00")
 		if dec.Kind == "notice" {
 			key += "\x00" + dec.Note
 		}
@@ -214,16 +214,21 @@ func compareBool(a, b bool) int {
 	return -1
 }
 
-// isPush reports whether dec runs git push anywhere in its script.
-func isPush(dec Decision) bool {
-	if dec.Kind != "permission" || dec.Tool != "Bash" {
-		return false
+// request is what permission dec asks to run: a Bash call's command, whose description and timeout differ from try to try, or else the whole input.
+func request(dec Decision) string {
+	if dec.Tool != "Bash" {
+		return compact(dec.Input)
 	}
 	var in struct {
 		Command string `json:"command"`
 	}
 	_ = json.Unmarshal(dec.Input, &in)
-	return pushes(in.Command)
+	return in.Command
+}
+
+// isPush reports whether dec runs git push anywhere in its script.
+func isPush(dec Decision) bool {
+	return dec.Kind == "permission" && dec.Tool == "Bash" && pushes(request(dec))
 }
 
 // pushes walks script as the gate's command and argv do, finding git behind wrappers such as sudo or env and inside sh -c or eval.

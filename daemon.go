@@ -1206,7 +1206,8 @@ func (d *daemon) adoptLocked(dec *Decision) *Decision {
 	for id, o := range d.orphans {
 		if dec.key != "" && o.key == dec.key {
 			delete(d.orphans, id)
-			if e := holdDeadline(o); e != o.Expires {
+			// A decision settled while its request was away, as by parking, is no longer open to show.
+			if e := holdDeadline(o); e != o.Expires && d.decisions[id] == o {
 				o.Expires = e
 				c := *o
 				d.broadcastLocked(Event{Kind: "decision", Decision: &c})

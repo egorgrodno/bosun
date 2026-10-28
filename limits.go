@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"slices"
 	"strconv"
 	"time"
 )
@@ -73,7 +74,7 @@ func (d *daemon) limitLocked(n *Session, text string) {
 	d.saveLocked()
 	d.broadcastSessionsLocked()
 	log.Printf("%s stopped at a usage limit until %s", n.Node, until.Format(time.RFC3339))
-	if d.decisions[d.limitNotice] == nil {
+	if d.decisions[d.limitNotice] == nil && !slices.ContainsFunc(d.parked, func(p Parked) bool { return p.Decision.ID == d.limitNotice }) {
 		dec := &Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: fmt.Sprintf("Claude Code stopped %s at a usage limit: %q. bosun resumes each session the limit stops once it resets, %s for this one.", n.Node, text, until.Format("Jan 2 15:04"))}
 		d.openLocked(dec)
 		d.limitNotice = dec.ID

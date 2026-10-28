@@ -458,8 +458,11 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	case "notify":
 		req.Text = args.Message
 	case "away":
+		if args.On == nil {
+			return "", errors.New("say whether the user leaves, with on")
+		}
 		req.Name, req.Words = "off", args.Words
-		if args.On != nil && *args.On {
+		if *args.On {
 			req.Name = "on"
 		}
 	case "tell_master", "tell_desk":
