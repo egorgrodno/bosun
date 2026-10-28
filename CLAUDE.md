@@ -106,13 +106,25 @@ The check holds the call until the answer and returns `allow` or `deny`. A `PreT
 **The user's list stays with you alone.** It holds two kinds of action: those that change code that runs later where no bosun session sees it, and those that reach credentials for other machines. An action on it never reaches the master:
 
 - the pushes above, and a push outside the sandbox from a repository whose git setup does not match its record, or has none
-- a write through a file tool to a credential store, a shell startup file, Claude Code's configuration, git hooks or config, a systemd unit or autostart entry, or bosun's state directory
-- a Bash command outside the sandbox that names such a path or runs in a folder of the list
-- a Bash command outside the sandbox that runs as root, as through `sudo`, or activates a NixOS configuration other than through a rebuild on the allowlist
+- a write through a file tool to a credential store, a shell startup file, Claude Code's configuration, git hooks or config, a systemd unit, autostart entry or cron table, or bosun's state directory
+- a Bash command outside the sandbox that may write such a path, or reads a credential
+- a Bash command outside the sandbox that runs in a folder of the list, unless it only reads and the folder holds no credential
+- a Bash command outside the sandbox that runs as root, as through `sudo`, edits a cron table through `crontab`, or activates a NixOS configuration other than through a rebuild on the allowlist
 
-`userList` in `reserved.go` holds the exact paths. In a worker's own worktree, only what its next start runs outside the sandbox counts, such as `.claude/settings.json`. The merge's review sees the rest.
+`userList` in `reserved.go` holds the exact paths. The sessions' temporary folders, `nodes/*/tmp` in the state directory, are off the list. In a worker's own worktree, only what its next start runs outside the sandbox counts, such as `.claude/settings.json`. The merge's review sees the rest.
 
-**The list cannot bind a command outside the sandbox.** Such a command can write anywhere. The check reads two things: the paths a command's words and redirections name, and whether a word runs as root. Some words name no path. A redirection's descriptor, as in `2>&1`, is one. A `/` or `..` that leads to the root is another when it is a piece of a longer word, such as jq's `//` or the end of sed's `s/x//`. jq's program is a third, since jq opens no file it names. A path built at run time, as by a script or an unknown variable, escapes it. So the `decide` description tells the master to read the command whole, and to escalate anything it cannot follow or that touches the list.
+**The list cannot bind a command outside the sandbox.** Such a command can write anywhere. The check reads two things: the paths a command's words and redirections name, and whether a word runs as root. Some words name no path. A redirection's descriptor, as in `2>&1`, is one. A `/` or `..` that leads to the root is another when it is a piece of a longer word, such as jq's `//` or the end of sed's `s/x//`. jq's program is a third, since jq opens no file it names. So are a shell's `-c` script, which the check reads as a command of its own, and the arguments of `bosun` other than `bosun daemon`. A path built at run time, as by a script or an unknown variable, escapes it. So the `decide` description tells the master to read the command whole, and to escalate anything it cannot follow or that touches the list.
+
+**A path the command only reads stays off the list, unless it is a credential.** `accesses` in `reserved.go` sorts each word:
+
+| The word | Counts as |
+|---|---|
+| an argument of a reader such as `cat`, `jq`, `grep`, `ls`, `diff`, or `find` without an action such as `-delete` or `-exec` | a read |
+| a source of `cp`, `install`, `ln`, `rsync` or `scp`, the target of `<`, the argument of `cd` | a read |
+| an argument of `rm`, `mv`, `tee`, `touch`, `chmod` and the like, the last argument of a copier or the target of its `-t`, `dd`'s `of=`, the target of `>` | a write |
+| a word of any other command, `sed` and `awk` included | a possible write |
+
+A bare program name names no path, since it runs from `PATH`. A program named by its path counts as a read.
 
 **The allowlist lets a few commands outside the sandbox take the normal flow.** Each must be the whole command: plain words, with nothing chained, piped, substituted, redirected or assigned before it.
 

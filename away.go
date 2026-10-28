@@ -240,7 +240,7 @@ func pushes(script string) bool {
 					return true
 				}
 			}
-			if s, ok := inner(c.argv, i); ok {
+			if s, _, _, ok := inner(c.argv, i); ok {
 				if pushes(s) {
 					return true
 				}
