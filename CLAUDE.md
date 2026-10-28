@@ -143,7 +143,7 @@ A rebuild on the allowlist that shares its command with others, as in `nxt 2>&1 
 | `transcript` | desk | shows a session's last turns: each prompt, its text and a line per tool call |
 | `answer` | desk | gives your answer to a decision that waits on you, once you have said yes to it |
 | `tell_desk` | master | answers the desk, or the user when there is no desk |
-| `next_event` | master | blocks until a worker asks or needs a permission, a child of the master ends a turn or exits, or a `tell` comes from the desk, or from a frontend when there is no desk |
+| `next_event` | master | blocks until a worker asks or needs a permission, a child of the master ends a turn or exits, a worker goes quiet or the user sits on a decision, or a `tell` comes from the desk, or from a frontend when there is no desk |
 | `reply` | master | answers a question |
 | `decide` | master | allows or denies a permission |
 | `resume` | master | gives a worker that ended its turn, or stopped in it, a new prompt, and optionally a new model or effort |
@@ -155,6 +155,13 @@ A rebuild on the allowlist that shares its command with others, as in `nxt 2>&1 
 **The master loops on `next_event`.** It calls `next_event`, handles the event, and calls it again. A `Stop` hook reports a worker's turn end, and the session listing reports a worker that stops in its turn.
 
 **A parent hears of its children.** A worker's `turn_end` and `exit` go to its parent. The master gets them only for its own children, and for the children of a worker that `bosun kill` stopped or that has exited. A worker runs no `next_event`, so the daemon queues the reports. A parent in its turn gets them at its `Stop`, which the daemon blocks with the reports as its reason. The daemon resumes a parent between turns with the reports as its prompt. `SendMessage`'s `notify_when_idle` cannot replace this queue: the child's process holds the subscription, so a stop or resume of the child voids it, and it fires only once.
+
+**Stalls.** A long build is normal, so a quiet session is a report and never a kill. The daemon's `-stall-after` sets how long counts as quiet: 10 minutes by default, 0 for off. `next_event`'s description tells the master the default. Each tick checks two things:
+
+- **A worker in its turn that no hook has reached for that long** gets a `stalled` event. Its `text` says how long the worker has been quiet, its latest activity and its open calls. The event goes where the worker's `turn_end` goes: to its parent, or to the master for its own children and orphans. A worker with a decision open is waiting, not stalled. The event comes once, and again only after a hook ended the quiet and the worker went quiet anew. Any hook counts, not only the tool ones. After a restart of the daemon, the quiet counts from the daemon's start, since the last hook is unknown.
+- **A decision the user has held for that long** gets a `stalled` event to the master, whatever the decision's session, with `id` set to the decision's. It covers a permission or question with `holder` `user`, such as a reserved action on the user's list or one the master escalated, and a notice that a session waits in its own prompt. Other notices are left out, and so are the master's own decisions, which the master could not read while they wait. The master cannot settle it, but it can tell you through `notify`. The event comes once for each decision, and again after a restart of the daemon.
+
+The decision rides in `text`, not in `decision`, since `pendingLocked` drops an event whose decision the master does not hold. The log records each as `stalled`.
 
 **An idle master sleeps.** Once `next_event` returns empty, the master ends its turn, and the next event resumes it. So an idle master spends no turns. The daemon blocks a `Stop` that comes while events wait, which sends the master back to `next_event`. If the master stops again before calling `next_event`, the daemon lets it, queues a notice for you, and the next event resumes it. On start, the daemon adopts an idle or stopped master as asleep, unless an event waits for it. A wake stops and resumes the master, which ends a subagent or background command still running. So the master hands long work, such as a review before a merge, to a subagent in the background, and keeps calling `next_event` while it runs.
 
@@ -340,6 +347,7 @@ A session's `activity` shows what it does: `tool` with `arg`, the main argument 
 | `unpaused` | the user resumed the fleet | `text`: which turns resumed |
 | `model` | the user switched the master or the desk | `model`, `effort` |
 | `turn_end`, `exit` | worker `node` ended its turn, or stopped in it, other than by a kill | `text` |
+| `stalled` | worker `node` went quiet in its turn, or a decision of `node` waited long on the user (see Stalls) | `text` |
 | `say` | the user typed into `node` | `text`, `via`, `error` |
 | `interrupt` | the user ended `node`'s turn | `via`, `error` |
 | `compact`, `clear` | the user compacted or cleared the conversation of `node`, the master or the desk | `via`, `error` |

@@ -94,7 +94,10 @@ type daemon struct {
 	// maxDepth caps the depth of the tree, where the master's children are at depth 1, and maxChildren the live children of each session.
 	maxDepth    int
 	maxChildren int
-	claude      claudeCLI
+	// stallAfter is how long a worker's turn may run no hook, or a decision wait on the user, before the master hears of it, and began when the daemon started, which a worker quiet since before then counts from.
+	stallAfter time.Duration
+	began      time.Time
+	claude     claudeCLI
 
 	// masterLock is held while the master is woken, switched or resumed idle, so that no two of them resume it at once.
 	masterLock sync.Mutex
@@ -207,6 +210,8 @@ func newDaemon(exe, socket, stateDir, masterDir string, claude claudeCLI) *daemo
 		masterDir:   masterDir,
 		maxDepth:    defaultMaxDepth,
 		maxChildren: defaultMaxChildren,
+		stallAfter:  defaultStallAfter,
+		began:       time.Now(),
 		claude:      claude,
 		nodes:       map[string]*Session{},
 		started:     map[string]time.Time{},
@@ -256,6 +261,7 @@ func runDaemon(args []string) error {
 	workerEffort := flags.String("worker-effort", "", "effort of a worker started without one: low, medium, high, xhigh or max; the user's default when empty")
 	maxDepth := flags.Int("max-depth", defaultMaxDepth, "deepest level of the tree, where the master's children are at level 1")
 	maxChildren := flags.Int("max-children", defaultMaxChildren, "most children each session runs at once, a stopped one included until it is killed")
+	stallAfter := flags.Duration("stall-after", defaultStallAfter, "how long a worker's turn may run no hook, or a decision wait on the user, before the master hears of it as a stalled event; 0 turns the reports off")
 	_ = flags.Parse(args)
 	if *maxDepth < 1 || *maxChildren < 1 {
 		return errors.New("-max-depth and -max-children must be at least 1")
@@ -273,6 +279,7 @@ func runDaemon(args []string) error {
 	d.masterModel, d.deskModel, d.workerModel = *masterModel, *deskModel, *workerModel
 	d.masterEffort, d.deskEffort, d.workerEffort = *masterEffort, *deskEffort, *workerEffort
 	d.maxDepth, d.maxChildren = *maxDepth, *maxChildren
+	d.stallAfter = *stallAfter
 	if err := d.fitsSockets(masterNode); err != nil {
 		return fmt.Errorf("the state path %s is too long, so set BOSUN_STATE to a shorter one: %w", d.stateDir, err)
 	}
@@ -315,6 +322,7 @@ func runDaemon(args []string) error {
 			}
 			d.recoverLimited(time.Now())
 			d.expireOrphans(time.Now())
+			d.checkStalls(time.Now())
 		}
 	}
 }
@@ -778,6 +786,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 	}
 	wasSettled := n.settled()
 	d.stirred = true
+	n.hookAt = time.Now()
 	if contextEvents[in.Event] {
 		event := in.Event
 		if event == "SessionStart" && in.Source == "compact" {
@@ -1735,6 +1744,8 @@ func childReport(evs []Event) string {
 		switch {
 		case ev.Kind == "turn_end":
 			fmt.Fprintf(&b, "\n\n%s ended its turn:\n%s", ev.Node, ev.Text)
+		case ev.Kind == "stalled":
+			fmt.Fprintf(&b, "\n\n%s may be stuck. %s", ev.Node, ev.Text)
 		case ev.Text != "":
 			fmt.Fprintf(&b, "\n\n%s has stopped. %s", ev.Node, ev.Text)
 		default:

@@ -72,8 +72,8 @@ type ConvLine struct {
 	More    bool   `json:"more,omitempty"`
 }
 
-// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, tell and message; the desk gets tell; a frontend gets decision, settled, answered, sessions, activity, context, message, paused, unpaused and log.
-// A message is what session From told session Node through Claude Code's SendMessage. A tell is From's text: the user's when From is empty, or the desk's or the master's.
+// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, stalled, tell and message; the desk gets tell; a frontend gets decision, settled, answered, sessions, activity, context, message, paused, unpaused and log.
+// A stalled event's ID is the decision that waited on the user, left out where a worker went quiet. A message is what session From told session Node through Claude Code's SendMessage. A tell is From's text: the user's when From is empty, or the desk's or the master's.
 // Again marks an event the master took once already, in a turn that was cut short.
 type Event struct {
 	Kind     string    `json:"kind"`
@@ -157,6 +157,8 @@ type Decision struct {
 	// Expires is when the daemon stops holding the decision, as RFC 3339, and is left out for a decision it holds until answered.
 	Expires string `json:"expires,omitempty"`
 
+	// stalled marks a decision whose long wait on the user the master has heard of.
+	stalled   bool
 	toolUseID string
 	// key is the Key of the request that waits on the decision.
 	key    string
@@ -224,6 +226,9 @@ type Session struct {
 	pre map[string]preCall
 	// turnAt is when a hook of the session's turn last ran.
 	turnAt time.Time
+	// hookAt is when any hook of the session last ran, and stallFrom the hookAt that a stalled report last covered.
+	hookAt    time.Time
+	stallFrom time.Time
 	// stopAt is when a Stop or StopFailure of the session last ran.
 	stopAt time.Time
 	// held keeps poll, resume, merge and kill off the session while one of them stops or resumes it.
