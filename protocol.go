@@ -61,6 +61,8 @@ type Response struct {
 	// Away is the away mode while it is on, and Parked what it has parked since it went on.
 	Away   *Away    `json:"away,omitempty"`
 	Parked []Parked `json:"parked,omitempty"`
+	// SleepLock is the sleep lock while the daemon holds it.
+	SleepLock *SleepLock `json:"sleepLock,omitempty"`
 	// Log holds the fleet's latest entries, oldest first.
 	Log []Entry `json:"log,omitempty"`
 }
@@ -75,7 +77,7 @@ type ConvLine struct {
 	More    bool   `json:"more,omitempty"`
 }
 
-// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, stalled, tell and message; the desk gets tell and back; a frontend gets decision, settled, answered, sessions, activity, context, message, paused, unpaused, away, parked, back and log.
+// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, stalled, tell and message; the desk gets tell and back; a frontend gets decision, settled, answered, sessions, activity, context, message, paused, unpaused, away, parked, back, sleeplock and log.
 // A stalled event's ID is the decision that waited on the user, left out where a worker went quiet. A message is what session From told session Node through Claude Code's SendMessage. A tell is From's text: the user's when From is empty, or the desk's or the master's.
 // Again marks an event the master took once already, in a turn that was cut short.
 type Event struct {
@@ -98,6 +100,8 @@ type Event struct {
 	// Away is the away mode an away event turns on, and Parked what a parked event parked.
 	Away   *Away   `json:"away,omitempty"`
 	Parked *Parked `json:"parked,omitempty"`
+	// SleepLock is the lock a sleeplock event reports, nil once the daemon lets go.
+	SleepLock *SleepLock `json:"sleepLock,omitempty"`
 
 	// sent is when the user sent a tell to the desk, which may hand it over only after an answer it proposed since.
 	sent time.Time

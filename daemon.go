@@ -160,6 +160,8 @@ type daemon struct {
 	// away holds while the user is away, and parked what would have waited on them since it went on.
 	away   *Away
 	parked []Parked
+	// sleep is the sleep lock the daemon holds while the fleet works.
+	sleep sleepLock
 }
 
 type watcher struct {
@@ -216,6 +218,7 @@ func newDaemon(exe, socket, stateDir, masterDir string, claude claudeCLI) *daemo
 		maxDepth:    defaultMaxDepth,
 		maxChildren: defaultMaxChildren,
 		stallAfter:  defaultStallAfter,
+		sleep:       sleepLock{mode: "on", quiet: defaultSleepLockQuiet, inhibitor: systemdInhibitor{}, onBattery: func() bool { return onBatteryAt(powerSupplyDir) }},
 		began:       time.Now(),
 		claude:      claude,
 		nodes:       map[string]*Session{},
@@ -267,9 +270,14 @@ func runDaemon(args []string) error {
 	maxDepth := flags.Int("max-depth", defaultMaxDepth, "deepest level of the tree, where the master's children are at level 1")
 	maxChildren := flags.Int("max-children", defaultMaxChildren, "most children each session runs at once, a stopped one included until it is killed")
 	stallAfter := flags.Duration("stall-after", defaultStallAfter, "how long a worker's turn may run no hook, or a decision wait on the user, before the master hears of it as a stalled event; 0 turns the reports off")
+	sleepLockMode := flags.String("sleep-lock", "on", "whether the daemon holds a logind sleep lock while a session other than the desk works: on, off, or battery for only while the machine runs on its battery")
+	sleepLockQuiet := flags.Duration("sleep-lock-quiet", defaultSleepLockQuiet, "how long the fleet may stay quiet before the daemon lets go of the sleep lock")
 	_ = flags.Parse(args)
 	if *maxDepth < 1 || *maxChildren < 1 {
 		return errors.New("-max-depth and -max-children must be at least 1")
+	}
+	if err := checkSleepLockMode(*sleepLockMode); err != nil {
+		return fmt.Errorf("-sleep-lock: %w", err)
 	}
 	for flag, effort := range map[string]string{"master-effort": *masterEffort, "desk-effort": *deskEffort, "worker-effort": *workerEffort} {
 		if err := checkEffort(effort); err != nil {
@@ -285,6 +293,7 @@ func runDaemon(args []string) error {
 	d.masterEffort, d.deskEffort, d.workerEffort = *masterEffort, *deskEffort, *workerEffort
 	d.maxDepth, d.maxChildren = *maxDepth, *maxChildren
 	d.stallAfter = *stallAfter
+	d.sleep.mode, d.sleep.quiet = *sleepLockMode, *sleepLockQuiet
 	if err := d.fitsSockets(masterNode); err != nil {
 		return fmt.Errorf("the state path %s is too long, so set BOSUN_STATE to a shorter one: %w", d.stateDir, err)
 	}
@@ -2063,6 +2072,7 @@ func (d *daemon) broadcastSessionsLocked() {
 
 func (d *daemon) snapshotLocked() Response {
 	resp := Response{Type: "snapshot", Sessions: []Session{}, Decisions: []Decision{}, Paused: d.paused, Away: d.away, Parked: d.parked}
+	resp.SleepLock = d.sleep.shown
 	for _, n := range d.sortedLocked() {
 		resp.Sessions = append(resp.Sessions, n.public())
 	}

@@ -182,6 +182,23 @@ The decision rides in `text`, not in `decision`, since `pendingLocked` drops an 
 
 **Turning it off hands you one list.** The list groups identical requests and puts first what unblocks the most: pushes, then the larger groups. It goes into one notice, which `bosun status` and the tui show until you dismiss it. The desk gets it as a `back` event, the way it gets a tell. A desk that turned the mode off itself gets no `back` event, since the tool's result holds the list. A `back` event counts as no message of yours. A desk that cannot take it drops it, since the notice holds the list. A parked call was denied, so acting on an item means telling the master to run it again.
 
+## Sleep lock
+
+**The daemon holds a logind sleep lock while the fleet works.** Claude Code's `awake` plugin held one through every turn, but the master and the workers start with plugins off, and the plugin holds one only on a machine with a battery. The daemon runs outside any sandbox, so it takes a block-mode lock on `sleep` itself, with no prompt. Each tick counts the sessions other than the desk that are in a turn. The first takes the lock, and it goes once none has worked for the quiet spell, so a gap between a merge and the next spawn does not let the machine sleep.
+
+| Flag | Default | Does |
+|---|---|---|
+| `-sleep-lock` | `on` | `on` holds the lock, `off` never does, `battery` holds it only while a battery discharges, read from `/sys/class/power_supply`. A machine with no battery never holds one in `battery` mode |
+| `-sleep-lock-quiet` | `10m` | how long the fleet may stay quiet before the lock goes |
+
+**A session that waits on the user does not work.** A session with a permission or question held by the user, or in its own prompt, is left out. So is a session that was killed, paused, stopped or stopped by a usage limit, and the master while it sleeps. A decision left with the user overnight therefore cannot keep the machine awake. There is no cap beside it: a fleet that works all night holds the lock all night.
+
+**The daemon never suspends the machine.** The release leaves the machine to the user's own idle step. A suspend of the daemon's own, once an overnight run is done, was left out on purpose: on a host whose idle step already suspends, a second request puts the machine back to sleep when it wakes.
+
+**The lock is `systemd-inhibit --what=sleep --mode=block sleep infinity`.** The daemon needs no D-Bus library, but the service's `PATH` must reach `systemd-inhibit` and `sleep`. The lock goes when the child dies. The daemon kills the child's process group to release it, and starts it with `Pdeathsig` `SIGKILL`, so a daemon that crashes leaves no lock behind, and the service's cgroup kill ends anything left. A child that dies of itself, as one does when it cannot reach D-Bus, is retaken after a minute, and the log tells of the first failure of a run. A lid close still suspends, since logind's `LidSwitchIgnoreInhibited` overrides sleep locks. The lock is not saved: a restarted daemon takes it again at its next tick that finds a session working.
+
+The log records `sleeplock` entries for taking and releasing the lock. The snapshot's `sleepLock` is `{"since":…,"until":…}` while the daemon holds the lock, and `until` is there only while the fleet is quiet. A `sleeplock` event carries the same in its `sleepLock`, and none once the lock is gone. `bosun status` and `bosun tui` show it.
+
 ## Messages
 
 **Workers talk through Claude Code.** `SendMessage` reaches a running session by its `-n` name, so workers address each other by node name. Auto mode runs it without a permission request, so the master never decides on a message. A message arrives between tool calls, so one to a worker blocked in `ask` waits until the call returns. A message to an idle session starts a turn, and that turn's `Stop` reaches its parent as a `turn_end`.
@@ -360,6 +377,7 @@ A session's `activity` shows what it does: `tool` with `arg`, the main argument 
 | `unpaused` | the user resumed the fleet | `text`: which turns resumed |
 | `away` | the user or the desk turned away mode on | `text`: the user's words |
 | `back` | the user or the desk turned away mode off | `text`: what the switch answered, with the list of what parked |
+| `sleeplock` | bosun took the sleep lock, let go of it, or could not hold it | `text`, `error` |
 | `parked` | bosun parked `node`'s decision while the user was away | `decision`, `text`: why it would have reached the user |
 | `model` | the user switched the master or the desk | `model`, `effort` |
 | `turn_end`, `exit` | worker `node` ended its turn, or stopped in it, other than by a kill | `text` |
@@ -417,6 +435,7 @@ Each leads with the queue of decisions waiting on you, above the tree. The desk 
 - **Effort.** That `--effort` lands in `respawnFlags` and survives a flagless resume is inferred from `--model` doing so, and unmeasured. So is whether `claude rm` of a switched worker's first id removes the worktree its copy runs in, and whether `claude rm` of the copy alone leaves it.
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
 - **Restarts and pauses.** Only a fake `claude` has run the restart handling and the pause. No real reboot, crash or pause has been measured. The daemon reads transcripts in the 2.1.310 format. A `claude stop` in a turn runs no `Stop` (see "Inside a session"), and the daemon ignores a `Stop` from a session that a pause stopped.
+- **Sleep lock.** Only a fake `systemd-inhibit` has run it. Whether the real one keeps its lock on the process that `sleep infinity` replaces, and so ends it on the kill of the process group, and whether the lock outlives a crashed daemon in the service's cgroup, is unmeasured.
 - **Away mode.** Only the fakes have run it. Whether a real master follows its descriptions, escalating as it would and carrying on, and whether a worker given a parked denial goes on with the rest of its task without retrying, is unmeasured.
 - **The desk.** No real desk has run. A probe session inside the master's directory measured the desk's trust, `autoMemoryDirectory` from `--settings` and the clear's transcript, and nothing more. Handing an idle desk its queue stops and resumes it, as waking the master does. Whether a `claude attach` open on it survives that is unmeasured. That a file tool's sensitive write asks even in auto mode comes from the 2.1.310 binary. The desk's answers assume that `UserPromptSubmit` carries each prompt you type, verbatim. No real desk has shown that. When it runs for a prompt typed while the desk is in its turn is unmeasured, and the daemon times the prompt by it. The desk's switch rests on the master's: no real desk has moved to a copy.
 - **The open master and its subagents.** No real `claude attach` has run under the `attached` hold. While you have the master open, it sleeps ten seconds after its last event, so a wake stops and resumes it under your `claude attach`. Whether the attach survives that is unmeasured. That a stop ends a background subagent, and that its result waits for the running tool call to return, are assumed, not measured.

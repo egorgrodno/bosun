@@ -229,6 +229,9 @@ func printStatus(w io.Writer, s Response) {
 	if s.Away != nil {
 		fmt.Fprintln(w, awayHeader(*s.Away)+" bosun away off hands you the list.")
 	}
+	if s.SleepLock != nil {
+		fmt.Fprintln(w, sleepLockLine(*s.SleepLock))
+	}
 	if len(s.Parked) > 0 {
 		fmt.Fprintln(w, "Parked while you are away:")
 	}
@@ -384,6 +387,8 @@ func logLine(e Entry) string {
 		if e.Decision != nil {
 			what = fmt.Sprintf("parked %s's %s %s", e.Node, e.Decision.ID, parkedLine(Parked{Decision: *e.Decision}))
 		}
+	case "sleeplock":
+		what = e.Text
 	case "model":
 		what = fmt.Sprintf("switched %s to %s", e.Node, modelLabel(Session{Model: e.Model, Effort: e.Effort}))
 	case "say":

@@ -26,6 +26,7 @@ type tui struct {
 	answered  []Answered
 	paused    bool
 	away      *Away
+	sleepLock *SleepLock
 	parked    []Parked
 	connected bool
 	sel       int
@@ -133,9 +134,12 @@ func (t *tui) apply(r Response) {
 	case r.Type == "snapshot":
 		t.sessions, t.decisions, t.log, t.answered, t.paused, t.connected = r.Sessions, r.Decisions, r.Log, r.Answered, r.Paused, true
 		t.away, t.parked = r.Away, r.Parked
+		t.sleepLock = r.SleepLock
 	case r.Event == nil:
 	case r.Event.Kind == "paused", r.Event.Kind == "unpaused":
 		t.paused = r.Event.Kind == "paused"
+	case r.Event.Kind == "sleeplock":
+		t.sleepLock = r.Event.SleepLock
 	case r.Event.Kind == "away":
 		t.away, t.parked = r.Event.Away, nil
 	case r.Event.Kind == "back":
@@ -277,6 +281,9 @@ func (t *tui) render(width, height int) []string {
 	}
 	if t.paused {
 		add(yellow, "Paused: p resumes the turns it stopped", false)
+	}
+	if t.sleepLock != nil {
+		add(dim, sleepLockLine(*t.sleepLock), false)
 	}
 	if t.away != nil {
 		add(yellow, awayHeader(*t.away)+" w comes back", false)
