@@ -122,7 +122,7 @@ func runCommand(cmd string, args []string) error {
 		_ = flags.Parse(args)
 		req.Model, req.Effort, args = *model, *effort, flags.Args()
 	}
-	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "say": 2, "interrupt": 1, "compact": 1, "clear": 1, "away": 1}[cmd]
+	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "say": 2, "interrupt": 1, "compact": 1, "clear": 1, "away": 1, "revoke": 1}[cmd]
 	if len(args) < need {
 		return errors.New(usage)
 	}
@@ -141,6 +141,13 @@ func runCommand(cmd string, args []string) error {
 		req.Name, req.Text = args[0], strings.Join(args[1:], " ")
 	case "away":
 		req.Name, req.Words = args[0], strings.Join(args[1:], " ")
+	case "grant":
+		var err error
+		if req, err = grantRequest(args); err != nil {
+			return err
+		}
+	case "revoke":
+		req.ID = args[0]
 	}
 	resp, err := call(context.Background(), req)
 	if resp.Text != "" {
@@ -231,6 +238,12 @@ func printStatus(w io.Writer, s Response) {
 	}
 	if s.SleepLock != nil {
 		fmt.Fprintln(w, sleepLockLine(*s.SleepLock))
+	}
+	if len(s.Grants) > 0 {
+		fmt.Fprintln(w, grantsHeader(s.Away != nil))
+	}
+	for _, g := range s.Grants {
+		fmt.Fprintf(w, "  %s\n", grantLine(g, time.Now()))
 	}
 	if len(s.Parked) > 0 {
 		fmt.Fprintln(w, "Parked while you are away:")
@@ -387,6 +400,8 @@ func logLine(e Entry) string {
 		if e.Decision != nil {
 			what = fmt.Sprintf("parked %s's %s %s", e.Node, e.Decision.ID, parkedLine(Parked{Decision: *e.Decision}))
 		}
+	case "granted", "revoked", "expired":
+		what = grantEntryLine(e)
 	case "sleeplock":
 		what = e.Text
 	case "model":
@@ -440,6 +455,8 @@ func settledLine(e Entry) string {
 		}
 	}
 	switch {
+	case e.Grant != nil:
+		s += fmt.Sprintf(", under grant %s (%s)", e.Grant.ID, e.Grant.Class)
 	case e.By == "session":
 		s += ", in its own prompt"
 	case e.Words != "":

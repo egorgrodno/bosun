@@ -181,12 +181,13 @@ func role(node string) string {
 	return node
 }
 
-// outcome is how a decision was settled, for the log: by whom, the answer where the session's own prompt gave it, for a withdrawal the cause, which completes "withdrawn when …", and the user's words the desk acted on.
+// outcome is how a decision was settled, for the log: by whom, the answer where the session's own prompt gave it, for a withdrawal the cause, which completes "withdrawn when …", and the user's words the desk acted on, or the standing grant that settled it.
 type outcome struct {
 	by       string
 	behavior string
 	cause    string
 	words    string
+	grant    *Grant
 }
 
 // The routes by which a decision reaches its holder. Every route but routeMaster reaches the user.
@@ -226,7 +227,7 @@ func (e *Entry) why(dec *Decision) {
 
 // settledEntry is the log's entry for dec, settled with a as o says.
 func settledEntry(dec *Decision, a answer, o outcome) Entry {
-	e := Entry{Kind: "settled", By: o.by, Node: dec.Node, Decision: dec, Words: o.words}
+	e := Entry{Kind: "settled", By: o.by, Node: dec.Node, Decision: dec, Words: o.words, Grant: o.grant}
 	e.why(dec)
 	if !dec.opened.IsZero() {
 		e.Waited = math.Round(time.Since(dec.opened).Seconds()*10) / 10

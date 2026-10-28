@@ -162,6 +162,29 @@ func TestTUIAway(t *testing.T) {
 	}
 }
 
+// n takes a grant to give, and x on a grant revokes it.
+func TestTUIGrants(t *testing.T) {
+	tu := testTUI()
+	tu.key("n")
+	for _, k := range strings.Split("push 8h", "") {
+		tu.key(k)
+	}
+	if a, ok := tu.key("\r"); !ok || a != (tuiAction{op: "grant", text: "push 8h"}) {
+		t.Fatalf("n: %+v %v", a, ok)
+	}
+	tu.apply(Response{Type: "event", Event: &Event{Kind: "grants", Grants: []Grant{{ID: "g1", Class: "push", Until: time.Now().Add(time.Hour), By: "user"}}}})
+	screen := strings.Join(tu.render(100, 30), "\n")
+	if !strings.Contains(screen, "Standing grants, which bosun acts on once away mode is on") || !strings.Contains(screen, "g1   push") {
+		t.Fatalf("the screen does not show the grant:\n%s", screen)
+	}
+	for tu.selected().grant == nil {
+		tu.key("j")
+	}
+	if a, ok := tu.key("x"); !ok || a != (tuiAction{op: "revoke", id: "g1"}) {
+		t.Fatalf("x on a grant: %+v %v", a, ok)
+	}
+}
+
 // m on the master or the desk takes a model and an effort to switch it to, and does nothing on a worker.
 func TestTUISwitch(t *testing.T) {
 	tu := testTUI()

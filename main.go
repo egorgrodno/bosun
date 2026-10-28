@@ -39,6 +39,10 @@ const usage = `usage:
   bosun unpause                    resume the turns that pause stopped
   bosun away on [WORDS]            park what would wait on you, so the fleet works on without you
   bosun away off                   hand you what was parked, as one list through the desk
+  bosun grant CLASS UNTIL [WORDS]  while away mode is on, let bosun allow a class of the master's calls until UNTIL
+                                   (09:00, 8h or RFC 3339, at most a day): push, its push to a remote of the
+                                   repository, or rebuild, its nixos-rebuild test or build of /etc/nixos
+  bosun revoke ID                  end a standing grant
   bosun attach ID                  claude attach to a session, which the daemon resumes if it stopped
   bosun model [-effort E] [master|desk] [M]
                                    switch the master, or the desk, to model M or effort E, keeping its conversation
@@ -73,7 +77,7 @@ func main() {
 		err = runAttach(args)
 	case "model":
 		err = runModel(args)
-	case "approve", "deny", "reply", "dismiss", "tell", "say", "interrupt", "compact", "clear", "spawn", "kill", "pause", "unpause", "away":
+	case "approve", "deny", "reply", "dismiss", "tell", "say", "interrupt", "compact", "clear", "spawn", "kill", "pause", "unpause", "away", "grant", "revoke":
 		err = runCommand(cmd, args)
 	default:
 		fmt.Fprintln(os.Stderr, usage)

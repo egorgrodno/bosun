@@ -75,6 +75,7 @@ func (d *daemon) statusFor(caller string) Response {
 	resp.Decisions = slices.DeleteFunc(resp.Decisions, func(dec Decision) bool { return !in[dec.Node] })
 	resp.Messages = slices.DeleteFunc(resp.Messages, func(e Event) bool { return !in[e.Node] && !in[e.From] })
 	resp.Answered = slices.DeleteFunc(resp.Answered, func(a Answered) bool { return !in[a.Decision.Node] })
+	resp.Grants = nil
 	resp.Log = slices.DeleteFunc(resp.Log, func(e Entry) bool { return !inScope(in, e) })
 	return resp
 }

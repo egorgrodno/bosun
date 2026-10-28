@@ -28,11 +28,13 @@ type tui struct {
 	away      *Away
 	sleepLock *SleepLock
 	parked    []Parked
+	grants    []Grant
 	connected bool
 	sel       int
-	// answering is the question an answer is being typed for, or switching the master or the desk a model and effort are being typed for, and answer the text so far.
+	// answering is the question an answer is being typed for, or switching the master or the desk a model and effort are being typed for, or granting a grant being typed, and answer the text so far.
 	answering string
 	switching string
+	granting  bool
 	answer    []rune
 	err       string
 	// layout is the keyboard layout, qwerty or hallmack, which picks the movement keys.
@@ -79,9 +81,10 @@ func moveHint(layout string) string {
 	return down + "/" + up + " move"
 }
 
-// tuiItem is a selectable line: a decision, or a session at its depth in the tree.
+// tuiItem is a selectable line: a decision, a standing grant, or a session at its depth in the tree.
 type tuiItem struct {
 	decision *Decision
+	grant    *Grant
 	session  *Session
 	depth    int
 }
@@ -91,7 +94,7 @@ type tuiAction struct {
 	op, id, name, text string
 }
 
-// items lists the decisions waiting on the user, then those waiting on the master, then the sessions depth first.
+// items lists the decisions waiting on the user, then those waiting on the master, then the standing grants, then the sessions depth first.
 func (t *tui) items() []tuiItem {
 	var items []tuiItem
 	for _, holder := range []string{"user", "master"} {
@@ -100,6 +103,9 @@ func (t *tui) items() []tuiItem {
 				items = append(items, tuiItem{decision: &t.decisions[i]})
 			}
 		}
+	}
+	for i := range t.grants {
+		items = append(items, tuiItem{grant: &t.grants[i]})
 	}
 	children := map[string][]int{}
 	for i, s := range t.sessions {
@@ -134,6 +140,7 @@ func (t *tui) apply(r Response) {
 	case r.Type == "snapshot":
 		t.sessions, t.decisions, t.log, t.answered, t.paused, t.connected = r.Sessions, r.Decisions, r.Log, r.Answered, r.Paused, true
 		t.away, t.parked = r.Away, r.Parked
+		t.grants = r.Grants
 		t.sleepLock = r.SleepLock
 	case r.Event == nil:
 	case r.Event.Kind == "paused", r.Event.Kind == "unpaused":
@@ -144,6 +151,8 @@ func (t *tui) apply(r Response) {
 		t.away, t.parked = r.Event.Away, nil
 	case r.Event.Kind == "back":
 		t.away, t.parked = nil, nil
+	case r.Event.Kind == "grants":
+		t.grants = r.Event.Grants
 	case r.Event.Kind == "parked" && r.Event.Parked != nil:
 		t.parked = append(t.parked, *r.Event.Parked)
 	case r.Event.Kind == "sessions":
@@ -191,18 +200,21 @@ func (t *tui) key(k string) (tuiAction, bool) {
 		t.armed, t.armedAt = k, t.clock()
 		return tuiAction{}, false
 	}
-	if t.answering != "" || t.switching != "" {
+	if t.answering != "" || t.switching != "" || t.granting {
 		switch k {
 		case "\x1b":
-			t.answering, t.switching, t.answer = "", "", nil
+			t.answering, t.switching, t.granting, t.answer = "", "", false, nil
 		case "\r":
 			text := strings.TrimSpace(string(t.answer))
 			a := tuiAction{op: "reply", id: t.answering, text: text}
 			if t.switching != "" {
 				a = tuiAction{op: "model", name: t.switching, text: text}
 			}
+			if t.granting {
+				a = tuiAction{op: "grant", text: text}
+			}
 			if text != "" {
-				t.answering, t.switching, t.answer = "", "", nil
+				t.answering, t.switching, t.granting, t.answer = "", "", false, nil
 				return a, true
 			}
 		case "\x7f", "\b":
@@ -243,6 +255,10 @@ func (t *tui) key(k string) (tuiAction, bool) {
 		return twice(tuiAction{op: "deny", id: it.decision.ID})
 	case k == "x" && kind == "notice":
 		return tuiAction{op: "dismiss", id: it.decision.ID}, true
+	case k == "x" && it.grant != nil:
+		return tuiAction{op: "revoke", id: it.grant.ID}, true
+	case k == "n":
+		t.granting = true
 	case (k == "r" || k == "\r") && kind == "question":
 		t.answering = it.decision.ID
 	case k == "m" && it.session != nil && (it.session.Node == masterNode || it.session.Node == deskNode):
@@ -306,6 +322,9 @@ func (t *tui) render(width, height int) []string {
 				title = "Waiting on you"
 			}
 		}
+		if it.grant != nil {
+			title = grantsHeader(t.away != nil)
+		}
 		if title != section {
 			if section != "" {
 				add("", "", false)
@@ -321,6 +340,11 @@ func (t *tui) render(width, height int) []string {
 			if d.Kind == "notice" {
 				add("", "       "+d.Note, false)
 			}
+			continue
+		}
+		if g := it.grant; g != nil {
+			add("", "  "+grantLine(*g, t.clock()), i == t.sel)
+			add(dim, "       "+classWhat(g.Class), false)
 			continue
 		}
 		s := it.session
@@ -357,6 +381,8 @@ func (t *tui) render(width, height int) []string {
 		foot = append(foot, yellow+"Press "+t.armed+" again to "+hint+plain)
 	case t.answering != "":
 		foot = append(foot, fmt.Sprintf("answer %s: %s_", t.answering, string(t.answer)), dim+clip("enter send · esc cancel", width)+plain)
+	case t.granting:
+		foot = append(foot, fmt.Sprintf("grant: %s_", string(t.answer)), dim+clip("a class ("+classNames()+"), when it ends (09:00 or 8h) and your words · enter grant · esc cancel", width)+plain)
 	case it.decision != nil && it.decision.Kind == "permission":
 		foot = append(foot, dim+clip("y approve · d deny · "+moveHint(t.layout)+" · q quit", width)+plain)
 	case it.decision != nil && it.decision.Kind == "question":
@@ -365,6 +391,8 @@ func (t *tui) render(width, height int) []string {
 		foot = append(foot, fmt.Sprintf("switch %s to: %s_", t.switching, string(t.answer)), dim+clip("a model, an effort ("+strings.Join(efforts, ", ")+") or both · enter switch · esc cancel", width)+plain)
 	case it.decision != nil:
 		foot = append(foot, dim+clip("x dismiss · "+moveHint(t.layout)+" · q quit", width)+plain)
+	case it.grant != nil:
+		foot = append(foot, dim+clip("x revoke · n grant · "+moveHint(t.layout)+" · q quit", width)+plain)
 	case it.session != nil:
 		keys := "enter attach, then ctrl+z to come back · "
 		if it.session.Node == masterNode || it.session.Node == deskNode {
@@ -380,6 +408,7 @@ func (t *tui) render(width, height int) []string {
 		} else {
 			keys += "w away · "
 		}
+		keys += "n grant · "
 		foot = append(foot, dim+clip(keys+moveHint(t.layout)+" · q quit", width)+plain)
 	default:
 		foot = append(foot, dim+"q quit"+plain)
@@ -548,6 +577,17 @@ func runTUI(args []string) error {
 					t.err = attach(a.id)
 					_, _ = makeRaw(in)
 					enter()
+				case "grant":
+					t.err = ""
+					req, err := grantRequest(strings.Fields(a.text))
+					if err == nil {
+						ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+						_, err = call(ctx, req)
+						cancel()
+					}
+					if err != nil {
+						t.err = err.Error()
+					}
 				case "pause", "unpause", "model", "away":
 					// Each stops or resumes sessions, which takes a while, and the watch stream shows the progress. A switch of the desk waits for its turn to end.
 					t.err = ""

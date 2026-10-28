@@ -25,10 +25,13 @@ func (d *daemon) awayLocked() bool {
 }
 
 // parkLocked is where every decision that would wait on the user goes, as it opens or as the master escalates it.
-// While the user is away, it parks dec: it answers a permission or question with parkedCall or parkedQuestion, keeps it on the list for their return, and reports true. A notice that a permission waits in its session's own prompt never parks, since only an answer there settles it.
+// While the user is away, it allows dec under a standing grant that covers it, or else parks it: it answers a permission or question with parkedCall or parkedQuestion, keeps it on the list for their return, and reports true. A notice that a permission waits in its session's own prompt never parks, since only an answer there settles it.
 func (d *daemon) parkLocked(dec *Decision) bool {
 	if !d.awayLocked() || dec.Prompt {
 		return false
+	}
+	if d.grantLocked(dec) {
+		return true
 	}
 	c := *dec
 	c.Input, c.Expires = cutInput(c.Input), ""
@@ -80,19 +83,10 @@ func reachesUser(dec *Decision) string {
 // setAway turns the away mode on or off for caller: the user from a frontend, or the desk on the user's words, which must appear in their latest message.
 // Turning it on parks what waits on the user already, other than notices. Turning it off hands the user what was parked, as one list through the desk and as a notice.
 func (d *daemon) setAway(caller string, on bool, words string) (string, error) {
-	switch caller {
-	case "":
-	case deskNode:
-		if squash(words) == "" {
-			return "", errors.New("quote the user's words that ask for it")
-		}
-	default:
-		return "", errors.New("only the user and the desk switch the away mode")
-	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if caller == deskNode && (d.said.at.IsZero() || !strings.Contains(squash(d.said.text), squash(words))) {
-		return "", fmt.Errorf("the user's latest message does not hold %q: quote their words exactly", words)
+	if err := d.onUserWordLocked(caller, words, "switch the away mode"); err != nil {
+		return "", err
 	}
 	if on {
 		return d.goAwayLocked(caller, words)
@@ -122,8 +116,11 @@ func (d *daemon) goAwayLocked(caller, words string) (string, error) {
 	}
 	d.saveLocked()
 	text := "Away mode is on: bosun parks what would wait on the user, and the master carries on with the rest."
-	if len(waiting) > 0 {
-		text += fmt.Sprintf(" It parked the %d decisions that waited on the user already.", len(waiting))
+	if len(d.parked) > 0 {
+		text += fmt.Sprintf(" It parked the %d decisions that waited on the user already.", len(d.parked))
+	}
+	if granted := len(waiting) - len(d.parked); granted > 0 {
+		text += fmt.Sprintf(" It allowed %d under standing grants.", granted)
 	}
 	return text, nil
 }
@@ -254,11 +251,15 @@ func pushes(script string) bool {
 	return false
 }
 
-// awayLine is what heads each batch of events the master gets while the user is away.
-func awayLine(a *Away) string {
+// awayLine is what heads each batch of events the master gets while the user is away, naming the standing grants.
+func awayLine(a *Away, grants []Grant) string {
 	s := "bosun: away mode is on: the user went away at " + a.Since.Local().Format("Jan 2 15:04")
 	if a.Words != "" {
 		s += fmt.Sprintf(", saying %q", a.Words)
 	}
-	return s + ". Escalate and notify park what they get for the user's return, and next_event says how to work until then."
+	s += ". Escalate and notify park what they get for the user's return, and next_event says how to work until then."
+	if g := grantsLine(grants); g != "" {
+		s += " " + g
+	}
+	return s
 }

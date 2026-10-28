@@ -61,6 +61,8 @@ type Response struct {
 	// Away is the away mode while it is on, and Parked what it has parked since it went on.
 	Away   *Away    `json:"away,omitempty"`
 	Parked []Parked `json:"parked,omitempty"`
+	// Grants are the user's standing grants that have not ended.
+	Grants []Grant `json:"grants,omitempty"`
 	// SleepLock is the sleep lock while the daemon holds it.
 	SleepLock *SleepLock `json:"sleepLock,omitempty"`
 	// Log holds the fleet's latest entries, oldest first.
@@ -100,6 +102,8 @@ type Event struct {
 	// Away is the away mode an away event turns on, and Parked what a parked event parked.
 	Away   *Away   `json:"away,omitempty"`
 	Parked *Parked `json:"parked,omitempty"`
+	// Grants is every standing grant that has not ended, in a grants event.
+	Grants []Grant `json:"grants,omitempty"`
 	// SleepLock is the lock a sleeplock event reports, nil once the daemon lets go.
 	SleepLock *SleepLock `json:"sleepLock,omitempty"`
 
@@ -138,11 +142,23 @@ type Entry struct {
 	Route string `json:"route,omitempty"`
 	// Waited is how many seconds a settled decision waited.
 	Waited float64 `json:"waited,omitempty"`
+	// Grant is the standing grant that a granted, revoked or expired entry is about, or that settled a decision.
+	Grant *Grant `json:"grant,omitempty"`
 }
 
 // Away is the user's away mode, on since Since. By is user or desk, and Words the user's words that turned it on, if any.
 type Away struct {
 	Since time.Time `json:"since"`
+	By    string    `json:"by"`
+	Words string    `json:"words,omitempty"`
+}
+
+// Grant is a standing grant of the user's: while away mode is on, from Since until Until, bosun allows each permission of Class itself. By is user or desk, and Words the user's words that gave it, if any.
+type Grant struct {
+	ID    string    `json:"id"`
+	Class string    `json:"class"`
+	Since time.Time `json:"since"`
+	Until time.Time `json:"until"`
 	By    string    `json:"by"`
 	Words string    `json:"words,omitempty"`
 }
@@ -185,6 +201,8 @@ type Decision struct {
 	Asked string `json:"asked,omitempty"`
 	// Expires is when the daemon stops holding the decision, as RFC 3339, and is left out for a decision it holds until answered.
 	Expires string `json:"expires,omitempty"`
+	// Class is the grant class of grantClasses that a permission of the master's falls in, if any.
+	Class string `json:"class,omitempty"`
 
 	// stalled marks a decision whose long wait on the user the master has heard of.
 	stalled   bool

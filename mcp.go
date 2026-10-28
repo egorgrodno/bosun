@@ -59,6 +59,15 @@ While it is on, bosun parks what would wait on the user, such as the master's pu
 
 Turning it off returns the list of what was parked, the one whose approval unblocks the most first. Show it to the user, and pass on what they want done with each item to the master with tell_master. A parked call was denied, so the master runs it again, or resumes the worker that made it. When the user turns it off themselves, as with bosun away off, bosun hands you the same list as a prompt.`
 
+	grantHelp = `Give a standing grant when the user asks ahead of time that bosun settle a class of the master's calls without them, such as "push whatever you merge tonight". Call it on their word alone, quoting it exactly from their latest message. A grant acts only while away mode is on, and ends at until or when revoked. bosun status lists the grants.
+
+The classes, each one the master's own permission, which would otherwise wait on the user:
+- push: the master's push to a remote of the repository, as one whole command with nothing chained or piped, from a repository whose git setup is as bosun recorded it. A force push, deleting a ref and a push to a URL stay with the user.
+- rebuild: the master's nixos-rebuild test or build of /etc/nixos itself, or nxt or nxc, as one whole command.
+No grant covers anything else, such as a worker's call, a reserved action on the user's list or a question. Tell the user so when they ask for more.`
+
+	revokeHelp = "End a standing grant when the user asks, quoting their words exactly from their latest message."
+
 	transcriptHelp = `Show the last turns of a session's conversation: the prompt that began each turn, the session's text, and a line for each tool call, oldest first. Use it to answer what a session is doing or did, after status names the sessions. A turn's tool results do not show.`
 
 	// The read tools ride on every request of every session, so their descriptions stay short. status holds the scope and the reason once.
@@ -89,6 +98,7 @@ Once you have merged every worker and an hour has passed since your last turn, b
 When the user leaves the fleet to work without them, as overnight, they turn on the away mode, and each batch next_event returns begins with a line that says so. Until a batch comes without that line:
 - escalate and notify reach nobody. bosun parks what they get on a list for the user's return, and denies a parked permission or answers a parked question with a note that it waits for the user. Escalate what needs the user as you would, then move on: the user gets the list once they are back.
 - Your own permissions and the reserved actions on the user's list park the same way, such as a push of yours. Do not try them again, nor another way to the same end.
+- The away line may name standing grants of the user's, such as one for your pushes. bosun allows a call of yours that a grant covers, run exactly as the line describes it.
 - Carry on with everything else. Decide and reply as you would. Merge on into the local checkout rather than wait on a push, and start the next piece of work on what merged. A worker whose call was parked carries on with the rest of its task, and its turn_end says what waits.
 - Answer tells with tell_desk as you would: the desk keeps your answers for the user, and without a desk they park.
 
@@ -172,6 +182,15 @@ func roleTools(node string) []tool {
 			{"away", awayHelp, object([]string{"on", "words"}, map[string]any{
 				"on":    map[string]any{"type": "boolean", "description": "true when the user leaves, false when they are back."},
 				"words": str("The user's words that say so, quoted exactly from their latest message."),
+			})},
+			{"grant", grantHelp, object([]string{"class", "until", "words"}, map[string]any{
+				"class": str("push or rebuild."),
+				"until": str("When it ends, at most a day away: a time of day such as 09:00, which means its next coming, or a duration such as 8h."),
+				"words": str("The user's words that ask for it, quoted exactly from their latest message."),
+			})},
+			{"revoke", revokeHelp, object([]string{"id", "words"}, map[string]any{
+				"id":    str("The grant's id, such as g1, as status shows it."),
+				"words": str("The user's words that ask for it, quoted exactly from their latest message."),
 			})},
 		}
 	}
@@ -398,6 +417,8 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		Answer      string   `json:"answer"`
 		Allow       *bool    `json:"allow"`
 		On          *bool    `json:"on"`
+		Class       string   `json:"class"`
+		Until       string   `json:"until"`
 		Message     string   `json:"message"`
 		Note        string   `json:"note"`
 		Text        string   `json:"text"`
@@ -465,6 +486,10 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		if *args.On {
 			req.Name = "on"
 		}
+	case "grant":
+		req.Name, req.Text, req.Words = args.Class, args.Until, args.Words
+	case "revoke":
+		req.Words = args.Words
 	case "tell_master", "tell_desk":
 		// The daemon passes a tell on by who sends it.
 		req.Op, req.Text = "tell", args.Text
@@ -506,10 +531,10 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		}
 		data, err := json.MarshalIndent(resp.Events, "", "  ")
 		if resp.Away != nil {
-			return awayLine(resp.Away) + "\n\n" + string(data), err
+			return awayLine(resp.Away, resp.Grants) + "\n\n" + string(data), err
 		}
 		return string(data), err
-	case "escalate", "notify", "away":
+	case "escalate", "notify", "away", "grant", "revoke":
 		return resp.Text, nil
 	}
 	return "Done.", nil

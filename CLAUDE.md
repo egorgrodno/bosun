@@ -21,7 +21,7 @@ One binary carries every part:
 | `bosun mcp` | the stdio MCP server each session starts, relaying to the daemon |
 | `bosun hook` | every hook each session runs |
 | `bosun tui` | the terminal frontend |
-| `bosun status`, `log`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `compact`, `clear`, `spawn`, `kill`, `pause`, `unpause`, `away`, `model`, `attach`, `watch`, `conversation`, `follow` | the command-line frontend |
+| `bosun status`, `log`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `compact`, `clear`, `spawn`, `kill`, `pause`, `unpause`, `away`, `grant`, `revoke`, `model`, `attach`, `watch`, `conversation`, `follow` | the command-line frontend |
 
 The daemon holds each session's parent and the queue of decisions waiting on an answer. It reads each session's state from `claude agents --json --all`, which also lists sessions bosun did not start.
 
@@ -171,6 +171,7 @@ A rebuild on the allowlist that shares its command with others, as in `nxt 2>&1 
 | `transcript` | desk | shows a session's last turns: each prompt, its text and a line per tool call |
 | `answer` | desk | gives your answer to a decision that waits on you, once you have said yes to it |
 | `away` | desk | turns the away mode on or off, on your words quoted from your latest message |
+| `grant`, `revoke` | desk | gives or ends a standing grant, on your words quoted from your latest message |
 | `tell_desk` | master | answers the desk, or the user when there is no desk |
 | `next_event` | master | blocks until a worker asks or needs a permission, a child of the master ends a turn or exits, a worker goes quiet or the user sits on a decision, or a `tell` comes from the desk, or from a frontend when there is no desk |
 | `reply` | master | answers a question |
@@ -202,13 +203,26 @@ The decision rides in `text`, not in `decision`, since `pendingLocked` drops an 
 
 ## Away mode
 
-**Away mode parks what would wait on you.** `bosun away on`, the tui or the desk's `away` tool turns it on, and `bosun away off` turns it off. The desk acts only on your words, quoted from your latest message. The mode lives in `state.json`, so it outlasts a restart and a cleared master. While it is on, every decision that would wait on you parks instead of opening. That covers the master's and the desk's own permissions, reserved actions on your list, escalations and every notice, a `tell_desk` without a desk included. A notice for a permission left in its session's own prompt still opens, since only an answer there settles it. Turning the mode on parks the permissions and questions already waiting on you.
+**Away mode parks what would wait on you.** `bosun away on`, the tui or the desk's `away` tool turns it on, and `bosun away off` turns it off. The desk acts only on your words, quoted from your latest message. The mode lives in `state.json`, so it outlasts a restart and a cleared master. While it is on, every decision that would wait on you parks instead of opening, unless a standing grant allows it. That covers the master's and the desk's own permissions, reserved actions on your list, escalations and every notice, a `tell_desk` without a desk included. A notice for a permission left in its session's own prompt still opens, since only an answer there settles it. Turning the mode on parks the permissions and questions already waiting on you.
 
 **Parked means answered at once.** A parked permission is denied, and a parked question answered, with a note that it waits for your return. The session then goes on with other work, where a held `PreToolUse` would block it for up to an hour. A parked notice waits on the list. The frontends get a `parked` event and no `decision` event, so nothing notifies you.
 
 **The master learns of it from each batch.** `next_event`'s result begins with a line that says so, and `escalate` and `notify` answer that they parked. The rules live in the tool descriptions, as "Upgrades" requires. The master escalates what needs you as it would, and merges on into the local checkout rather than wait on a push.
 
 **Turning it off hands you one list.** The list groups identical requests and puts first what unblocks the most: pushes, then the larger groups. It goes into one notice, which `bosun status` and the tui show until you dismiss it. The desk gets it as a `back` event, the way it gets a tell. A desk that turned the mode off itself gets no `back` event, since the tool's result holds the list. A `back` event counts as no message of yours. A desk that cannot take it drops it, since the notice holds the list. A parked call was denied, so acting on an item means telling the master to run it again.
+
+### Standing grants
+
+**A grant settles a class of the master's own permissions while you are away.** `bosun grant push 09:00 'push what merges'`, `n` in the tui or the desk's `grant` tool gives one, and `bosun revoke g1`, `x` on it in the tui or the desk's `revoke` tool ends it. The desk acts only on your words, as for the away mode. A grant ends at its `until`, at most a day away, and lasts across a restart in `state.json`. It acts only while away mode is on: `parkLocked` asks `grantLocked` first, which allows the decision instead of parking it. With away mode off, the decision waits on you as before.
+
+**The classes are few and checked from the command alone.** Each covers a permission of the master's, which waits on you since nobody sits above the master:
+
+| Class | Covers, as one whole command of plain words | Why |
+|---|---|---|
+| `push` | `git [-C <repo>] push [<remote> [<refspec>…]]`, with no option but `-u`, `--set-upstream`, `--follow-tags`, `-q`, `-v` or `--porcelain`, to a remote the repository lists, from a repository whose git setup matches its record | the overnight stall: the master's push after its merges, which must run outside the sandbox |
+| `rebuild` | `nixos-rebuild test` or `build` with `--flake` on `/etc/nixos` itself, optionally with `#host` and `--sudo`, and `nxt` and `nxc` | the master may already allow a worker's rebuild, and `/etc/nixos` holds only what it merged. A worktree's configuration stays out |
+
+A grant never covers a worker's call, a question, a notice or a decision marked `userOnly`, whatever its class. The daemon reads the class in the hook, outside the lock, since a push runs git, and keeps it in the decision's `class`. A command that chains, pipes or redirects matches no class, so each batch's away line names the live grants and the exact form each takes, and the master runs the call that way.
 
 ## Sleep lock
 
@@ -355,7 +369,7 @@ The daemon refuses each of these ops from a request that names a node, as every 
 
 ## Frontends
 
-Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `compact`, `clear`, `spawn`, `kill`, `pause`, `unpause`, `away`, `model`, `attach`, `attached`, `transcript`, `conversation`, `follow`. Every rule lives in the daemon.
+Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `compact`, `clear`, `spawn`, `kill`, `pause`, `unpause`, `away`, `grant`, `revoke`, `model`, `attach`, `attached`, `transcript`, `conversation`, `follow`. Every rule lives in the daemon.
 
 A decision's `asked` is when it opened, as RFC 3339, and a frontend may show its age. Its `expires` is when the daemon stops holding it, as RFC 3339, for a frontend's countdown. Only a permission that is not a reserved action expires, `promptAfter` after `asked`, and then the daemon leaves it to the session's own prompt and opens a notice. A reserved action, a question and a notice carry no `expires`: a reserved action's hook denies the call itself before its timeout, and the others wait until answered. After a restart, a decision whose request has not come back expires 30 seconds after the start, or at its own deadline if that comes sooner, since the daemon then settles it or leaves it to the session's prompt. A request that comes back restores the decision's own `expires`, and the daemon sends the decision again. A decision's `reserved` holds the reason it is a reserved action, such as `a force push`. Its `userOnly` marks an action on your list. A notice's `prompt` marks a permission waiting in its session's own prompt, with the call in `tool` and `input`, which `approve` and `deny` answer there.
 
@@ -364,6 +378,8 @@ A frontend should show the `answered` event and the snapshot's `answered`: each 
 The snapshot's `paused`, and the `paused` and `unpaused` events, show a pause. A session's `paused` marks a turn that `unpause` resumes.
 
 The snapshot's `away` is `{"since":…,"by":"user","words":"off to bed"}` while away mode is on, and is left out otherwise. Its `parked` lists what parked since, each as `{"decision":…,"why":"it is the master's own permission","at":…}`. An `away` event starts the mode, in its `away`, with an empty list. Each `parked` event adds the item in its `parked`. A `back` event ends both. `away` takes `name` `on` or `off`, and `words`, as `{"op":"away","name":"on","words":"off to bed"}`.
+
+The snapshot's `grants` lists the grants that have not ended, each as `{"id":"g1","class":"push","since":…,"until":…,"by":"user","words":…}`. A `grants` event carries the whole list again after each change. `grant` takes `name`, the class, `text`, when it ends (`09:00`, `8h` or RFC 3339), and `words`, as `{"op":"grant","name":"push","text":"09:00"}`. `revoke` takes the grant's `id`.
 
 A session's `status` comes from Claude Code's listing, which shows it busy after its turn ended while a background command still runs, and for a few seconds after any turn. From a `Stop` or `StopFailure` until a hook of a new turn or a listing that shows the session idle or stopped, the snapshot and the `sessions` event show it `idle` with no `state`, and `say` and `interrupt` treat it as idle. The daemon's own record keeps the listing's status.
 
@@ -391,7 +407,7 @@ A session's `activity` shows what it does: `tool` with `arg`, the main argument 
 |---|---|---|
 | `decision` | a decision or notice began to wait on you | `decision`, `rule`, `match`, `route` |
 | `escalated` | the master passed a decision to you | `decision`, `text`: the master's note, `rule`, `match`, `route` |
-| `settled` | a decision was settled | `decision`, and `behavior`, `text`, `words` or `withdrawn` with `cause`, `rule`, `match`, `route`, `waited` |
+| `settled` | a decision was settled | `decision`, and `behavior`, `text`, `words` or `withdrawn` with `cause`, `rule`, `match`, `route`, `waited`, and `grant` for one a grant allowed |
 | `tell` | the user, the desk or the master told `node`, `master` or `desk` | `text` |
 | `message` | session `from` messaged `node` | `text` |
 | `spawned` | the user or a session started worker `node` | `text`: the prompt, `repo`, `model`, `effort` |
@@ -404,6 +420,7 @@ A session's `activity` shows what it does: `tool` with `arg`, the main argument 
 | `back` | the user or the desk turned away mode off | `text`: what the switch answered, with the list of what parked |
 | `sleeplock` | bosun took the sleep lock, let go of it, or could not hold it | `text`, `error` |
 | `parked` | bosun parked `node`'s decision while the user was away | `decision`, `text`: why it would have reached the user |
+| `granted`, `revoked`, `expired` | the user or the desk gave or ended a grant, or its time ran out | `grant`, `text`: the user's words |
 | `model` | the user switched the master or the desk | `model`, `effort` |
 | `turn_end`, `exit` | worker `node` ended its turn, or stopped in it, other than by a kill | `text` |
 | `stalled` | worker `node` went quiet in its turn, or a decision of `node` waited long on the user (see Stalls) | `text` |
@@ -474,7 +491,7 @@ Each leads with the queue of decisions waiting on you, above the tree. The desk 
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
 - **Restarts and pauses.** Only a fake `claude` has run the restart handling and the pause. No real reboot, crash or pause has been measured. The daemon reads transcripts in the 2.1.310 format. A `claude stop` in a turn runs no `Stop` (see "Inside a session"), and the daemon ignores a `Stop` from a session that a pause stopped.
 - **Sleep lock.** Only a fake `systemd-inhibit` has run it, and no real daemon has held a lock. Whether the real one keeps its lock on the process that `sleep infinity` replaces, so that the kill of the process group ends it, and whether the lock outlives a crashed daemon, is unmeasured.
-- **Away mode.** Only the fakes have run it. Whether a real master follows its descriptions, escalating as it would and carrying on, and whether a worker given a parked denial goes on with the rest of its task without retrying, is unmeasured.
+- **Away mode.** Only the fakes have run it. Whether a real master follows its descriptions, escalating as it would and carrying on, and whether a worker given a parked denial goes on with the rest of its task without retrying, is unmeasured. Only the fakes have run a grant. Whether a real master runs its push in the form the away line gives, rather than as `cd … && git push … | tail`, is unmeasured.
 - **The desk.** No real desk has run. A probe session inside the master's directory measured the desk's trust, `autoMemoryDirectory` from `--settings` and the clear's transcript, and nothing more. Handing an idle desk its queue stops and resumes it, as waking the master does. Whether a `claude attach` open on it survives that is unmeasured. That a file tool's sensitive write asks even in auto mode comes from the 2.1.310 binary. The desk's answers assume that `UserPromptSubmit` carries each prompt you type, verbatim. No real desk has shown that. When it runs for a prompt typed while the desk is in its turn is unmeasured, and the daemon times the prompt by it. The desk's switch rests on the master's: no real desk has moved to a copy.
 - **The open master and its subagents.** No real `claude attach` has run under the `attached` hold. While you have the master open, it sleeps ten seconds after its last event, so a wake stops and resumes it under your `claude attach`. Whether the attach survives that is unmeasured. That a stop ends a background subagent, and that its result waits for the running tool call to return, are assumed, not measured.
 - **Reserved actions at the master.** Only the tests' fake hooks have sent one. Whether a file tool writes through a symlink, as the check assumes, is unmeasured.

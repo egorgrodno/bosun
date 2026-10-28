@@ -162,6 +162,9 @@ type daemon struct {
 	// away holds while the user is away, and parked what would have waited on them since it went on.
 	away   *Away
 	parked []Parked
+	// grants are the user's standing grants that have not ended, and nextGrant numbers the last one given.
+	grants    []Grant
+	nextGrant int
 	// sleep is the sleep lock the daemon holds while the fleet works.
 	sleep sleepLock
 }
@@ -201,6 +204,8 @@ type savedState struct {
 	Paused    bool            `json:"paused,omitempty"`
 	Away      *Away           `json:"away,omitempty"`
 	Parked    []Parked        `json:"parked,omitempty"`
+	Grants    []Grant         `json:"grants,omitempty"`
+	NextGrant int             `json:"nextGrant,omitempty"`
 }
 
 // savedDecision is a decision with what the protocol leaves out of it.
@@ -341,6 +346,7 @@ func runDaemon(args []string) error {
 			}
 			d.recoverLimited(time.Now())
 			d.expireOrphans(time.Now())
+			d.expireGrants(time.Now())
 			d.checkStalls(time.Now())
 			d.checkSleepLock(time.Now())
 		}
@@ -411,6 +417,7 @@ func (d *daemon) load() error {
 	}
 	d.events, d.taken, d.takenKey, d.paused, d.answered = st.Events, st.Taken, st.TakenKey, st.Paused, st.Answered
 	d.away, d.parked = st.Away, st.Parked
+	d.grants, d.nextGrant = st.Grants, st.NextGrant
 	for _, sd := range st.Decisions {
 		dec := sd.Decision
 		dec.toolUseID, dec.key, dec.opened, dec.rule, dec.match = sd.ToolUseID, sd.Key, sd.Opened, sd.Rule, sd.Match
@@ -436,7 +443,7 @@ func (d *daemon) saveLocked() {
 	if d.stopping {
 		return
 	}
-	st := savedState{NextID: d.nextID, Events: d.events, Taken: d.taken, TakenKey: d.takenKey, Answered: d.answered, Paused: d.paused, Away: d.away, Parked: d.parked}
+	st := savedState{NextID: d.nextID, Events: d.events, Taken: d.taken, TakenKey: d.takenKey, Answered: d.answered, Paused: d.paused, Away: d.away, Parked: d.parked, Grants: d.grants, NextGrant: d.nextGrant}
 	for _, n := range d.sortedLocked() {
 		st.Sessions = append(st.Sessions, n)
 	}
@@ -705,6 +712,7 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 			resp.Events = d.nextEvent(ctx, r.Key)
 			d.mu.Lock()
 			resp.Away = d.away
+			resp.Grants = slices.Clone(d.grants)
 			d.mu.Unlock()
 		}
 	case "approve", "deny":
@@ -729,6 +737,10 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 		} else {
 			resp.Text, err = d.setAway(r.Node, r.Name == "on", r.Words)
 		}
+	case "grant":
+		resp.Text, err = d.grant(r.Node, r.Name, r.Text, r.Words)
+	case "revoke":
+		resp.Text, err = d.revoke(r.Node, r.ID, r.Words)
 	case "dismiss":
 		resp.Text, err = d.answer(r.Node, r.ID, r.Words, "notice", answer{})
 	case "tell":
@@ -803,10 +815,16 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 		return resp, fmt.Errorf("hook input: %w", err)
 	}
 	var reserved reservation
-	// The check may run git, which a worker's repository can hold up, so it runs outside the lock.
-	if in.Event == "PreToolUse" {
+	var class string
+	// The checks may run git, which a worker's repository can hold up, so they run outside the lock.
+	if in.Event == "PreToolUse" || in.Event == "PermissionRequest" && node == masterNode {
 		if g := d.gate(node, in.Cwd); g != nil {
-			reserved = g.reserved(in.ToolName, in.ToolInput)
+			if in.Event == "PreToolUse" {
+				reserved = g.reserved(in.ToolName, in.ToolInput)
+			}
+			if node == masterNode {
+				class = g.grantClass(in.ToolName, in.ToolInput)
+			}
 		}
 	}
 	d.mu.Lock()
@@ -886,7 +904,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 			if reserved.user || !isWorker(node) {
 				holder = "user"
 			}
-			dec = &Decision{Kind: "permission", Node: node, Holder: holder, Reserved: reserved.reason, UserOnly: reserved.user, Tool: in.ToolName, Input: in.ToolInput, Refused: n.refused, toolUseID: in.ToolUseID, rule: reserved.rule, match: reserved.match, key: key}
+			dec = &Decision{Kind: "permission", Node: node, Holder: holder, Reserved: reserved.reason, UserOnly: reserved.user, Tool: in.ToolName, Input: in.ToolInput, Refused: n.refused, Class: class, toolUseID: in.ToolUseID, rule: reserved.rule, match: reserved.match, key: key}
 		}
 		if in.ToolName != "SendMessage" {
 			break
@@ -934,7 +952,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 		if !isWorker(node) {
 			holder = "user"
 		}
-		dec = &Decision{Kind: "permission", Node: node, Holder: holder, Tool: in.ToolName, Input: in.ToolInput, Refused: n.refused, toolUseID: n.match(in.ToolName, in.ToolInput), key: key}
+		dec = &Decision{Kind: "permission", Node: node, Holder: holder, Tool: in.ToolName, Input: in.ToolInput, Refused: n.refused, Class: class, toolUseID: n.match(in.ToolName, in.ToolInput), key: key}
 	case "PermissionDenied":
 		n.refused = cmp.Or(in.Reason, "it gave no reason")
 	case "PostToolUse", "PostToolUseFailure":
@@ -2088,7 +2106,7 @@ func (d *daemon) broadcastSessionsLocked() {
 }
 
 func (d *daemon) snapshotLocked() Response {
-	resp := Response{Type: "snapshot", Sessions: []Session{}, Decisions: []Decision{}, Paused: d.paused, Away: d.away, Parked: d.parked}
+	resp := Response{Type: "snapshot", Sessions: []Session{}, Decisions: []Decision{}, Paused: d.paused, Away: d.away, Parked: d.parked, Grants: slices.Clone(d.grants)}
 	resp.SleepLock = d.sleep.shown
 	for _, n := range d.sortedLocked() {
 		resp.Sessions = append(resp.Sessions, n.public())
