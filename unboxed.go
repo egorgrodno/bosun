@@ -35,7 +35,10 @@ func (g gate) outside(script string) reservation {
 // It trusts that a path is only read when it understands every command of the script. One command it does not, such as xargs fed by a pipe, may write any path the others name.
 func (g gate) userUnboxed(script, dir string) reservation {
 	cmds := simpleCommands(script)
-	sure := !slices.ContainsFunc(cmds, func(c simple) bool { return !g.list.understood(c.argv) })
+	names, all, sets := rebinds(cmds)
+	g.list = g.list.unbound(names, all)
+	// A variable set in the environment can make a reader run a command, as RIPGREP_CONFIG_PATH or LD_PRELOAD does.
+	sure := !sets && !slices.ContainsFunc(cmds, func(c simple) bool { return !g.list.understood(c.argv) })
 	for _, cmd := range cmds {
 		argv := cmd.argv
 		var words []string
@@ -100,6 +103,84 @@ func (g gate) userUnboxed(script, dir string) reservation {
 	return reservation{}
 }
 
+// setters are the builtins that set the variables their arguments name, and nameref marks the option that makes one variable stand for another.
+var setters = []string{"export", "declare", "typeset", "local", "readonly", "let", "unset", "read", "mapfile", "readarray", "getopts", "vared", "for", "select"}
+
+// rebinds says which variables cmds, and the scripts they run, may set: by an assignment, a builtin such as export, read or printf -v, or a for loop.
+// all marks a command that may set any, such as source or a nameref, and sets one that sets a variable at all.
+func rebinds(cmds []simple) (names []string, all, sets bool) {
+	for _, c := range cmds {
+		argv := c.argv
+		i := 0
+		for ; i < len(argv) && assignment.MatchString(argv[i]); i++ {
+			names, sets = append(names, varName(argv[i])), true
+		}
+		if i == len(argv) {
+			continue
+		}
+		args := argv[i+1:]
+		switch name := filepath.Base(argv[i]); {
+		case name == "source", name == ".":
+			return nil, true, true
+		case name == "env":
+			for _, a := range args {
+				if assignment.MatchString(a) {
+					names, sets = append(names, varName(a)), true
+				}
+			}
+		case name == "printf":
+			if j := slices.Index(args, "-v"); j >= 0 && j+1 < len(args) {
+				names, sets = append(names, args[j+1]), true
+			}
+		case slices.Contains(setters, name):
+			sets = true
+			for _, a := range args {
+				switch {
+				case strings.HasPrefix(a, "-") && strings.ContainsRune(a, 'n') && name != "read" && name != "unset":
+					return nil, true, true
+				case !strings.HasPrefix(a, "-"):
+					names = append(names, varName(a))
+				}
+			}
+		}
+		for j := range argv {
+			if s, _, _, ok := inner(argv, j); ok {
+				n, a, set := rebinds(simpleCommands(s))
+				if a {
+					return nil, true, true
+				}
+				names, sets = append(names, n...), sets || set
+			}
+		}
+	}
+	return names, false, sets
+}
+
+// varName is the variable an assignment or a builtin's argument names, without its value or index.
+func varName(a string) string {
+	if i := strings.IndexAny(a, "+=["); i >= 0 {
+		return a[:i]
+	}
+	return a
+}
+
+// unbound is l without the values of the variables in names, or of every variable when all is set, for a script that may set them. ~ follows HOME.
+func (l userList) unbound(names []string, all bool) userList {
+	moves := []string{"PWD", "OLDPWD", "CDPATH"}
+	if !all && !slices.ContainsFunc(names, func(n string) bool { _, ok := l.vars[n]; return ok || slices.Contains(moves, n) }) {
+		return l
+	}
+	vars := map[string]string{}
+	for k, v := range l.vars {
+		if !all && !slices.Contains(names, k) {
+			vars[k] = v
+		}
+	}
+	l.vars = vars
+	l.moved = l.moved || all || slices.ContainsFunc(names, func(n string) bool { return slices.Contains(moves, n) })
+	return l
+}
+
 // uses says whether a word that expands to paths, used as a in a command run in dir, names a path on the user's list that only the user may let it use: any it may write, and a credential it reads.
 func (g gate) uses(paths []string, dir string, a access) reservation {
 	if a == text {
@@ -120,8 +201,8 @@ func (g gate) uses(paths []string, dir string, a access) reservation {
 // couldLand reports whether path p, which holds a variable, a substitution or a ~ that bosun cannot expand, may lead to the user's list: through what comes before the unknown part, or after it.
 // A path that begins with the unknown part may lead anywhere, so for a sure write, which sure is, it counts whatever follows.
 func (g gate) couldLand(p, dir string, sure bool) bool {
-	// A relative path after a cd bosun could not follow lies anywhere.
-	if dir == "" && sure && !filepath.IsAbs(p) {
+	// A relative path after a cd bosun could not follow lies anywhere, and so may what zsh's ** matches, through links at any depth.
+	if sure && (dir == "" && !filepath.IsAbs(p) || strings.Contains(p, "**")) {
 		return true
 	}
 	i := strings.IndexAny(p, "$`")

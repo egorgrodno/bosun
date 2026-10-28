@@ -128,6 +128,9 @@ The check holds the call until the answer and returns `allow` or `deny`. A `PreT
 - a copier passes only options that keep its last argument the destination and its sources unchanged: not `-t`, `-S`, `-m`, `-e`, `--remove-source-files`, or cp's `-l` and `-s`
 - `find` has no action such as `-delete` or `-exec`, and `rg` no `--pre` or `--hostname-bin`
 - a `cd` leads where bosun can follow, with no option
+- no command of the script sets a variable: no assignment, `export`, `declare`, `read`, `printf -v`, `unset`, `for` or `source`. The environment can make a reader run a command, as `RIPGREP_CONFIG_PATH` and `LD_PRELOAD` do.
+
+A script that may set a variable bosun expands, such as `HOME`, `TMPDIR`, `USER`, an `XDG_` folder, `PWD` or `CDPATH`, also loses that expansion. Its `~`, `$TMPDIR` or relative `cd` then counts as a path bosun cannot resolve. A glob counts as each path it matches, and each folder its folder part matches, through links. zsh's `**` counts as unresolved.
 
 In a script bosun understands, `accesses` in `unboxed.go` sorts each word:
 

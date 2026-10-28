@@ -708,6 +708,32 @@ func TestReservedReviewBypasses(t *testing.T) {
 		"bosun log > ~/.claude/settings.json",
 		"exec 3>~/.claude/settings.json",
 		">~/.claude/settings.json cat x",
+		// Variables bosun expands, set by the script itself.
+		"TMPDIR=~/.claude cp x $TMPDIR/settings.json",
+		"TMPDIR=~/.claude; cp x $TMPDIR/settings.json",
+		"TMPDIR=$(dirname ~/.claude/x); cp evil $TMPDIR/settings.json",
+		"TMPDIR=`dirname ~/.claude/x`; cp evil $TMPDIR/settings.json",
+		"HOME=$(dirname ~/.claude/x); cp evil ~/settings.json",
+		"HOME=$(dirname ~/.local/state/bosun/nodes/b/x); cp evil ~/settings.json",
+		"printf -v HOME %s /home/u/.claude; cp evil ~/settings.json",
+		"export HOME=$(dirname ~/.claude/x) && cp evil ~/settings.json",
+		"declare HOME=/home/u/.claude; cp evil ~/settings.json",
+		"read HOME < f; cp evil ~/settings.json",
+		"unset HOME; cp evil ~/settings.json",
+		"for HOME in /home/u/.claude; do cp evil ~/settings.json; done",
+		"declare -n h=HOME; h=/home/u/.claude; cp evil ~/settings.json",
+		". ./vars.sh; cp evil $TMPDIR/settings.json",
+		"eval 'TMPDIR=/home/u/.claude'; cp evil $TMPDIR/settings.json",
+		"CDPATH=/home/u; cd .claude && cp evil settings.json",
+		"PWD=/home/u/.claude; cp evil $PWD/settings.json",
+		// Readers the environment configures.
+		"RIPGREP_CONFIG_PATH=./rc rg x ~/.claude",
+		"export RIPGREP_CONFIG_PATH=./rc; rg x ~/.claude",
+		"env RIPGREP_CONFIG_PATH=./rc rg x ~/.claude",
+		"LD_PRELOAD=./evil.so cat ~/.local/state/bosun/log.jsonl",
+		"LESSOPEN='|./p.sh %s' cat ~/.claude/settings.json",
+		// zsh's ** may reach a link at any depth.
+		"cp evil **/settings.json",
 	} {
 		input, _ := json.Marshal(map[string]any{"command": cmd, "dangerouslyDisableSandbox": true})
 		if got := g.reserved("Bash", input); !got.user {
@@ -720,6 +746,57 @@ func TestReservedReviewBypasses(t *testing.T) {
 		if got := g.reserved("Bash", input); bare(got) != unboxed {
 			t.Errorf("unsandboxed %q: reserved = %+v, want the master's", cmd, got)
 		}
+	}
+}
+
+// A path through a real link, a glob that matches one, or a cd into one counts as the link's target.
+func TestReservedUnsandboxedLinks(t *testing.T) {
+	h := t.TempDir()
+	wt, scratch := filepath.Join(h, "wt"), filepath.Join(h, "state/nodes/a/tmp/claude-1000")
+	for _, dir := range []string{wt, scratch, filepath.Join(h, ".claude"), filepath.Join(h, "state/nodes/b")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(h, ".claude/settings.json"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for link, target := range map[string]string{
+		filepath.Join(wt, "link"):   filepath.Join(h, ".claude"),
+		filepath.Join(scratch, "s"): "../../../b/settings.json",
+		filepath.Join(scratch, "d"): filepath.Join(h, ".claude"),
+	} {
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatal(err)
+		}
+	}
+	g := gate{cwd: wt, writable: []string{wt}, list: newUserList(h, filepath.Join(h, ".claude"), filepath.Join(h, "state"), noEnv)}
+	g.list.vars["TMPDIR"] = scratch
+	for _, cmd := range []string{
+		"cp evil link/settings.json",
+		"cp evil ./link",
+		"cat evil > link/settings.json",
+		"cp evil $TMPDIR/s",
+		"cp evil $TMPDIR/d/settings.json",
+		"cp -r evil $TMPDIR/d",
+		"cd link && cp evil settings.json",
+		"cd $TMPDIR/d && cp evil settings.json",
+		"cp evil link/sub/../settings.json",
+		"cp evil lin?/settings.json",
+		"cp evil l*/settings.json",
+		"cp evil [l]ink/settings.json",
+		"cp evil l*/new.json",
+		"cp evil $TMPDIR/[d]/settings.json",
+	} {
+		input, _ := json.Marshal(map[string]any{"command": cmd, "dangerouslyDisableSandbox": true})
+		if got := g.reserved("Bash", input); !got.user {
+			t.Errorf("unsandboxed %q: reserved = %+v, want the user's", cmd, got)
+		}
+	}
+	// A glob that matches no link stays the master's.
+	input, _ := json.Marshal(map[string]any{"command": "rm -rf $TMPDIR/build*", "dangerouslyDisableSandbox": true})
+	if got := g.reserved("Bash", input); bare(got) != unboxed {
+		t.Errorf("unsandboxed glob in the scratch folder: reserved = %+v, want the master's", got)
 	}
 }
 
@@ -753,7 +830,6 @@ func TestReservedUnsandboxedReads(t *testing.T) {
 		"stat ~/.local/state/bosun/bosun",
 		"readlink -f ~/.local/state/bosun/bosun",
 		"timeout 5 cat ~/.local/state/bosun/log.jsonl",
-		"FOO=1 cat ~/.local/state/bosun/log.jsonl",
 		"jq . < ~/.local/state/bosun/state.json",
 		// Reading Claude Code's configuration and the rest of the list.
 		"cat ~/.claude/settings.json",

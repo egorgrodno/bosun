@@ -467,10 +467,30 @@ func (g gate) names(word, dir string) string {
 		return g.list.holds(word, false)
 	}
 	path = filepath.Clean(path)
+	if what := g.linked(path); what != "" {
+		return what
+	}
+	// A glob may match a link, so each path it matches counts, and so does each folder its folder part matches, for a file still to be made.
+	if strings.ContainsAny(path, "*?[") {
+		matches, _ := filepath.Glob(path)
+		dirs, _ := filepath.Glob(filepath.Dir(path))
+		for _, d := range dirs {
+			matches = append(matches, filepath.Join(d, filepath.Base(path)))
+		}
+		for _, m := range matches[:min(len(matches), 1000)] {
+			if what := g.linked(m); what != "" {
+				return what
+			}
+		}
+	}
+	return ""
+}
+
+// linked says what on the list path names, or the target of the links along it. A link, such as one a session made in its scratch folder from inside the sandbox, leads a command to its target.
+func (g gate) linked(path string) string {
 	if what := g.nameAt(path); what != "" {
 		return what
 	}
-	// A link, such as one a session made in its scratch folder from inside the sandbox, leads a command to its target.
 	if real := resolve(path); real != path {
 		return g.resolved().nameAt(real)
 	}
@@ -545,6 +565,8 @@ type userList struct {
 	places []place
 	// vars holds the values of the variables a command may name a place by.
 	vars map[string]string
+	// moved marks a script that may set PWD, OLDPWD or CDPATH, so that $PWD and a relative cd lead where bosun cannot tell.
+	moved bool
 	// scratch is the sessions' temporary folders, which hold nothing on the list, with * for the node.
 	scratch []string
 }
@@ -672,7 +694,7 @@ var shellVar = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}|\$([A-Za-z_][A
 func (l userList) words(word, dir string) []string {
 	word = shellVar.ReplaceAllStringFunc(word, func(v string) string {
 		name := strings.Trim(v, "${}")
-		if name == "PWD" && dir != "" {
+		if name == "PWD" && dir != "" && !l.moved {
 			return dir
 		}
 		return cmp.Or(l.vars[name], v)
@@ -685,11 +707,11 @@ func (l userList) words(word, dir string) []string {
 				continue
 			}
 			switch {
-			case w == "~" || strings.HasPrefix(w, "~/"):
-				w = l.home + w[1:]
-			case l.vars["USER"] != "" && (w == "~"+l.vars["USER"] || strings.HasPrefix(w, "~"+l.vars["USER"]+"/")):
-				w = l.home + w[1+len(l.vars["USER"]):]
-			case (w == "~+" || strings.HasPrefix(w, "~+/")) && dir != "":
+			case (w == "~" || strings.HasPrefix(w, "~/")) && l.vars["HOME"] != "":
+				w = l.vars["HOME"] + w[1:]
+			case l.vars["USER"] != "" && l.vars["HOME"] != "" && (w == "~"+l.vars["USER"] || strings.HasPrefix(w, "~"+l.vars["USER"]+"/")):
+				w = l.vars["HOME"] + w[1+len(l.vars["USER"]):]
+			case (w == "~+" || strings.HasPrefix(w, "~+/")) && dir != "" && !l.moved:
 				w = dir + w[2:]
 			}
 			out = append(out, w)
@@ -741,7 +763,7 @@ func braces(s string, limit int) []string {
 // cd is where cd with args leads from dir, or "" when bosun cannot tell.
 func (l userList) cd(dir string, args []string) string {
 	if len(args) == 0 {
-		return l.home
+		return l.vars["HOME"]
 	}
 	if len(args) != 1 || strings.HasPrefix(args[0], "-") {
 		return ""
@@ -753,7 +775,7 @@ func (l userList) cd(dir string, args []string) string {
 	switch w := words[0]; {
 	case filepath.IsAbs(w):
 		return filepath.Clean(w)
-	case dir == "":
+	case dir == "", l.moved:
 		return ""
 	default:
 		return filepath.Join(dir, w)
