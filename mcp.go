@@ -127,10 +127,11 @@ func readTools(node string) []tool {
 		})},
 		{"activity", activityHelp, object([]string{}, map[string]any{"name": nameArg})},
 	}
-	if node != deskNode {
-		t = append([]tool{{"status", readStatusHelp, object([]string{}, map[string]any{})}}, t...)
+	status := readStatusHelp
+	if node == deskNode {
+		status = statusHelp + deskLogHelp
 	}
-	return t
+	return append([]tool{{"status", status, object([]string{}, map[string]any{})}}, t...)
 }
 
 // tools are the tools node's MCP server offers: its role's own, then the read tools.
@@ -144,7 +145,6 @@ func roleTools(node string) []tool {
 			{"tell_master", tellMasterHelp, object([]string{"text"}, map[string]any{
 				"text": str("The instruction, as a spec the master can act on alone."),
 			})},
-			{"status", statusHelp + deskLogHelp, object([]string{}, map[string]any{})},
 			{"transcript", transcriptHelp, object([]string{"name"}, map[string]any{
 				"name":  str("The session's node name, as status shows it."),
 				"turns": map[string]any{"type": "integer", "description": "How many of its last turns to show. 3 when left out."},

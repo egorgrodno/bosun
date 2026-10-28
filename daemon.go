@@ -2943,9 +2943,9 @@ func (d *daemon) transcript(caller, name string, turns int) (string, error) {
 		d.mu.Unlock()
 		return "", fmt.Errorf("no session %q", name)
 	}
-	if in := d.scopeLocked(caller); in != nil && !in[name] {
+	if err := d.checkReadLocked(caller, name); err != nil {
 		d.mu.Unlock()
-		return "", errOutOfScope(name)
+		return "", err
 	}
 	sid, state := cmp.Or(n.Conversation, n.SessionID), sessionState(n.public())
 	d.mu.Unlock()

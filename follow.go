@@ -35,10 +35,10 @@ func (d *daemon) conversation(caller, name, before string, limit int) ConvLine {
 		limit = convLimit
 	}
 	d.mu.Lock()
-	in := d.scopeLocked(caller)
+	err := d.checkReadLocked(caller, name)
 	d.mu.Unlock()
-	if in != nil && !in[name] {
-		line.Error = errOutOfScope(name).Error()
+	if err != nil {
+		line.Error = err.Error()
 		return line
 	}
 	sid, _, err := d.conversationID(name)

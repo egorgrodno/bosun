@@ -160,7 +160,7 @@ func TestDeskTools(t *testing.T) {
 	for _, tool := range tools(deskNode) {
 		names = append(names, tool.Name)
 	}
-	if !slices.Equal(names, []string{"tell_master", "status", "transcript", "answer", "conversation", "log", "activity"}) {
+	if !slices.Equal(names, []string{"tell_master", "transcript", "answer", "status", "conversation", "log", "activity"}) {
 		t.Fatalf("the desk's tools are %q", names)
 	}
 	desk := newMCPServer(deskNode, nil)

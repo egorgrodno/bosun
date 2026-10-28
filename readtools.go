@@ -44,6 +44,14 @@ func (d *daemon) scopeLocked(caller string) map[string]bool {
 	return in
 }
 
+// checkReadLocked returns an error when caller may not read session name.
+func (d *daemon) checkReadLocked(caller, name string) error {
+	if in := d.scopeLocked(caller); in != nil && !in[name] {
+		return errOutOfScope(name)
+	}
+	return nil
+}
+
 // errOutOfScope tells a worker that name lies outside its subtree.
 func errOutOfScope(name string) error {
 	return fmt.Errorf("no session %q in your subtree: you can read yourself and your descendants", name)
@@ -134,22 +142,23 @@ func (d *daemon) readLog(caller string, q LogQuery) ([]Entry, error) {
 func (d *daemon) activityReport(caller, name string) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	in := d.scopeLocked(caller)
 	var nodes []*Session
-	for _, n := range d.sortedLocked() {
-		if in == nil || in[n.Node] {
-			nodes = append(nodes, n)
-		}
-	}
 	if name != "" {
 		n := d.nodes[name]
-		switch {
-		case n == nil:
+		if n == nil {
 			return "", fmt.Errorf("no session %q", name)
-		case in != nil && !in[name]:
-			return "", errOutOfScope(name)
+		}
+		if err := d.checkReadLocked(caller, name); err != nil {
+			return "", err
 		}
 		nodes = []*Session{n}
+	} else {
+		in := d.scopeLocked(caller)
+		for _, n := range d.sortedLocked() {
+			if in == nil || in[n.Node] {
+				nodes = append(nodes, n)
+			}
+		}
 	}
 	var b strings.Builder
 	for _, n := range nodes {
@@ -158,8 +167,8 @@ func (d *daemon) activityReport(caller, name string) (string, error) {
 			b.WriteString(", in its turn")
 		}
 		b.WriteString(".\n")
-		if a := n.Activity; a != nil && activityLine(a) != "" {
-			fmt.Fprintf(&b, "  latest, %s ago: %s\n", time.Since(a.At).Round(time.Second), clip(activityLine(a), 200))
+		if line := activityLine(n.Activity); line != "" {
+			fmt.Fprintf(&b, "  latest, %s ago: %s\n", time.Since(n.Activity.At).Round(time.Second), clip(line, 200))
 		}
 		// pre holds the calls that began and did not end, including one that waits at a permission prompt.
 		calls := make([]string, 0, len(n.pre))
