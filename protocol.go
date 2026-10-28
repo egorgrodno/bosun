@@ -32,6 +32,8 @@ type Request struct {
 	Before string          `json:"before,omitempty"`
 	Limit  int             `json:"limit,omitempty"`
 	Hook   json.RawMessage `json:"hook,omitempty"`
+	// Log picks the entries a log request returns.
+	Log *LogQuery `json:"log,omitempty"`
 	// Words quotes the user's message that the desk's answer to a decision acts on.
 	Words string `json:"words,omitempty"`
 	// Plugins and Connectors are what a spawn adds to the worker's lean start.
@@ -119,6 +121,8 @@ type Entry struct {
 	Repo   string `json:"repo,omitempty"`
 	Model  string `json:"model,omitempty"`
 	Effort string `json:"effort,omitempty"`
+	// Route is how a decision reached its holder: master, escalated, requester, userOnly, prompt or notice. A decision reached the user when Route is neither empty nor master.
+	Route string `json:"route,omitempty"`
 }
 
 // Answered is a decision the desk answered on the user's word: Behavior is allow or deny for a permission, and Text a denial's message or a question's answer.
@@ -246,26 +250,34 @@ func socketPath() string {
 // call sends req to the daemon and waits for its result, giving up when ctx ends.
 func call(ctx context.Context, req Request) (Response, error) {
 	var resp Response
-	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", socketPath())
-	if err != nil {
-		return resp, err
-	}
-	defer conn.Close()
-	stop := context.AfterFunc(ctx, func() { conn.Close() })
-	defer stop()
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
-		return resp, err
-	}
-	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
-		if ctx.Err() != nil {
-			return resp, ctx.Err()
-		}
+	if err := exchange(ctx, req, &resp); err != nil {
 		return resp, err
 	}
 	if resp.Error != "" {
 		return resp, errors.New(resp.Error)
 	}
 	return resp, nil
+}
+
+// exchange sends req to the daemon and decodes the one line it answers with into reply, a *Response or a *ConvLine.
+func exchange(ctx context.Context, req Request, reply any) error {
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", socketPath())
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return err
+	}
+	if err := json.NewDecoder(conn).Decode(reply); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return err
+	}
+	return nil
 }
 
 // reconnectWait bounds how long callAgain waits for a daemon that went away, as one does while it restarts.

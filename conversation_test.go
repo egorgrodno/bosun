@@ -342,7 +342,7 @@ func TestConversationRequest(t *testing.T) {
 	}
 
 	// bosun transcript reads through the same entries.
-	if text, err := d.transcript("a", 1); err != nil || !strings.Contains(text, "> /compact\n") {
+	if text, err := d.transcript("", "a", 1); err != nil || !strings.Contains(text, "> /compact\n") {
 		t.Fatalf("the transcript is %q (%v)", text, err)
 	}
 }

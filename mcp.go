@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -54,6 +55,13 @@ bosun refuses a notice, a decision that waits on the master, a decision of your 
 
 	transcriptHelp = `Show the last turns of a session's conversation: the prompt that began each turn, the session's text, and a line for each tool call, oldest first. Use it to answer what a session is doing or did, after status names the sessions. A turn's tool results do not show.`
 
+	// The read tools ride on every request of every session, so their descriptions stay short. status holds the scope and the reason once.
+	readStatusHelp   = "Show the fleet: decisions waiting, the tree of sessions with state, model and activity, and the latest log entries. Read-only, and it works inside the sandbox, so use it, never bosun status. A worker reads itself and its descendants through this and the other read tools; the master and the desk read everything."
+	conversationHelp = "Show a session's conversation as JSON entries, oldest first: prompts, text, tool calls with results. Use it, never bosun conversation."
+	logHelp          = "Read the event log: decisions and how they were settled, tells, messages, spawns, merges, turn ends. Filter by since, node, kind, who acted (for settled, who settled it) or decisions that reached the user. Use it, never bosun status --json, and for any question about what happened in the run."
+	activityHelp     = "Show what a session is doing now: its latest tool call and the calls still open. Without a name, every session you can read."
+	deskLogHelp      = " For a question about what happened in the run, such as which decisions reached the user, read log."
+
 	tellMasterHelp = `Pass an instruction of the user's on to the master, the session that runs the fleet: it spawns, resumes, merges and stops workers, and settles their decisions. Call it for everything the user asks that would change the fleet or a repository, and never do any of that yourself, by SendMessage to a session or otherwise. The one thing you do yourself is give the user's answer to a decision that waits on them, with answer.
 
 Write it as a spec the master can act on without asking back: what to do, in which repository, what done looks like, and what the user said that settles open choices. The master takes it as the user's own instruction, so pass on only what the user asked for, and ask the user first when you are unsure they want it done.
@@ -99,13 +107,44 @@ Every other reserved action reaches you as a permission with reserved set: a wri
 - any other push, from a repository whose git config, hooks and remotes are as bosun recorded them while no worker was in it. Auto mode decides such a push, so it reaches you only when auto mode asks.`
 )
 
+// readTools are the read-only tools every session has, served by the daemon for the session's node: a worker's reads reach its subtree alone. The desk has its own status.
+func readTools(node string) []tool {
+	nameArg := str("The session's node name, as status shows it.")
+	t := []tool{
+		{"conversation", conversationHelp, object([]string{"name"}, map[string]any{
+			"name":   nameArg,
+			"limit":  map[string]any{"type": "integer", "description": "How many entries, 20 when left out."},
+			"before": str("An entry's id: show the entries before it."),
+		})},
+		{"log", logHelp, object([]string{}, map[string]any{
+			"since":        str("RFC 3339 time, or a duration back from now such as 2h."),
+			"node":         str("Only entries about or by this session."),
+			"kind":         str("Only this kind, such as settled, escalated, decision, say, tell, message, spawned, merged, turn_end."),
+			"by":           str("Only this actor: user, master, desk, worker, session or bosun."),
+			"reached_user": map[string]any{"type": "boolean", "description": "Only entries of decisions that reached the user."},
+			"limit":        map[string]any{"type": "integer", "description": "The latest this many, 50 when left out."},
+			"full":         map[string]any{"type": "boolean", "description": "Show each entry as JSON, with its decision and routing."},
+		})},
+		{"activity", activityHelp, object([]string{}, map[string]any{"name": nameArg})},
+	}
+	if node != deskNode {
+		t = append([]tool{{"status", readStatusHelp, object([]string{}, map[string]any{})}}, t...)
+	}
+	return t
+}
+
+// tools are the tools node's MCP server offers: its role's own, then the read tools.
 func tools(node string) []tool {
+	return append(roleTools(node), readTools(node)...)
+}
+
+func roleTools(node string) []tool {
 	if node == deskNode {
 		return []tool{
 			{"tell_master", tellMasterHelp, object([]string{"text"}, map[string]any{
 				"text": str("The instruction, as a spec the master can act on alone."),
 			})},
-			{"status", statusHelp, object([]string{}, map[string]any{})},
+			{"status", statusHelp + deskLogHelp, object([]string{}, map[string]any{})},
 			{"transcript", transcriptHelp, object([]string{"name"}, map[string]any{
 				"name":  str("The session's node name, as status shows it."),
 				"turns": map[string]any{"type": "integer", "description": "How many of its last turns to show. 3 when left out."},
@@ -330,22 +369,30 @@ func (s *mcpServer) progress(ctx context.Context, token json.RawMessage) {
 
 func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (string, error) {
 	var args struct {
-		Name       string   `json:"name"`
-		Repo       string   `json:"repo"`
-		Model      string   `json:"model"`
-		Effort     string   `json:"effort"`
-		Plugins    []string `json:"plugins"`
-		Connectors bool     `json:"connectors"`
-		Prompt     string   `json:"prompt"`
-		Question   string   `json:"question"`
-		ID         string   `json:"id"`
-		Answer     string   `json:"answer"`
-		Allow      *bool    `json:"allow"`
-		Message    string   `json:"message"`
-		Note       string   `json:"note"`
-		Text       string   `json:"text"`
-		Turns      int      `json:"turns"`
-		Words      string   `json:"words"`
+		Name        string   `json:"name"`
+		Repo        string   `json:"repo"`
+		Model       string   `json:"model"`
+		Effort      string   `json:"effort"`
+		Plugins     []string `json:"plugins"`
+		Connectors  bool     `json:"connectors"`
+		Prompt      string   `json:"prompt"`
+		Question    string   `json:"question"`
+		ID          string   `json:"id"`
+		Answer      string   `json:"answer"`
+		Allow       *bool    `json:"allow"`
+		Message     string   `json:"message"`
+		Note        string   `json:"note"`
+		Text        string   `json:"text"`
+		Turns       int      `json:"turns"`
+		Words       string   `json:"words"`
+		Before      string   `json:"before"`
+		Limit       int      `json:"limit"`
+		Since       string   `json:"since"`
+		Node        string   `json:"node"`
+		Kind        string   `json:"kind"`
+		By          string   `json:"by"`
+		ReachedUser bool     `json:"reached_user"`
+		Full        bool     `json:"full"`
 	}
 	if len(raw) > 0 {
 		if err := json.Unmarshal(raw, &args); err != nil {
@@ -397,6 +444,13 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		req.Op, req.Text = "tell", args.Text
 	case "transcript":
 		req.Name, req.Turns = args.Name, args.Turns
+	case "activity":
+		req.Name = args.Name
+	case "log":
+		req.Log = &LogQuery{Since: args.Since, Node: args.Node, Kind: args.Kind, By: args.By, ReachedUser: args.ReachedUser, Limit: args.Limit}
+	case "conversation":
+		req.Name, req.Before, req.Limit = args.Name, args.Before, cmp.Or(args.Limit, mcpConvLimit)
+		return s.conversation(ctx, req)
 	}
 	send := call
 	if name == "ask" || name == "next_event" {
@@ -410,8 +464,10 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	switch name {
 	case "spawn":
 		return fmt.Sprintf("Started %s, session %s, in %s.", resp.Session.Node, resp.Session.ID, resp.Session.Dir), nil
-	case "ask", "merge", "transcript", "answer":
+	case "ask", "merge", "transcript", "answer", "activity":
 		return resp.Text, nil
+	case "log":
+		return logText(resp.Log, args.Full), nil
 	case "status":
 		return fleetStatus(resp), nil
 	case "tell_master":

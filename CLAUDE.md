@@ -136,7 +136,10 @@ A rebuild on the allowlist that shares its command with others, as in `nxt 2>&1 
 | `merge` | the master and workers | lands a finished worker's branch and removes the worker |
 | `ask` | workers | sends a question to the master and blocks until the answer |
 | `tell_master` | desk | queues the user's instruction for the master |
-| `status` | desk | shows what `bosun status` shows, with each decision and message in full |
+| `status` | every session | shows what `bosun status` shows. The desk's also shows each decision and message in full |
+| `conversation` | every session | shows a session's conversation entries, as `bosun conversation` prints them less the `meta` ones, 20 by default |
+| `log` | every session | reads the log, filtered by `since`, `node`, `kind`, `by` and `reached_user` |
+| `activity` | every session | shows what a session, or each readable one, is doing: its latest activity and its open tool calls |
 | `transcript` | desk | shows a session's last turns: each prompt, its text and a line per tool call |
 | `answer` | desk | gives your answer to a decision that waits on you, once you have said yes to it |
 | `tell_desk` | master | answers the desk, or the user when there is no desk |
@@ -146,6 +149,8 @@ A rebuild on the allowlist that shares its command with others, as in `nxt 2>&1 
 | `resume` | master | gives a worker that ended its turn, or stopped in it, a new prompt, and optionally a new model or effort |
 | `escalate` | master | queues a question or a permission for you |
 | `notify` | master | queues a notice for you, about a problem that is not a decision |
+
+**Every session reads the fleet without leaving the sandbox.** The daemon's socket is hidden inside it, so a session that ran `bosun status` or `bosun conversation` outside the sandbox raised a decision. The read tools reach the daemon through `bosun mcp` instead, and need no decision. The daemon scopes each read by the node that `bosun mcp` names in its request, never by an argument. A worker reads itself and its descendants: `status` leaves out other sessions' decisions, messages and log entries, and shows the worker as the root of its tree. `conversation`, `transcript`, `activity` and a `log` filtered by `node` refuse a session outside that subtree. The master, the desk and a frontend read everything. The tools only read: `say`, `interrupt`, the prompt answers and every use of the control key stay frontend actions. `log` reads the latest 200 entries in memory, and a `reached_user` entry is one whose `route` is set and is not `master`, or for an entry without a route, whose decision waited on or settled with the user. Every description rides on every request, so the master's stay one sentence each.
 
 **The master loops on `next_event`.** It calls `next_event`, handles the event, and calls it again. A `Stop` hook reports a worker's turn end, and the session listing reports a worker that stops in its turn.
 

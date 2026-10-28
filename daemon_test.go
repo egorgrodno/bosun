@@ -2361,7 +2361,7 @@ func TestMCPAskSendsProgress(t *testing.T) {
 	for _, tl := range read()["result"].(map[string]any)["tools"].([]any) {
 		names = append(names, tl.(map[string]any)["name"].(string))
 	}
-	if !slices.Equal(names, []string{"spawn", "ask", "merge"}) {
+	if !slices.Equal(names, []string{"spawn", "ask", "merge", "status", "conversation", "log", "activity"}) {
 		t.Fatalf("a worker lists %v", names)
 	}
 

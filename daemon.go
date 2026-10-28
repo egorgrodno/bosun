@@ -645,7 +645,7 @@ func (d *daemon) handleConn(conn net.Conn) {
 			case "follow":
 				go d.follow(ctx, cancel, o, r.Name, r.Limit)
 			case "conversation":
-				o.send(d.conversation(r.Name, r.Before, r.Limit))
+				o.send(d.conversation(r.Node, r.Name, r.Before, r.Limit))
 			default:
 				o.send(d.handle(ctx, r))
 			}
@@ -696,7 +696,15 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	case "clear":
 		resp.Text, err = d.clearConversation(ctx, r.Node, r.Name)
 	case "transcript":
-		resp.Text, err = d.transcript(r.Name, r.Turns)
+		resp.Text, err = d.transcript(r.Node, r.Name, r.Turns)
+	case "log":
+		var q LogQuery
+		if r.Log != nil {
+			q = *r.Log
+		}
+		resp.Log, err = d.readLog(r.Node, q)
+	case "activity":
+		resp.Text, err = d.activityReport(r.Node, r.Name)
 	case "spawn":
 		resp.Session, err = d.spawn(r.Node, r.Name, r.Repo, r.Model, r.Effort, r.Text, r.Plugins, r.Connectors)
 	case "resume":
@@ -716,9 +724,7 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	case "unpause":
 		resp.Text, err = d.unpause()
 	case "status":
-		d.mu.Lock()
-		resp = d.snapshotLocked()
-		d.mu.Unlock()
+		resp = d.statusFor(r.Node)
 	default:
 		err = fmt.Errorf("unknown op %q", r.Op)
 	}
@@ -2927,7 +2933,7 @@ func (d *daemon) clearStaleDesk() bool {
 }
 
 // transcript shows the last turns of session name's current conversation.
-func (d *daemon) transcript(name string, turns int) (string, error) {
+func (d *daemon) transcript(caller, name string, turns int) (string, error) {
 	if turns <= 0 {
 		turns = 3
 	}
@@ -2936,6 +2942,10 @@ func (d *daemon) transcript(name string, turns int) (string, error) {
 	if n == nil {
 		d.mu.Unlock()
 		return "", fmt.Errorf("no session %q", name)
+	}
+	if in := d.scopeLocked(caller); in != nil && !in[name] {
+		d.mu.Unlock()
+		return "", errOutOfScope(name)
 	}
 	sid, state := cmp.Or(n.Conversation, n.SessionID), sessionState(n.public())
 	d.mu.Unlock()

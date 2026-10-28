@@ -29,10 +29,17 @@ func (d *daemon) conversationID(name string) (sid, short string, err error) {
 }
 
 // conversation returns up to limit entries of session name's conversation before the one with ID before, or its last ones.
-func (d *daemon) conversation(name, before string, limit int) ConvLine {
+func (d *daemon) conversation(caller, name, before string, limit int) ConvLine {
 	line := ConvLine{Type: "result"}
 	if limit <= 0 {
 		limit = convLimit
+	}
+	d.mu.Lock()
+	in := d.scopeLocked(caller)
+	d.mu.Unlock()
+	if in != nil && !in[name] {
+		line.Error = errOutOfScope(name).Error()
+		return line
 	}
 	sid, _, err := d.conversationID(name)
 	if err == nil {
