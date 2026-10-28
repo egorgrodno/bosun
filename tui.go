@@ -26,6 +26,8 @@ type tui struct {
 	log       []Entry
 	answered  []Answered
 	paused    bool
+	away      *Away
+	parked    []Parked
 	connected bool
 	sel       int
 	// answering is the question an answer is being typed for, or switching the master or the desk a model and effort are being typed for, and answer the text so far.
@@ -131,9 +133,16 @@ func (t *tui) apply(r Response) {
 	switch {
 	case r.Type == "snapshot":
 		t.sessions, t.decisions, t.log, t.answered, t.paused, t.connected = r.Sessions, r.Decisions, r.Log, r.Answered, r.Paused, true
+		t.away, t.parked = r.Away, r.Parked
 	case r.Event == nil:
 	case r.Event.Kind == "paused", r.Event.Kind == "unpaused":
 		t.paused = r.Event.Kind == "paused"
+	case r.Event.Kind == "away":
+		t.away, t.parked = r.Event.Away, nil
+	case r.Event.Kind == "back":
+		t.away, t.parked = nil, nil
+	case r.Event.Kind == "parked" && r.Event.Parked != nil:
+		t.parked = append(t.parked, *r.Event.Parked)
 	case r.Event.Kind == "sessions":
 		t.sessions = r.Event.Sessions
 	case r.Event.Kind == "activity":
@@ -221,6 +230,10 @@ func (t *tui) key(k string) (tuiAction, bool) {
 		return twice(tuiAction{op: "unpause"})
 	case k == "p":
 		return twice(tuiAction{op: "pause"})
+	case k == "w" && t.away != nil:
+		return twice(tuiAction{op: "away", name: "off"})
+	case k == "w":
+		return twice(tuiAction{op: "away", name: "on"})
 	case k == down || k == "\x1b[B":
 		t.sel = min(t.sel+1, len(t.items())-1)
 	case k == up || k == "\x1b[A":
@@ -269,6 +282,19 @@ func (t *tui) render(width, height int) []string {
 	}
 	if t.paused {
 		add(yellow, "Paused: p resumes the turns it stopped", false)
+	}
+	if t.away != nil {
+		add(yellow, awayHeader(*t.away)+" w comes back", false)
+	}
+	if len(t.parked) > 0 {
+		add(dim, "Parked while you are away", false)
+	}
+	for _, p := range t.parked {
+		add("", fmt.Sprintf("  %-4s %-14s %s", p.Decision.ID, p.Decision.Node, parkedLine(p)), false)
+		add(dim, "       because "+p.Why, false)
+	}
+	if len(t.parked) > 0 {
+		add("", "", false)
 	}
 	items := t.items()
 	section := ""
@@ -321,9 +347,12 @@ func (t *tui) render(width, height int) []string {
 	var foot []string
 	switch it := t.selected(); {
 	case t.armedKey() != "":
-		hint := map[string]string{"y": "approve", "d": "deny", "p": "pause"}[t.armed]
-		if t.armed == "p" && t.paused {
+		hint := map[string]string{"y": "approve", "d": "deny", "p": "pause", "w": "turn away mode on"}[t.armed]
+		switch {
+		case t.armed == "p" && t.paused:
 			hint = "unpause"
+		case t.armed == "w" && t.away != nil:
+			hint = "come back"
 		}
 		foot = append(foot, yellow+"Press "+t.armed+" again to "+hint+plain)
 	case t.answering != "":
@@ -345,6 +374,11 @@ func (t *tui) render(width, height int) []string {
 			keys += "p unpause · "
 		} else {
 			keys += "p pause all · "
+		}
+		if t.away != nil {
+			keys += "w come back · "
+		} else {
+			keys += "w away · "
 		}
 		foot = append(foot, dim+clip(keys+moveHint(t.layout)+" · q quit", width)+plain)
 	default:
@@ -514,10 +548,10 @@ func runTUI(args []string) error {
 					t.err = attach(a.id)
 					_, _ = makeRaw(in)
 					enter()
-				case "pause", "unpause", "model":
+				case "pause", "unpause", "model", "away":
 					// Each stops or resumes sessions, which takes a while, and the watch stream shows the progress. A switch of the desk waits for its turn to end.
 					t.err = ""
-					req := Request{Op: a.op}
+					req := Request{Op: a.op, Name: a.name}
 					if a.op == "model" {
 						var err error
 						if req, err = modelRequest(a.name, strings.Fields(a.text)); err != nil {

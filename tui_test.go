@@ -140,6 +140,28 @@ func TestTUIPause(t *testing.T) {
 	}
 }
 
+func TestTUIAway(t *testing.T) {
+	tu := testTUI()
+	tu.key("w")
+	if a, ok := tu.key("w"); !ok || a != (tuiAction{op: "away", name: "on"}) {
+		t.Fatalf("w: %+v %v", a, ok)
+	}
+	tu.apply(Response{Type: "event", Event: &Event{Kind: "away", Away: &Away{Since: time.Now(), By: "user", Words: "bed"}}})
+	tu.apply(Response{Type: "event", Event: &Event{Kind: "parked", Parked: &Parked{Decision: Decision{ID: "7", Node: masterNode, Kind: "permission", Tool: "Bash", Input: []byte(`{"command":"git push"}`)}, Why: "it is the master's own permission"}}})
+	screen := strings.Join(tu.render(100, 30), "\n")
+	if !strings.Contains(screen, `Away since`) || !strings.Contains(screen, `"bed"`) || !strings.Contains(screen, "Bash: git push") || !strings.Contains(screen, "because it is the master's own permission") {
+		t.Fatalf("the screen does not show the away mode:\n%s", screen)
+	}
+	tu.key("w")
+	if a, ok := tu.key("w"); !ok || a != (tuiAction{op: "away", name: "off"}) {
+		t.Fatalf("w while away: %+v %v", a, ok)
+	}
+	tu.apply(Response{Type: "event", Event: &Event{Kind: "back"}})
+	if tu.away != nil || len(tu.parked) != 0 {
+		t.Fatalf("after the return away = %+v, parked = %+v", tu.away, tu.parked)
+	}
+}
+
 // m on the master or the desk takes a model and an effort to switch it to, and does nothing on a worker.
 func TestTUISwitch(t *testing.T) {
 	tu := testTUI()

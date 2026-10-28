@@ -53,6 +53,12 @@ Only the user's next message, typed to you or sent through bosun tell, can say y
 
 bosun refuses a notice, a decision that waits on the master, a decision of your own, and one with userOnly set. Pass on what the user wants done with one that waits on the master with tell_master. Show the user any other in full, and point them at the bosun panel or bosun tui, as status says.`
 
+	awayHelp = `Turn the away mode on when the user says they are leaving the fleet to work without them, such as "I'm logging off" or "going to bed", and off when they say they are back. Call it on their word alone, quoting it exactly from their latest message, and never of your own judgement, such as because they have gone quiet.
+
+While it is on, nothing waits on the user: bosun parks what would, such as the master's push, a reserved action on the user's list, a decision the master escalates or a notice. It denies each call and answers each question with a note that it waits for the user's return, so the fleet works on without them. bosun status shows it on and lists what it parked.
+
+Turning it off returns the list of what was parked, the one whose approval unblocks the most first. Show it to the user, and pass on what they want done with each item to the master with tell_master: a parked call was denied, so the master runs it again or resumes its worker to. When the user turns it off themselves, as with bosun away off, bosun hands you the same list as a prompt.`
+
 	transcriptHelp = `Show the last turns of a session's conversation: the prompt that began each turn, the session's text, and a line for each tool call, oldest first. Use it to answer what a session is doing or did, after status names the sessions. A turn's tool results do not show.`
 
 	// The read tools ride on every request of every session, so their descriptions stay short. status holds the scope and the reason once.
@@ -79,6 +85,12 @@ Work in a loop: call next_event, handle every event it returns, and call it agai
 The user waits on you. A tell waits until your next call to next_event, and what the user types into your session waits until your current tool call returns. So act on a batch's tells first, and get back to next_event quickly. Hand long work, such as reviewing a large branch before a merge, to a subagent in the background, and keep calling next_event while it runs. Claude Code hands you its result once your current next_event call returns. Answer what the user types into your session in the session itself, not with tell_desk.
 
 Once you have merged every worker and an hour has passed since your last turn, bosun clears your conversation before the next event wakes you, so you wake with no earlier conversation. Whenever you learn something that must outlast a clear, such as how the user wants decisions handled, write it to your memory directory then.
+
+When the user leaves the fleet to work without them, as overnight, they turn on the away mode, and each batch next_event returns begins with a line that says so. Until a batch comes without that line:
+- Send nothing to the user. escalate and notify reach nobody: bosun parks what they get on a list for the user's return, and a parked permission or question is denied or answered with a note that it waits for the user. So escalate what needs the user as you would, and move on: it needs nothing more from you, and the user gets the list once they are back.
+- Your own permissions and the reserved actions on the user's list park the same way, such as a push of yours. Do not try them again, nor another way to the same end.
+- Carry on with everything else. Decide and reply as you would. Merge on into the local checkout rather than wait on a push, and start the next piece of work on what merged. A worker whose call was parked carries on with the rest of its task, and its turn_end says what waits.
+- Answer tells with tell_desk as you would: the desk keeps your answers for the user.
 
 The events:
 - tell: an instruction from the user. Act on it, usually by starting workers with spawn. With from set to desk, the front desk relays it: the desk is the session the user talks to, which reads the fleet but changes nothing in it, so it passes the user's instructions to you. Act on such a tell as on the user's own. Answer every tell with tell_desk, whatever its from: that is how the user hears of it. Answer once you have acted on it, such as by spawning a worker for it, and again once you know how it ended. When acting on it is all it needs, one answer covers both.
@@ -157,6 +169,10 @@ func roleTools(node string) []tool {
 				"answer":  str("For a question, the user's answer."),
 				"words":   str("Leave it out on the first call. On the second, the user's yes, quoted exactly from their latest message."),
 			})},
+			{"away", awayHelp, object([]string{"on", "words"}, map[string]any{
+				"on":    map[string]any{"type": "boolean", "description": "true when the user leaves, false when they are back."},
+				"words": str("The user's words that say so, quoted exactly from their latest message."),
+			})},
 		}
 	}
 	if node != masterNode {
@@ -192,7 +208,7 @@ func roleTools(node string) []tool {
 			"id":     str("The decision's id."),
 			"answer": str("The answer."),
 		})},
-		{"decide", "Allow or deny a worker's permission request: a tool call that its permission rules and auto mode did not approve, or a reserved action. Allow it when the worker's task needs it and it can be undone. Deny it with a message that tells the worker what to do instead. Escalate what the user should judge, such as a call the task needs that cannot be undone. A request with reserved set is a reserved action, which bosun held before the sandbox and auto mode could judge it, and reserved says why. Allowing one lets it past both: a command outside the sandbox runs with all of the user's access, and a write outside the worker's folders lands where neither the sandbox nor your review of its branch reaches. So allow one only when the user's instructions or the worker's task plainly cover it, and escalate the rest. Deny with what to do instead, such as \"write it under $TMPDIR\" for a throwaway file, or \"run it in the sandbox\" when nothing in it needs to leave. Read a command outside the sandbox whole: it can write anywhere, and bosun checked only the paths it names and whether it runs as root. Escalate it when you cannot follow all it does, such as a script you have not read, or when it touches what the user keeps for themselves: credentials such as ~/.ssh, shell startup files, Claude Code's configuration, git hooks and config, systemd units, autostart entries and scheduled jobs such as crontab or systemd-run, and bosun's state. Deleting a branch can lose commits that nothing else holds: allow it only for a branch that is merged or that the worker made for itself. /etc/nixos outside its worktrees is the configuration that nxt activates as root: deny a write there, and send the worker to its worktree. A request with refused set comes after auto mode refused the worker's last call, which says why: after a run of refusals, auto mode asks about a call instead of refusing it, so it likely judged this one risky too. Escalate it unless the user's instructions plainly cover it. A push publishes its commits, and only a force push, which is the user's, takes them back: allow one only when the user's instructions or the worker's task ask for it. nixos-rebuild test, or nxt, runs the activation scripts of the configuration it names as root, and a reboot does not undo what they did. On /etc/nixos that configuration is what is checked out there. On a worktree under /etc/nixos/.claude/worktrees/ it is that worktree's files, whichever worker asks: first read git -C <worktree> diff <the branch it began from>, which includes uncommitted changes, and escalate if the change does anything its task does not need. nixos-rebuild build, or nxc, activates nothing.", object([]string{"id", "allow"}, map[string]any{
+		{"decide", "Allow or deny a worker's permission request: a tool call that its permission rules and auto mode did not approve, or a reserved action. Allow it when the worker's task needs it and it can be undone. Deny it with a message that tells the worker what to do instead. Escalate what the user should judge, such as a call the task needs that cannot be undone. While away mode is on, judge each request as you would, and escalate what the user should judge all the same: bosun parks it for their return and denies the call, as next_event says. A request with reserved set is a reserved action, which bosun held before the sandbox and auto mode could judge it, and reserved says why. Allowing one lets it past both: a command outside the sandbox runs with all of the user's access, and a write outside the worker's folders lands where neither the sandbox nor your review of its branch reaches. So allow one only when the user's instructions or the worker's task plainly cover it, and escalate the rest. Deny with what to do instead, such as \"write it under $TMPDIR\" for a throwaway file, or \"run it in the sandbox\" when nothing in it needs to leave. Read a command outside the sandbox whole: it can write anywhere, and bosun checked only the paths it names and whether it runs as root. Escalate it when you cannot follow all it does, such as a script you have not read, or when it touches what the user keeps for themselves: credentials such as ~/.ssh, shell startup files, Claude Code's configuration, git hooks and config, systemd units, autostart entries and scheduled jobs such as crontab or systemd-run, and bosun's state. Deleting a branch can lose commits that nothing else holds: allow it only for a branch that is merged or that the worker made for itself. /etc/nixos outside its worktrees is the configuration that nxt activates as root: deny a write there, and send the worker to its worktree. A request with refused set comes after auto mode refused the worker's last call, which says why: after a run of refusals, auto mode asks about a call instead of refusing it, so it likely judged this one risky too. Escalate it unless the user's instructions plainly cover it. A push publishes its commits, and only a force push, which is the user's, takes them back: allow one only when the user's instructions or the worker's task ask for it. nixos-rebuild test, or nxt, runs the activation scripts of the configuration it names as root, and a reboot does not undo what they did. On /etc/nixos that configuration is what is checked out there. On a worktree under /etc/nixos/.claude/worktrees/ it is that worktree's files, whichever worker asks: first read git -C <worktree> diff <the branch it began from>, which includes uncommitted changes, and escalate if the change does anything its task does not need. nixos-rebuild build, or nxc, activates nothing.", object([]string{"id", "allow"}, map[string]any{
 			"id":      str("The decision's id."),
 			"allow":   map[string]any{"type": "boolean", "description": "true to allow the tool call, false to deny it."},
 			"message": str("When denying, why. It reaches the worker verbatim, so tell it what to do instead."),
@@ -206,11 +222,11 @@ func roleTools(node string) []tool {
 			"model":  str("The model to switch to, as for spawn. Left out, it keeps its own."),
 			"effort": str("The effort to switch to, as for spawn. Left out, it keeps its own."),
 		})},
-		{"escalate", "Hand a question or permission request to the user, who answers it from bosun. Its worker keeps waiting, and the decision needs nothing more from you.", object([]string{"id"}, map[string]any{
+		{"escalate", "Hand a question or permission request to the user, who answers it from bosun. Its worker keeps waiting, and the decision needs nothing more from you. While away mode is on, it reaches nobody: bosun parks the decision on the list the user gets when they come back, and denies the call or answers the question with a note that it waits for them, so the worker carries on.", object([]string{"id"}, map[string]any{
 			"id":   str("The decision's id."),
 			"note": str("What the user should know, such as why you did not decide it yourself."),
 		})},
-		{"notify", "Tell the user about a problem that is not a decision. Call it whenever something fails that you cannot fix, such as a spawn that Claude Code refuses: the user hears of it no other way. It waits in bosun until the user dismisses it, and nobody waits on it.", object([]string{"message"}, map[string]any{
+		{"notify", "Tell the user about a problem that is not a decision. Call it whenever something fails that you cannot fix, such as a spawn that Claude Code refuses: the user hears of it no other way. It waits in bosun until the user dismisses it, and nobody waits on it. While away mode is on, bosun parks it instead, on the list the user gets when they come back.", object([]string{"message"}, map[string]any{
 			"message": str("What happened, and what the user can do about it."),
 		})},
 		{"tell_desk", "Answer a tell: tell the front desk, the session the user talks to, what became of an instruction, such as which worker took it, what merged, or what failed and waits on the user. The desk passes it on to the user, and when there is no desk, the user gets it as a notice. Keep it short, and say which instruction it answers. The desk takes no messages, so answer it only with this.", object([]string{"text"}, map[string]any{
@@ -381,6 +397,7 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		ID          string   `json:"id"`
 		Answer      string   `json:"answer"`
 		Allow       *bool    `json:"allow"`
+		On          *bool    `json:"on"`
 		Message     string   `json:"message"`
 		Note        string   `json:"note"`
 		Text        string   `json:"text"`
@@ -440,6 +457,11 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		req.Text = args.Note
 	case "notify":
 		req.Text = args.Message
+	case "away":
+		req.Name, req.Words = "off", args.Words
+		if args.On != nil && *args.On {
+			req.Name = "on"
+		}
 	case "tell_master", "tell_desk":
 		// The daemon passes a tell on by who sends it.
 		req.Op, req.Text = "tell", args.Text
@@ -480,11 +502,12 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 			return "No events. If a subagent or background command of yours still runs, call next_event again. Otherwise end your turn: the next event starts a new one.", nil
 		}
 		data, err := json.MarshalIndent(resp.Events, "", "  ")
+		if resp.Away != nil {
+			return awayLine(resp.Away) + "\n\n" + string(data), err
+		}
 		return string(data), err
-	case "escalate":
-		return "Escalated to the user.", nil
-	case "notify":
-		return "The user will see it.", nil
+	case "escalate", "notify", "away":
+		return resp.Text, nil
 	}
 	return "Done.", nil
 }

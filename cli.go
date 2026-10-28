@@ -122,8 +122,8 @@ func runCommand(cmd string, args []string) error {
 		_ = flags.Parse(args)
 		req.Model, req.Effort, args = *model, *effort, flags.Args()
 	}
-	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "say": 2, "interrupt": 1, "compact": 1, "clear": 1}[cmd]
-	if len(args) < need {
+	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "say": 2, "interrupt": 1, "compact": 1, "clear": 1, "away": 1}[cmd]
+	if len(args) < need || cmd == "away" && (args[0] != "on" && args[0] != "off" || args[0] == "off" && len(args) > 1) {
 		return errors.New(usage)
 	}
 	switch cmd {
@@ -139,6 +139,8 @@ func runCommand(cmd string, args []string) error {
 		req.Name = args[0]
 	case "say":
 		req.Name, req.Text = args[0], strings.Join(args[1:], " ")
+	case "away":
+		req.Name, req.Words = args[0], strings.Join(args[1:], " ")
 	}
 	resp, err := call(context.Background(), req)
 	if resp.Text != "" {
@@ -224,6 +226,16 @@ func printStatus(w io.Writer, s Response) {
 	if s.Paused {
 		fmt.Fprintln(w, "Paused: bosun unpause resumes the turns it stopped.")
 	}
+	if s.Away != nil {
+		fmt.Fprintln(w, awayHeader(*s.Away)+" bosun away off hands you the list.")
+	}
+	if len(s.Parked) > 0 {
+		fmt.Fprintln(w, "Parked while you are away:")
+	}
+	for _, p := range s.Parked {
+		fmt.Fprintf(w, "  %-4s %-12s %s\n", p.Decision.ID, p.Decision.Node, parkedLine(p))
+		fmt.Fprintf(w, "       because %s\n", p.Why)
+	}
 	for _, holder := range []string{"user", "master"} {
 		first := true
 		for _, dec := range s.Decisions {
@@ -272,6 +284,23 @@ func printStatus(w io.Writer, s Response) {
 	for _, e := range s.Log[max(0, len(s.Log)-shownLog):] {
 		fmt.Fprintf(w, "  %s\n", clip(logLine(e), 120))
 	}
+}
+
+// awayHeader is how a frontend shows that the away mode is on.
+func awayHeader(a Away) string {
+	s := "Away since " + a.Since.Local().Format("Jan 2 15:04")
+	if a.Words != "" {
+		s += fmt.Sprintf(", on your words %q", squash(a.Words))
+	}
+	return s + ": bosun parks what would wait on you."
+}
+
+// parkedLine shows a parked decision's request, or a parked notice's text, on one line.
+func parkedLine(p Parked) string {
+	if p.Decision.Kind == "notice" {
+		return "notice: " + squash(p.Decision.Note)
+	}
+	return describe(p.Decision)
 }
 
 // shownLog is how many of the log's latest entries bosun status and bosun tui show.
@@ -346,6 +375,15 @@ func logLine(e Entry) string {
 		what = "paused the fleet"
 	case "unpaused":
 		what = with("resumed the fleet")
+	case "away":
+		what = with("turned away mode on")
+	case "back":
+		what = "turned away mode off"
+	case "parked":
+		what = "parked a decision"
+		if e.Decision != nil {
+			what = fmt.Sprintf("parked %s's %s %s", e.Node, e.Decision.ID, parkedLine(Parked{Decision: *e.Decision}))
+		}
 	case "model":
 		what = fmt.Sprintf("switched %s to %s", e.Node, modelLabel(Session{Model: e.Model, Effort: e.Effort}))
 	case "say":

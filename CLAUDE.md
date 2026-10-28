@@ -21,7 +21,7 @@ One binary carries every part:
 | `bosun mcp` | the stdio MCP server each session starts, relaying to the daemon |
 | `bosun hook` | every hook each session runs |
 | `bosun tui` | the terminal frontend |
-| `bosun status`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `compact`, `clear`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `watch`, `conversation`, `follow` | the command-line frontend |
+| `bosun status`, `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `compact`, `clear`, `spawn`, `kill`, `pause`, `unpause`, `away`, `model`, `attach`, `watch`, `conversation`, `follow` | the command-line frontend |
 
 The daemon holds each session's parent and the queue of decisions waiting on an answer. It reads each session's state from `claude agents --json --all`, which also lists sessions bosun did not start.
 
@@ -130,6 +130,14 @@ A rebuild on the allowlist that shares its command with others, as in `nxt 2>&1 
 
 **Questions go to the master, whatever the depth.** Workers run without `AskUserQuestion`, which would wait on a person, and ask through `ask` instead.
 
+**Away mode parks what would wait on you.** `bosun away on`, `w` twice in `bosun tui`, or the desk's `away` tool on your quoted words turns it on, and `off` turns it off. The daemon keeps it in `state.json`, with when it went on and your words, so it outlasts a restart and a cleared master. While it is on, every decision whose holder would be you goes through `parkLocked` instead of opening. The master's own permissions, the desk's, reserved actions on your list, escalations, `notify` and bosun's own notices all park this way. A notice whose permission waits in its session's own prompt does not park, since only an answer there settles it. Turning it on also parks the permissions and questions already waiting on you.
+
+**Parked means answered at once.** A parked permission is denied, and a parked question answered, with a standard text: you are away, the call waits on a list for your return, so do not retry it and carry on with the rest. A held `PreToolUse` would block its session until the hook's timeout, while a denial lets it go on with other work. A parked notice simply waits on the list. Each parked item records the decision as it stood, why it would have reached you, and when. The frontends get a `parked` event and no `decision` event, so nothing notifies you, and the log gets a `parked` entry.
+
+**The master learns of it from each batch.** While away mode is on, `next_event`'s result begins with a line that says so. `escalate` and `notify` answer that they parked. The rules for the master live in the descriptions of `next_event`, `escalate`, `notify` and `decide`, since its system prompt never changes. The master escalates what needs you as it would, and merges on into the local checkout rather than wait on a push.
+
+**Turning it off hands you one list.** `parkedList` groups identical requests and orders them so one approval unblocks the most: pushes first, then the larger groups, then permissions, questions and notices. The daemon opens one notice holding the list, which `bosun status` and the tui show until you dismiss it. It also queues the list for the desk as a `back` event, which the desk gets as it gets a tell, unless the desk turned the mode off itself and so read the list in the tool's result. A `back` event is no message of yours, and a desk that cannot take it drops it, since the notice holds the list. A parked call was denied, so acting on an item means telling the master to run it again.
+
 | MCP tool | Held by | Does |
 |---|---|---|
 | `spawn` | the master and workers | starts a child session |
@@ -142,6 +150,7 @@ A rebuild on the allowlist that shares its command with others, as in `nxt 2>&1 
 | `activity` | every session | shows what a session, or each readable one, is doing: its latest activity and its open tool calls |
 | `transcript` | desk | shows a session's last turns: each prompt, its text and a line per tool call |
 | `answer` | desk | gives your answer to a decision that waits on you, once you have said yes to it |
+| `away` | desk | turns the away mode on or off, on your words quoted from your latest message |
 | `tell_desk` | master | answers the desk, or the user when there is no desk |
 | `next_event` | master | blocks until a worker asks or needs a permission, a child of the master ends a turn or exits, a worker goes quiet or the user sits on a decision, or a `tell` comes from the desk, or from a frontend when there is no desk |
 | `reply` | master | answers a question |
@@ -302,13 +311,15 @@ The daemon refuses each of these ops from a request that names a node, as every 
 
 ## Frontends
 
-Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `compact`, `clear`, `spawn`, `kill`, `pause`, `unpause`, `model`, `attach`, `attached`, `transcript`, `conversation`, `follow`. Every rule lives in the daemon.
+Every frontend is a thin client of one protocol on the daemon's socket. A frontend that sends `watch` gets JSON lines: a snapshot, then events. A frontend sends commands back: `approve`, `deny`, `reply`, `dismiss`, `tell`, `say`, `interrupt`, `compact`, `clear`, `spawn`, `kill`, `pause`, `unpause`, `away`, `model`, `attach`, `attached`, `transcript`, `conversation`, `follow`. Every rule lives in the daemon.
 
 A decision's `asked` is when it opened, as RFC 3339, and a frontend may show its age. Its `expires` is when the daemon stops holding it, as RFC 3339, for a frontend's countdown. Only a permission that is not a reserved action expires, `promptAfter` after `asked`, and then the daemon leaves it to the session's own prompt and opens a notice. A reserved action, a question and a notice carry no `expires`: a reserved action's hook denies the call itself before its timeout, and the others wait until answered. After a restart, a decision whose request has not come back expires 30 seconds after the start, or at its own deadline if that comes sooner, since the daemon then settles it or leaves it to the session's prompt. A request that comes back restores the decision's own `expires`, and the daemon sends the decision again. A decision's `reserved` holds the reason it is a reserved action, such as `a force push`. Its `userOnly` marks an action on your list. A notice's `prompt` marks a permission waiting in its session's own prompt, with the call in `tool` and `input`, which `approve` and `deny` answer there.
 
 A frontend should show the `answered` event and the snapshot's `answered`: each decision the desk answered on your word, with the answer given and the words the desk quoted.
 
 The snapshot's `paused`, and the `paused` and `unpaused` events, show a pause. A session's `paused` marks a turn that `unpause` resumes.
+
+The snapshot's `away` is `{"since":…,"by":"user","words":"off to bed"}` while away mode is on, and is left out otherwise. Its `parked` lists what parked since, each as `{"decision":…,"why":"it is the master's own permission","at":…}`. An `away` event carries `away` and starts an empty list. A `parked` event carries one item in `parked`, and a `back` event ends the mode and the list. `away` takes `name` `on` or `off`, and `words`, as `{"op":"away","name":"on","words":"off to bed"}`.
 
 A session's `status` comes from Claude Code's listing, which shows it busy after its turn ended while a background command still runs, and for a few seconds after any turn. From a `Stop` or `StopFailure` until a hook of a new turn or a listing that shows the session idle or stopped, the snapshot and the `sessions` event show it `idle` with no `state`, and `say` and `interrupt` treat it as idle. The daemon's own record keeps the listing's status.
 
@@ -345,6 +356,9 @@ A session's `activity` shows what it does: `tool` with `arg`, the main argument 
 | `killed` | the user stopped `node` | |
 | `paused` | the user paused the fleet | |
 | `unpaused` | the user resumed the fleet | `text`: which turns resumed |
+| `away` | the user or the desk turned away mode on | `text`: the user's words |
+| `back` | the user or the desk turned away mode off | `text`: the list of what parked |
+| `parked` | bosun parked `node`'s decision while the user was away | `decision`, `text`: why it would have reached the user |
 | `model` | the user switched the master or the desk | `model`, `effort` |
 | `turn_end`, `exit` | worker `node` ended its turn, or stopped in it, other than by a kill | `text` |
 | `stalled` | worker `node` went quiet in its turn, or a decision of `node` waited long on the user (see Stalls) | `text` |
@@ -401,6 +415,7 @@ Each leads with the queue of decisions waiting on you, above the tree. The desk 
 - **Effort.** That `--effort` lands in `respawnFlags` and survives a flagless resume is inferred from `--model` doing so, and unmeasured. So is whether `claude rm` of a switched worker's first id removes the worktree its copy runs in, and whether `claude rm` of the copy alone leaves it.
 - **Usage limits.** The `StopFailure` input and the reset's format come from the 2.1.310 binary. No real usage limit has been measured.
 - **Restarts and pauses.** Only a fake `claude` has run the restart handling and the pause. No real reboot, crash or pause has been measured. The daemon reads transcripts in the 2.1.310 format. A `claude stop` in a turn runs no `Stop` (see "Inside a session"), and the daemon ignores a `Stop` from a session that a pause stopped.
+- **Away mode.** Only the fakes have run it. Whether a real master follows its descriptions, escalating as it would and carrying on, and whether a worker given a parked denial goes on with the rest of its task without retrying, is unmeasured.
 - **The desk.** No real desk has run. A probe session inside the master's directory measured the desk's trust, `autoMemoryDirectory` from `--settings` and the clear's transcript, and nothing more. Handing an idle desk its queue stops and resumes it, as waking the master does. Whether a `claude attach` open on it survives that is unmeasured. That a file tool's sensitive write asks even in auto mode comes from the 2.1.310 binary. The desk's answers assume that `UserPromptSubmit` carries each prompt you type, verbatim. No real desk has shown that. When it runs for a prompt typed while the desk is in its turn is unmeasured, and the daemon times the prompt by it. The desk's switch rests on the master's: no real desk has moved to a copy.
 - **The open master and its subagents.** No real `claude attach` has run under the `attached` hold. While you have the master open, it sleeps ten seconds after its last event, so a wake stops and resumes it under your `claude attach`. Whether the attach survives that is unmeasured. That a stop ends a background subagent, and that its result waits for the running tool call to return, are assumed, not measured.
 - **Reserved actions at the master.** Only the tests' fake hooks have sent one. Whether a file tool writes through a symlink, as the check assumes, is unmeasured.

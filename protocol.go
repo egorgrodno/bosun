@@ -58,6 +58,9 @@ type Response struct {
 	Messages  []Event    `json:"messages,omitempty"`
 	Answered  []Answered `json:"answered,omitempty"`
 	Paused    bool       `json:"paused,omitempty"`
+	// Away is the away mode while it is on, and Parked what it has parked since it went on.
+	Away   *Away    `json:"away,omitempty"`
+	Parked []Parked `json:"parked,omitempty"`
 	// Log holds the fleet's latest entries, oldest first.
 	Log []Entry `json:"log,omitempty"`
 }
@@ -72,7 +75,7 @@ type ConvLine struct {
 	More    bool   `json:"more,omitempty"`
 }
 
-// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, stalled, tell and message; the desk gets tell; a frontend gets decision, settled, answered, sessions, activity, context, message, paused, unpaused and log.
+// Event is what the master, the desk or a frontend is told. The master gets decision, turn_end, exit, stalled, tell and message; the desk gets tell and back; a frontend gets decision, settled, answered, sessions, activity, context, message, paused, unpaused, away, parked, back and log.
 // A stalled event's ID is the decision that waited on the user, left out where a worker went quiet. A message is what session From told session Node through Claude Code's SendMessage. A tell is From's text: the user's when From is empty, or the desk's or the master's.
 // Again marks an event the master took once already, in a turn that was cut short.
 type Event struct {
@@ -92,6 +95,9 @@ type Event struct {
 	Context *Context `json:"context,omitempty"`
 	// Runs is what session Node's default resolves to, in a runs event.
 	Runs *Runs `json:"runs,omitempty"`
+	// Away is the away mode an away event turns on, and Parked what a parked event parked.
+	Away   *Away   `json:"away,omitempty"`
+	Parked *Parked `json:"parked,omitempty"`
 
 	// sent is when the user sent a tell to the desk, which may hand it over only after an answer it proposed since.
 	sent time.Time
@@ -123,6 +129,20 @@ type Entry struct {
 	Effort string `json:"effort,omitempty"`
 	// Route is how a decision reached its holder: master, escalated, requester, userOnly, prompt or notice. A decision reached the user when Route is neither empty nor master.
 	Route string `json:"route,omitempty"`
+}
+
+// Away is the user's away mode, on since Since. By is user or desk, and Words the user's words that turned it on, if any.
+type Away struct {
+	Since time.Time `json:"since"`
+	By    string    `json:"by"`
+	Words string    `json:"words,omitempty"`
+}
+
+// Parked is a decision that would have waited on the user while they were away, which bosun answered itself or, for a notice, kept for their return. Why says why it would have reached them.
+type Parked struct {
+	Decision Decision  `json:"decision"`
+	Why      string    `json:"why"`
+	At       time.Time `json:"at"`
 }
 
 // Answered is a decision the desk answered on the user's word: Behavior is allow or deny for a permission, and Text a denial's message or a question's answer.

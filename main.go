@@ -35,6 +35,8 @@ const usage = `usage:
   bosun kill NAME                  stop a session
   bosun pause                      stop every session, and resume none until unpause
   bosun unpause                    resume the turns that pause stopped
+  bosun away on [WORDS]            park what would wait on you, so the fleet works on without you
+  bosun away off                   hand you what was parked, as one list through the desk
   bosun attach ID                  claude attach to a session, which the daemon resumes if it stopped
   bosun model [-effort E] [master|desk] [M]
                                    switch the master, or the desk, to model M or effort E, keeping its conversation
@@ -67,7 +69,7 @@ func main() {
 		err = runAttach(args)
 	case "model":
 		err = runModel(args)
-	case "approve", "deny", "reply", "dismiss", "tell", "say", "interrupt", "compact", "clear", "spawn", "kill", "pause", "unpause":
+	case "approve", "deny", "reply", "dismiss", "tell", "say", "interrupt", "compact", "clear", "spawn", "kill", "pause", "unpause", "away":
 		err = runCommand(cmd, args)
 	default:
 		fmt.Fprintln(os.Stderr, usage)

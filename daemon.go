@@ -157,6 +157,9 @@ type daemon struct {
 	// paused holds while the user has paused the fleet, and stopping once the daemon shuts down.
 	paused   bool
 	stopping bool
+	// away holds while the user is away, and parked what would have waited on them since it went on.
+	away   *Away
+	parked []Parked
 }
 
 type watcher struct {
@@ -192,6 +195,8 @@ type savedState struct {
 	Decisions []savedDecision `json:"decisions,omitempty"`
 	Answered  []Answered      `json:"answered,omitempty"`
 	Paused    bool            `json:"paused,omitempty"`
+	Away      *Away           `json:"away,omitempty"`
+	Parked    []Parked        `json:"parked,omitempty"`
 }
 
 // savedDecision is a decision with what the protocol leaves out of it.
@@ -390,6 +395,7 @@ func (d *daemon) load() error {
 		}
 	}
 	d.events, d.taken, d.takenKey, d.paused, d.answered = st.Events, st.Taken, st.TakenKey, st.Paused, st.Answered
+	d.away, d.parked = st.Away, st.Parked
 	for _, sd := range st.Decisions {
 		dec := sd.Decision
 		dec.toolUseID, dec.key, dec.opened = sd.ToolUseID, sd.Key, sd.Opened
@@ -415,7 +421,7 @@ func (d *daemon) saveLocked() {
 	if d.stopping {
 		return
 	}
-	st := savedState{NextID: d.nextID, Events: d.events, Taken: d.taken, TakenKey: d.takenKey, Answered: d.answered, Paused: d.paused}
+	st := savedState{NextID: d.nextID, Events: d.events, Taken: d.taken, TakenKey: d.takenKey, Answered: d.answered, Paused: d.paused, Away: d.away, Parked: d.parked}
 	for _, n := range d.sortedLocked() {
 		st.Sessions = append(st.Sessions, n)
 	}
@@ -674,6 +680,9 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 			err = errors.New("only the master waits for events")
 		} else {
 			resp.Events = d.nextEvent(ctx, r.Key)
+			d.mu.Lock()
+			resp.Away = d.away
+			d.mu.Unlock()
 		}
 	case "approve", "deny":
 		a := answer{behavior: "allow"}
@@ -688,9 +697,15 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	case "reply":
 		resp.Text, err = d.answer(r.Node, r.ID, r.Words, "question", answer{text: r.Text})
 	case "escalate":
-		err = d.escalate(r.Node, r.ID, r.Text)
+		resp.Text, err = d.escalate(r.Node, r.ID, r.Text)
 	case "notify":
-		err = d.notify(r.Node, r.Text)
+		resp.Text, err = d.notify(r.Node, r.Text)
+	case "away":
+		if r.Name != "on" && r.Name != "off" {
+			err = errors.New("away takes on or off")
+		} else {
+			resp.Text, err = d.setAway(r.Node, r.Name == "on", r.Words)
+		}
 	case "dismiss":
 		resp.Text, err = d.answer(r.Node, r.ID, r.Words, "notice", answer{})
 	case "tell":
@@ -1211,6 +1226,9 @@ func (d *daemon) openLocked(dec *Decision) {
 	dec.Asked = dec.opened.UTC().Format(time.RFC3339)
 	dec.Expires = holdDeadline(dec)
 	dec.answer = make(chan answer, 1)
+	if dec.Holder == "user" && d.parkLocked(dec) {
+		return
+	}
 	d.decisions[dec.ID] = dec
 	d.saveLocked()
 	c := *dec
@@ -1476,46 +1494,62 @@ func (d *daemon) saidLocked(text string, at time.Time) {
 // A tell that a restart reloaded lost when it was sent, and so comes before every answer the desk proposes.
 func (d *daemon) toldLocked(evs []Event) {
 	for _, ev := range evs {
-		if ev.From == "" && !ev.Again {
+		if ev.Kind == "tell" && ev.From == "" && !ev.Again {
 			d.saidLocked(ev.Text, ev.sent)
 		}
 	}
 }
 
-func (d *daemon) escalate(caller, id, note string) error {
+// escalate hands decision id from the master to the user, and says what became of it.
+func (d *daemon) escalate(caller, id, note string) (string, error) {
 	if caller != masterNode {
-		return errors.New("only the master escalates")
+		return "", errors.New("only the master escalates")
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	dec := d.decisions[id]
 	if dec == nil {
-		return fmt.Errorf("no open decision %s", id)
+		return "", fmt.Errorf("no open decision %s", id)
 	}
 	if dec.Holder != "master" {
-		return fmt.Errorf("decision %s already waits on the user", id)
+		return "", fmt.Errorf("decision %s already waits on the user", id)
 	}
 	dec.Holder, dec.Note = "user", note
-	d.saveLocked()
 	c := *dec
-	d.broadcastLocked(Event{Kind: "decision", Decision: &c})
 	d.logLocked(Entry{Kind: "escalated", By: masterNode, From: masterNode, Node: dec.Node, Decision: &c, Text: note})
 	log.Printf("decision %s: escalated", id)
-	return nil
+	if d.parkLocked(dec) {
+		return fmt.Sprintf("The user is away, so bosun parked decision %s for their return, and told %s so. Carry on.", id, dec.Node), nil
+	}
+	d.saveLocked()
+	d.broadcastLocked(Event{Kind: "decision", Decision: &c})
+	return "Escalated to the user.", nil
 }
 
-// notify queues a notice from the master, which waits for the user to dismiss it and holds up no session.
-func (d *daemon) notify(caller, text string) error {
+// notify queues a notice from the master, which waits for the user to dismiss it and holds up no session, and says what became of it.
+func (d *daemon) notify(caller, text string) (string, error) {
 	if caller != masterNode {
-		return errors.New("only the master notifies the user")
+		return "", errors.New("only the master notifies the user")
 	}
 	if text == "" {
-		return errors.New("the notice is empty")
+		return "", errors.New("the notice is empty")
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: text, from: masterNode})
-	return nil
+	if d.awayLocked() {
+		return "The user is away, so bosun parked the notice on the list they get when they come back.", nil
+	}
+	return "The user will see it.", nil
+}
+
+// deskLocked is the desk while it can take what bosun hands it, and nil when it could not start, its session is gone or a usage limit stopped it.
+func (d *daemon) deskLocked() *Session {
+	desk := d.nodes[deskNode]
+	if desk != nil && (desk.Status == "exited" || desk.LimitedUntil != nil) {
+		return nil
+	}
+	return desk
 }
 
 // tell passes on text from caller: the user's from a frontend to the desk, the desk's to the master, and the master's to the desk.
@@ -1526,10 +1560,7 @@ func (d *daemon) tell(caller, text string) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	desk := d.nodes[deskNode]
-	if desk != nil && (desk.Status == "exited" || desk.LimitedUntil != nil) {
-		desk = nil
-	}
+	desk := d.deskLocked()
 	e := Entry{Kind: "tell", By: role(caller), From: caller, Node: masterNode, Text: text}
 	switch {
 	case caller == deskNode:
@@ -1558,7 +1589,10 @@ func deskReport(evs []Event) string {
 	var parts []string
 	for _, ev := range evs {
 		part := "bosun: the user sent this through bosun tell, so they may not be watching this session:\n"
-		if ev.From == masterNode {
+		switch {
+		case ev.Kind == "back":
+			part = "bosun: the user turned away mode off. While they were away, bosun parked what would have waited on them: it denied each call and answered each question with a note that it waits for their return, and kept each notice. Show the user this list, the one whose approval unblocks the most first, and pass on what they want done with each to the master with tell_master. bosun also shows it as a notice in bosun status:\n"
+		case ev.From == masterNode:
 			part = "bosun: the master answers:\n"
 		}
 		if ev.Again {
@@ -1572,9 +1606,11 @@ func deskReport(evs []Event) string {
 // strandLocked hands on what waits for the desk, which cannot take it: the user's tells go to the master, and the master's answers to the user.
 // The tells that a turn it was in took go with them.
 func (d *daemon) strandLocked(desk *Session, why string) {
-	evs := slices.Concat(desk.Taken, desk.Events)
+	// The notice that ended the away mode holds its list already.
+	evs := slices.DeleteFunc(slices.Concat(desk.Taken, desk.Events), func(ev Event) bool { return ev.Kind == "back" })
 	desk.Taken = nil
 	if len(evs) == 0 {
+		desk.Events = nil
 		return
 	}
 	note := fmt.Sprintf("The front desk %s.", why)
@@ -2024,7 +2060,7 @@ func (d *daemon) broadcastSessionsLocked() {
 }
 
 func (d *daemon) snapshotLocked() Response {
-	resp := Response{Type: "snapshot", Sessions: []Session{}, Decisions: []Decision{}, Paused: d.paused}
+	resp := Response{Type: "snapshot", Sessions: []Session{}, Decisions: []Decision{}, Paused: d.paused, Away: d.away, Parked: slices.Clone(d.parked)}
 	for _, n := range d.sortedLocked() {
 		resp.Sessions = append(resp.Sessions, n.public())
 	}
