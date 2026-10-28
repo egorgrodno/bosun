@@ -123,7 +123,7 @@ type daemon struct {
 	// said is the user's latest message to the desk, typed into it or told through bosun, and saidBefore when the one before it came.
 	said       userMessage
 	saidBefore time.Time
-	// proposed holds by decision id the answer the desk last showed the user, which only the user's next message can say yes to.
+	// proposed holds what the desk last showed the user, which only the user's next message can say yes to: an answer by its decision's id, a grant under grantKey and its class, and away mode under awayKey.
 	proposed map[string]proposal
 	// answered holds the latest decisions the desk answered on the user's word.
 	answered []Answered
@@ -181,10 +181,10 @@ type userMessage struct {
 	text string
 }
 
-// proposal is an answer the desk showed the user at at.
+// proposal is what the desk showed the user at at. offer must be comparable, since a second call is checked against it.
 type proposal struct {
-	answer answer
-	at     time.Time
+	offer any
+	at    time.Time
 }
 
 // preCall is a PreToolUse not yet followed by its PostToolUse.
@@ -1483,21 +1483,11 @@ func (d *daemon) deskAnswerLocked(dec *Decision, words string, a answer) (string
 	case dec.UserOnly:
 		return "", fmt.Errorf("decision %s is %s, which is on the user's list, %s", dec.ID, dec.Reserved, inFrontend)
 	}
-	p, ok := d.proposed[dec.ID]
-	why := ""
-	switch {
-	case !ok:
-	case p.answer != a:
-		why = "It differs from the answer you last showed the user. "
-	case words == "":
-	case !p.at.Before(d.said.at):
-		why = "The user has said nothing since you showed it. "
-	case p.at.Before(d.saidBefore):
-		// The user's latest message may answer whatever they wrote of in between.
-		why = "The user has written to you more than once since you showed it. "
-	case !strings.Contains(squash(d.said.text), squash(words)):
-		return "", fmt.Errorf("the user's latest message does not hold %q: quote their words exactly", words)
-	default:
+	shown, why, err := d.yesLocked(dec.ID, a, words)
+	if err != nil {
+		return "", err
+	}
+	if !shown.IsZero() {
 		rec := Answered{Decision: *dec, Behavior: a.behavior, Text: a.text, Words: words, At: time.Now()}
 		d.answered = append(d.answered, rec)
 		d.answered = d.answered[max(0, len(d.answered)-keptMessages):]
@@ -1506,9 +1496,33 @@ func (d *daemon) deskAnswerLocked(dec *Decision, words string, a answer) (string
 		d.settleLocked(dec, a, outcome{by: deskNode, words: words})
 		return fmt.Sprintf("bosun %s decision %s on the user's word.", given(rec), dec.ID), nil
 	}
-	d.proposed[dec.ID] = proposal{a, time.Now()}
 	data, _ := json.MarshalIndent(dec, "", "  ")
-	return fmt.Sprintf("%sbosun has not answered decision %s, and holds your answer until the user says yes to it. Show the user the whole decision below, and that you will %s. Ask them whether to, and end your turn. Once their next message says yes, call answer again with the same answer and words quoted from that message.\n\n%s", why, dec.ID, proposed(dec.Kind, a), data), nil
+	return fmt.Sprintf("%sbosun has not answered decision %s, and holds your answer until the user says yes to it. Show the user the whole decision below, and that you will %s. Ask them whether to, and end your turn. Once their next message says yes, call answer again with the same answer and words that quote all of that message.\n\n%s", why, dec.ID, proposed(dec.Kind, a), data), nil
+}
+
+// yesLocked checks that words quote the user's yes to offer, which the desk proposed under key: words must be the whole of the user's only message since the desk showed offer.
+// On the yes it returns when the desk showed offer. Otherwise it proposes offer anew, and why says what the yes lacked, or it fails when words are not the user's.
+func (d *daemon) yesLocked(key string, offer any, words string) (shown time.Time, why string, err error) {
+	p, ok := d.proposed[key]
+	switch {
+	case !ok:
+	case p.offer != offer:
+		why = "It differs from what you last showed the user. "
+	case words == "":
+	case !p.at.Before(d.said.at):
+		why = "The user has said nothing since you showed it. "
+	case p.at.Before(d.saidBefore):
+		// The user's latest message may answer whatever they wrote of in between.
+		why = "The user has written to you more than once since you showed it. "
+	case squash(d.said.text) != squash(words):
+		// A part of a refusal, such as "push anything tonight" in "don't push anything tonight", would read as a yes.
+		return time.Time{}, "", fmt.Errorf("the user's latest message is not %q: only a message that is a plain yes says yes, and words quote all of it exactly", words)
+	default:
+		delete(d.proposed, key)
+		return p.at, "", nil
+	}
+	d.proposed[key] = proposal{offer, time.Now()}
+	return time.Time{}, why, nil
 }
 
 // proposed says what answer a to a decision of kind does, completing "you will …".

@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -108,7 +110,7 @@ func TestGrantSettlesWhileAway(t *testing.T) {
 	d, _ := testDaemon(t)
 	recordNixos(t, d)
 	_, next := watchKinds(t)
-	if text := grant(t, "rebuild", "8h"); !strings.Contains(text, "Grant g1") || !strings.Contains(text, "applies once it goes on") {
+	if text := grant(t, "rebuild", "8h"); !strings.Contains(text, "Grant g1") || !strings.Contains(text, "acts only once it goes on") {
 		t.Fatalf("grant said %q", text)
 	}
 	awaitEvent(t, next, "grants")
@@ -255,7 +257,7 @@ func TestGrantOutlastsRestart(t *testing.T) {
 	}
 }
 
-// Only the user gives grants: from a frontend, or through the desk quoting their latest message.
+// Only the user gives grants: from a frontend, or through the desk on their yes. The desk revokes one on their quoted words.
 func TestGrantCallers(t *testing.T) {
 	testDesk(t)
 	if _, err := call(context.Background(), Request{Op: "grant", Node: masterNode, Name: "push", Text: "8h"}); err == nil {
@@ -264,16 +266,139 @@ func TestGrantCallers(t *testing.T) {
 	if _, err := call(context.Background(), Request{Op: "grant", Name: "anything", Text: "8h"}); err == nil {
 		t.Fatal("a grant of an unknown class")
 	}
-	desk := newMCPServer(deskNode, nil)
-	deskSays(t, "push what you merge tonight, until 9")
-	if _, err := desk.run(context.Background(), "grant", json.RawMessage(`{"class":"push","until":"09:00","words":"merge everything"}`)); err == nil {
-		t.Fatal("the desk gave a grant on words the user did not say")
+	if _, err := deskGrant(`{"class":"anything","until":"8h"}`); err == nil {
+		t.Fatal("the desk proposed a grant of an unknown class")
 	}
-	if _, err := desk.run(context.Background(), "grant", json.RawMessage(`{"class":"push","until":"09:00","words":"push what you merge tonight"}`)); err != nil {
+	if _, err := deskGrant(`{"class":"push","until":"25h"}`); err == nil {
+		t.Fatal("the desk proposed a grant longer than a day")
+	}
+	deskSays(t, "push what you merge tonight, until 9")
+	deskGrant(`{"class":"push","until":"09:00"}`)
+	deskSays(t, "yes")
+	if text, err := deskGrant(`{"class":"push","until":"09:00","words":"yes"}`); err != nil || !strings.HasPrefix(text, "Grant g1") {
+		t.Fatalf("the grant on the user's yes said %q, %v", text, err)
+	}
+	deskSays(t, "stop pushing, revoke g1")
+	if text, err := newMCPServer(deskNode, nil).run(context.Background(), "revoke", json.RawMessage(`{"id":"g1","words":"revoke g1"}`)); err != nil || text != "Revoked grant g1." {
+		t.Fatalf("the desk's revoke said %q, %v", text, err)
+	}
+}
+
+// deskGrant calls the desk's grant tool with the JSON arguments args.
+func deskGrant(args string) (string, error) {
+	return newMCPServer(deskNode, nil).run(context.Background(), "grant", json.RawMessage(args))
+}
+
+// No message of the user's gives a grant before the desk has shown it to them, however it reads, and a refusal holds no yes.
+func TestDeskGrantNeedsYes(t *testing.T) {
+	d, _ := testDesk(t)
+	noGrant := func(args, why string) string {
+		t.Helper()
+		before := len(mustCall(t, Request{Op: "status"}).Grants)
+		text, err := deskGrant(args)
+		if err != nil {
+			t.Fatalf("%s: %v", why, err)
+		}
+		if !strings.Contains(text, "bosun has not given the grant") {
+			t.Fatalf("%s: the desk's grant said %q", why, text)
+		}
+		if g := mustCall(t, Request{Op: "status"}).Grants; len(g) != before {
+			t.Fatalf("%s: grants %+v", why, g)
+		}
+		return text
+	}
+	// The first call gives nothing, whatever words it quotes.
+	deskSays(t, "don't push anything tonight")
+	noGrant(`{"class":"push","until":"8h","words":"push anything tonight"}`, "a grant on words from before it was shown")
+	if text := noGrant(`{"class":"push","until":"8h","words":"push anything tonight"}`, "a grant on the same words again"); !strings.HasPrefix(text, "The user has said nothing since you showed it.") {
+		t.Fatalf("a grant on the same words again said %q", text)
+	}
+
+	shown := noGrant(`{"class":"push","until":"09:00"}`, "the first call")
+	for _, want := range []string{"A standing grant of push, until ", "git -C <repo> push", "never a worker's call", "Away mode is off"} {
+		if !strings.Contains(shown, want) {
+			t.Fatalf("the proposal %q lacks %q", shown, want)
+		}
+	}
+	// A reply that refuses or changes the grant holds words of a yes, but is not one.
+	for reply, words := range map[string]string{
+		"no, don't push anything tonight": "push anything tonight",
+		"yes, but only until 07:00":       "yes",
+	} {
+		deskSays(t, reply)
+		if text, err := deskGrant(fmt.Sprintf(`{"class":"push","until":"09:00","words":%q}`, words)); err == nil || !strings.Contains(err.Error(), "is not "+strconv.Quote(words)) {
+			t.Fatalf("a grant on %q from %q said %q, %v", words, reply, text, err)
+		}
+		if g := mustCall(t, Request{Op: "status"}).Grants; len(g) != 0 {
+			t.Fatalf("a grant on %q from %q: grants %+v", words, reply, g)
+		}
+		noGrant(`{"class":"push","until":"09:00"}`, "proposing anew")
+	}
+	if text := noGrant(`{"class":"push","until":"07:00"}`, "proposing another end"); !strings.HasPrefix(text, "It differs from what you last showed") {
+		t.Fatalf("proposing another end said %q", text)
+	}
+	deskSays(t, "what does it push?")
+	deskSays(t, "ok, yes")
+	if text := noGrant(`{"class":"push","until":"07:00","words":"ok, yes"}`, "a grant two messages after it was shown"); !strings.HasPrefix(text, "The user has written to you more than once") {
+		t.Fatalf("a grant two messages after it was shown said %q", text)
+	}
+
+	deskSays(t, "Yes,\n  give it.")
+	text, err := deskGrant(`{"class":"push","until":"07:00","words":"Yes, give it."}`)
+	if err != nil || !strings.HasPrefix(text, "Grant g1: while away mode is on, until ") {
+		t.Fatalf("the grant on the user's yes said %q, %v", text, err)
+	}
+	g := mustCall(t, Request{Op: "status"}).Grants
+	if len(g) != 1 || g[0].Class != "push" || g[0].By != "desk" || g[0].Words != "Yes, give it." || g[0].Until.Local().Format("15:04") != "07:00" {
+		t.Fatalf("grants %+v", g)
+	}
+	// The yes gave one grant.
+	if text := noGrant(`{"class":"push","until":"07:00","words":"Yes, give it."}`, "a second grant on the same yes"); !strings.HasPrefix(text, "bosun has not given") {
+		t.Fatalf("a second grant on the same yes said %q", text)
+	}
+	if text := noGrant(`{"class":"rebuild","until":"07:00","words":"Yes, give it."}`, "a grant of a class not shown"); !strings.HasPrefix(text, "bosun has not given") {
+		t.Fatalf("a grant of a class not shown said %q", text)
+	}
+
+	var b strings.Builder
+	printStatus(&b, mustCall(t, Request{Op: "status"}))
+	if !strings.Contains(b.String(), "g1   push     until ") || !strings.Contains(b.String(), `07:00, on your words "Yes, give it."`) {
+		t.Fatalf("status shows\n%s", b.String())
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if e := d.logged[len(d.logged)-1]; e.Kind != "granted" || e.By != "desk" || e.Text != "Yes, give it." || !strings.Contains(logLine(e), `on your words "Yes, give it."`) {
+		t.Fatalf("logged %+v", e)
+	}
+}
+
+// The grant the user said yes to ends when the desk showed them, and one that ended already is not given.
+func TestDeskGrantKeepsShownEnd(t *testing.T) {
+	d, _ := testDesk(t)
+	deskGrant(`{"class":"push","until":"8h"}`)
+	d.mu.Lock()
+	p := d.proposed[grantKey+"push"]
+	p.at = p.at.Add(-time.Hour)
+	d.proposed[grantKey+"push"] = p
+	d.mu.Unlock()
+	deskSays(t, "yes")
+	if _, err := deskGrant(`{"class":"push","until":"8h","words":"yes"}`); err != nil {
 		t.Fatal(err)
 	}
-	if text, err := desk.run(context.Background(), "revoke", json.RawMessage(`{"id":"g1","words":"push what you merge"}`)); err != nil || text != "Revoked grant g1." {
-		t.Fatalf("the desk's revoke said %q, %v", text, err)
+	if g := mustCall(t, Request{Op: "status"}).Grants; len(g) != 1 || g[0].Until.Sub(p.at) != 8*time.Hour {
+		t.Fatalf("grants %+v, shown at %v", g, p.at)
+	}
+
+	deskGrant(`{"class":"rebuild","until":"1h"}`)
+	d.mu.Lock()
+	p = d.proposed[grantKey+"rebuild"]
+	p.at = p.at.Add(-2 * time.Hour)
+	d.proposed[grantKey+"rebuild"] = p
+	d.said, d.saidBefore = userMessage{}, time.Time{}
+	d.mu.Unlock()
+	deskSays(t, "yes")
+	if text, err := deskGrant(`{"class":"rebuild","until":"1h","words":"yes"}`); err == nil || !strings.Contains(err.Error(), "ended already") {
+		t.Fatalf("a grant that ended already said %q, %v", text, err)
 	}
 }
 

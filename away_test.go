@@ -210,22 +210,57 @@ func TestAwayOff(t *testing.T) {
 	}
 }
 
-// The desk switches the away mode only on the user's words.
+// The desk turns the away mode on only on the user's yes to what it showed them, and off on their quoted words.
 func TestDeskAway(t *testing.T) {
 	testDesk(t)
 	desk := newMCPServer(deskNode, io.Discard)
-	if _, err := desk.run(context.Background(), "away", json.RawMessage(`{"on":true,"words":"I'm logging off"}`)); err == nil {
-		t.Fatal("the desk turned away mode on with no word of the user's")
+	away := func(args string) string {
+		t.Helper()
+		text, err := desk.run(context.Background(), "away", json.RawMessage(args))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return text
 	}
-	deskSays(t, "ok, I'm logging off for the night")
+	stillHere := func(why, text string) {
+		t.Helper()
+		if !strings.Contains(text, "bosun has not turned away mode on") {
+			t.Fatalf("%s: away said %q", why, text)
+		}
+		if a := mustCall(t, Request{Op: "status"}).Away; a != nil {
+			t.Fatalf("%s: away = %+v", why, a)
+		}
+	}
 	if _, err := desk.run(context.Background(), "away", json.RawMessage(`{"words":"I'm logging off"}`)); err == nil {
 		t.Fatal("the desk switched away mode without saying which way")
 	}
-	if _, err := desk.run(context.Background(), "away", json.RawMessage(`{"on":true,"words":"I'm logging off"}`)); err != nil {
-		t.Fatal(err)
+	// A message that keeps the user here holds the words of one that sends them away.
+	deskSays(t, "I'm not logging off yet")
+	stillHere("on words from before it was shown", away(`{"on":true,"words":"logging off"}`))
+	grant(t, "push", "8h")
+	hook := runHookAsync(masterNode, hookEvent("PermissionRequest", "", "Bash", bashTest))
+	openDecision(t, 1)
+	shown := away(`{"on":true}`)
+	stillHere("the first call", shown)
+	for _, want := range []string{"would park the 1 decisions that wait on the user now: 1.", "g1   push     until "} {
+		if !strings.Contains(shown, want) {
+			t.Fatalf("the proposal %q lacks %q", shown, want)
+		}
 	}
-	if a := mustCall(t, Request{Op: "status"}).Away; a == nil || a.By != "desk" || a.Words != "I'm logging off" {
+	deskSays(t, "I'm not logging off yet")
+	if _, err := desk.run(context.Background(), "away", json.RawMessage(`{"on":true,"words":"logging off"}`)); err == nil {
+		t.Fatal("the desk turned away mode on on a part of a message that refuses it")
+	}
+	stillHere("proposing anew", away(`{"on":true}`))
+	deskSays(t, "yes, I'm off")
+	if text := away(`{"on":true,"words":"yes, I'm off"}`); !strings.HasPrefix(text, "Away mode is on") {
+		t.Fatalf("away on the user's yes said %q", text)
+	}
+	if a := mustCall(t, Request{Op: "status"}).Away; a == nil || a.By != "desk" || a.Words != "yes, I'm off" {
 		t.Fatalf("away = %+v", a)
+	}
+	if out := receive(t, hook); out != parkedDeny("PermissionRequest") {
+		t.Fatalf("the permission waiting on the user printed %s", out)
 	}
 	if _, err := newMCPServer(masterNode, io.Discard).run(context.Background(), "away", json.RawMessage(`{"on":false}`)); err == nil {
 		t.Fatal("the master has away")

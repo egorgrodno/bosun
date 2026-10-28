@@ -132,28 +132,41 @@ func grantRequest(args []string) (Request, error) {
 	return Request{Op: "grant", Name: args[0], Text: args[1], Words: strings.Join(args[2:], " ")}, nil
 }
 
-// onUserWordLocked checks that caller acts on the user's word: the user from a frontend, or the desk quoting words from the user's latest message. what completes "only the user and the desk …".
-func (d *daemon) onUserWordLocked(caller, words, what string) error {
-	switch caller {
-	case "":
-		return nil
-	case deskNode:
-		if squash(words) == "" {
-			return errors.New("quote the user's words that ask for it")
-		}
-		if d.said.at.IsZero() || !strings.Contains(squash(d.said.text), squash(words)) {
-			return fmt.Errorf("the user's latest message does not hold %q: quote their words exactly", words)
-		}
-		return nil
+// grantKey, followed by a grant's class, and awayKey hold in proposed the grant and the away mode the desk showed the user.
+const (
+	grantKey = "grant "
+	awayKey  = "away"
+)
+
+// userOrDesk checks that caller is the user from a frontend or the desk. what completes "only the user and the desk …".
+func userOrDesk(caller, what string) error {
+	if caller != "" && caller != deskNode {
+		return errors.New("only the user and the desk " + what)
 	}
-	return errors.New("only the user and the desk " + what)
+	return nil
 }
 
-// grant gives a standing grant of class until the time that until names, for caller acting on the user's words.
+// onUserWordLocked checks that caller acts on the user's word: the user from a frontend, or the desk quoting words from the user's latest message.
+// It suits only what hands a decision back to the user, since a quote can come from a message that refuses it. What acts without the user takes their yes through yesLocked.
+func (d *daemon) onUserWordLocked(caller, words, what string) error {
+	if err := userOrDesk(caller, what); err != nil || caller == "" {
+		return err
+	}
+	if squash(words) == "" {
+		return errors.New("quote the user's words that ask for it")
+	}
+	if d.said.at.IsZero() || !strings.Contains(squash(d.said.text), squash(words)) {
+		return fmt.Errorf("the user's latest message does not hold %q: quote their words exactly", words)
+	}
+	return nil
+}
+
+// grant gives a standing grant of class until the time that until names, for the user, or for the desk once the user said yes to it.
+// The desk's first call proposes the grant, and the second, whose words quote the yes, gives it with the end the desk showed.
 func (d *daemon) grant(caller, class, until, words string) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if err := d.onUserWordLocked(caller, words, "give grants"); err != nil {
+	if err := userOrDesk(caller, "give grants"); err != nil {
 		return "", err
 	}
 	if classWhat(class) == "" {
@@ -164,6 +177,18 @@ func (d *daemon) grant(caller, class, until, words string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if caller == deskNode {
+		shown, why, err := d.yesLocked(grantKey+class, until, words)
+		if err != nil {
+			return "", err
+		}
+		if shown.IsZero() {
+			return why + d.grantProposalLocked(class, end), nil
+		}
+		if end, _ = parseUntil(until, shown); !end.After(now) {
+			return "", errors.New("the grant you showed the user ended already: call grant without words to propose it anew")
+		}
+	}
 	d.nextGrant++
 	g := Grant{ID: "g" + strconv.Itoa(d.nextGrant), Class: class, Since: now, Until: end, By: role(caller), Words: words}
 	d.grants = append(d.grants, g)
@@ -171,11 +196,21 @@ func (d *daemon) grant(caller, class, until, words string) (string, error) {
 	d.broadcastGrantsLocked()
 	d.logLocked(Entry{Kind: "granted", By: role(caller), From: caller, Grant: &g, Text: words})
 	log.Printf("grant %s: %s until %s", g.ID, g.Class, g.Until.Format(time.RFC3339))
-	text := fmt.Sprintf("Grant %s: while away mode is on, until %s, bosun allows %s.", g.ID, untilLabel(g.Until, now), classWhat(class))
-	if d.away == nil {
-		text += " Away mode is off, so it applies once it goes on."
+	return fmt.Sprintf("Grant %s: while away mode is on, until %s, bosun allows %s. %s", g.ID, untilLabel(g.Until, now), classWhat(class), d.grantActsLocked()), nil
+}
+
+// grantActsLocked says whether a grant acts yet.
+func (d *daemon) grantActsLocked() string {
+	if d.awayLocked() {
+		return "Away mode is on, so it acts at once."
 	}
-	return text, nil
+	return "Away mode is off, so it acts only once it goes on."
+}
+
+// grantProposalLocked is what the desk's first grant call returns: the grant in full, for the desk to show the user and ask.
+func (d *daemon) grantProposalLocked(class string, end time.Time) string {
+	return fmt.Sprintf("bosun has not given the grant, and holds it until the user says yes to it. Show the user the whole grant below, ask them whether to give it, and end your turn. Once their next message says yes, call grant again with the same class and until, and words that quote all of that message.\n\nA standing grant of %s, until %s: while away mode is on, bosun would allow %s, without asking the user. It would allow only such a call as it opens, and never a worker's call, a question or a reserved action on the user's list. %s",
+		class, end.Local().Format("Mon Jan 2 15:04"), classWhat(class), d.grantActsLocked())
 }
 
 // revoke ends grant id, for caller acting on the user's words.

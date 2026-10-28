@@ -170,8 +170,8 @@ A rebuild on the allowlist that shares its command with others, as in `nxt 2>&1 
 | `activity` | every session | shows what a session, or each readable one, is doing: its latest activity and its open tool calls |
 | `transcript` | desk | shows a session's last turns: each prompt, its text and a line per tool call |
 | `answer` | desk | gives your answer to a decision that waits on you, once you have said yes to it |
-| `away` | desk | turns the away mode on or off, on your words quoted from your latest message |
-| `grant`, `revoke` | desk | gives or ends a standing grant, on your words quoted from your latest message |
+| `away` | desk | turns the away mode on after your yes to it, or off on your words quoted from your latest message |
+| `grant`, `revoke` | desk | gives a standing grant after your yes to it, or ends one on your words quoted from your latest message |
 | `tell_desk` | master | answers the desk, or the user when there is no desk |
 | `next_event` | master | blocks until a worker asks or needs a permission, a child of the master ends a turn or exits, a worker goes quiet or the user sits on a decision, or a `tell` comes from the desk, or from a frontend when there is no desk |
 | `reply` | master | answers a question |
@@ -203,15 +203,17 @@ The decision rides in `text`, not in `decision`, since `pendingLocked` drops an 
 
 ## Away mode
 
-**Away mode parks what would wait on you.** `bosun away on`, the tui or the desk's `away` tool turns it on, and `bosun away off` turns it off. The desk acts only on your words, quoted from your latest message. The mode lives in `state.json`, so it outlasts a restart and a cleared master. While it is on, every decision that would wait on you parks instead of opening, unless a standing grant allows it. That covers the master's and the desk's own permissions, reserved actions on your list, escalations and every notice, a `tell_desk` without a desk included. A notice for a permission left in its session's own prompt still opens, since only an answer there settles it. Turning the mode on parks the permissions and questions already waiting on you.
+**Away mode parks what would wait on you.** `bosun away on`, the tui or the desk's `away` tool turns it on, and `bosun away off` turns it off. The mode lives in `state.json`, so it outlasts a restart and a cleared master. While it is on, every decision that would wait on you parks instead of opening, unless a standing grant allows it. That covers the master's and the desk's own permissions, reserved actions on your list, escalations and every notice, a `tell_desk` without a desk included. A notice for a permission left in its session's own prompt still opens, since only an answer there settles it. Turning the mode on parks the permissions and questions already waiting on you.
 
 **Parked means answered at once.** A parked permission is denied, and a parked question answered, with a note that it waits for your return. The session then goes on with other work, where a held `PreToolUse` would block it for up to an hour. A parked notice waits on the list. The frontends get a `parked` event and no `decision` event, so nothing notifies you.
 
 **The master learns of it from each batch.** `next_event`'s result begins with a line that says so, and `escalate` and `notify` answer that they parked. The rules live in the tool descriptions, as "Upgrades" requires. The master escalates what needs you as it would, and merges on into the local checkout rather than wait on a push.
 
+**The desk gives a grant or turns away mode on only after your yes.** Each acts without you, so it takes two calls, as `answer` does. The first returns what it would do: a grant's class, end and what it would allow, or the decisions away mode would park and the grants it would set acting. The second, quoting your next message as its yes, does it. A grant ends where the first call showed. Turning away mode off and revoking a grant take one call, quoting words from your latest message, since a wrong match only hands decisions back to you.
+
 **Turning it off hands you one list.** The list groups identical requests and puts first what unblocks the most: pushes, then the larger groups. It goes into one notice, which `bosun status` and the tui show until you dismiss it. The desk gets it as a `back` event, the way it gets a tell. A desk that turned the mode off itself gets no `back` event, since the tool's result holds the list. A `back` event counts as no message of yours. A desk that cannot take it drops it, since the notice holds the list. A parked call was denied, so acting on an item means telling the master to run it again.
 
-**A standing grant allows a class of the master's own permissions while you are away.** `bosun grant`, the tui or the desk's `grant` tool gives one, on your words as for the away mode. `bosun revoke`, the tui or the desk's `revoke` tool ends it. A grant ends at its `until`, at most a day away, and outlasts a restart. It acts only on a decision as it opens while away mode is on. One already waiting parks, since its class was read when it opened and a worker may have changed the repository since. A grant never acts on a decision marked `userOnly`, whatever its class.
+**A standing grant allows a class of the master's own permissions while you are away.** `bosun grant`, the tui or the desk's `grant` tool gives one. `bosun revoke`, the tui or the desk's `revoke` tool ends it. A grant ends at its `until`, at most a day away, and outlasts a restart. It acts only on a decision as it opens while away mode is on. One already waiting parks, since its class was read when it opened and a worker may have changed the repository since. A grant never acts on a decision marked `userOnly`, whatever its class.
 
 **A class is a whole command of plain words.** `grantClasses` in `grants.go` holds the two:
 
@@ -274,9 +276,9 @@ The check covers only what a session sends: a message from outside bosun reaches
 
 - it repeats the proposed answer
 - you have sent the desk exactly one message since the proposal
-- its `words` appear in that message
+- its `words` are that whole message, give or take white space
 
-So a decision that opened after your message can never be answered by it. A message is a prompt you type into the desk, read from its `UserPromptSubmit`, or a `tell` of yours, which counts from when you sent it. The master's answers, a tell handed over again after a cut turn, and bosun's own prompts do not count. Every prompt bosun sends the desk must begin with `bosun:` and a space, or be listed in `deskPromptFromBosun`. Any other prompt counts as your message. A clear or a restart drops what the desk proposed.
+So a decision that opened after your message can never be answered by it. A part of a refusal cannot pass for a yes either, as "push anything tonight" in "don't push anything tonight" would. `yesLocked` holds these checks, which `grant` and turning away mode on share. A message is a prompt you type into the desk, read from its `UserPromptSubmit`, or a `tell` of yours, which counts from when you sent it. The master's answers, a tell handed over again after a cut turn, and bosun's own prompts do not count. Every prompt bosun sends the desk must begin with `bosun:` and a space, or be listed in `deskPromptFromBosun`. Any other prompt counts as your message. A clear or a restart drops what the desk proposed.
 
 **The daemon checks order and the quote, not the yes.** Whether your words say yes to that answer, and whether the desk showed you the decision, rest on the desk. The `answered` record shows you what it gave.
 

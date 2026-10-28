@@ -80,30 +80,38 @@ func reachesUser(dec *Decision) string {
 	return "the master escalated it"
 }
 
-// setAway turns the away mode on or off for caller: the user from a frontend, or the desk on the user's words, which must appear in their latest message.
+// setAway turns the away mode on or off for caller: the user from a frontend, or the desk on the user's word.
+// The desk turns it on only once the user said yes to it, as for a grant, since it parks the user's decisions and sets their grants acting. It turns it off on words quoted from the user's latest message, since that hands their decisions back to them.
 // Turning it on parks what waits on the user already, other than notices. Turning it off hands the user what was parked, as one list through the desk and as a notice.
 func (d *daemon) setAway(caller string, on bool, words string) (string, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if err := d.onUserWordLocked(caller, words, "switch the away mode"); err != nil {
+	if !on {
+		if err := d.onUserWordLocked(caller, words, "switch the away mode"); err != nil {
+			return "", err
+		}
+		return d.comeBackLocked(caller)
+	}
+	if err := userOrDesk(caller, "switch the away mode"); err != nil {
 		return "", err
 	}
-	if on {
-		return d.goAwayLocked(caller, words)
-	}
-	return d.comeBackLocked(caller)
-}
-
-func (d *daemon) goAwayLocked(caller, words string) (string, error) {
 	if d.away != nil {
 		return "", fmt.Errorf("away mode is already on, since %s", d.away.Since.Local().Format("Jan 2 15:04"))
 	}
-	d.away = &Away{Since: time.Now(), By: role(caller), Words: words}
-	d.parked = nil
-	a := *d.away
-	d.broadcastLocked(Event{Kind: "away", Away: &a})
-	d.logLocked(Entry{Kind: "away", By: role(caller), From: caller, Text: words})
-	log.Print("away mode on")
+	if caller == deskNode {
+		shown, why, err := d.yesLocked(awayKey, true, words)
+		if err != nil {
+			return "", err
+		}
+		if shown.IsZero() {
+			return why + d.awayProposalLocked(), nil
+		}
+	}
+	return d.goAwayLocked(caller, words)
+}
+
+// waitingOnUserLocked lists the permissions and questions that wait on the user, oldest first.
+func (d *daemon) waitingOnUserLocked() []*Decision {
 	var waiting []*Decision
 	for _, dec := range d.decisions {
 		if dec.Holder == "user" && dec.Kind != "notice" {
@@ -111,6 +119,39 @@ func (d *daemon) goAwayLocked(caller, words string) (string, error) {
 		}
 	}
 	slices.SortFunc(waiting, func(a, b *Decision) int { return byID(a.ID, b.ID) })
+	return waiting
+}
+
+// awayProposalLocked is what the desk's first call to turn away mode on returns: what turning it on would do, for the desk to show the user and ask.
+func (d *daemon) awayProposalLocked() string {
+	var b strings.Builder
+	b.WriteString("bosun has not turned away mode on, and holds the switch until the user says yes to it. Show the user what it does below, ask them whether to turn it on, and end your turn. Once their next message says yes, call away again with on and words that quote all of that message.\n\n")
+	b.WriteString("While away mode is on, bosun parks what would wait on the user, such as the master's push, a reserved action on the user's list, a decision the master escalates or a notice. It denies each call and answers each question with a note that it waits for the user's return, and lists them for when away mode goes off.")
+	if waiting := d.waitingOnUserLocked(); len(waiting) > 0 {
+		var ids []string
+		for _, dec := range waiting {
+			ids = append(ids, dec.ID)
+		}
+		fmt.Fprintf(&b, " Turning it on would park the %d decisions that wait on the user now: %s.", len(waiting), strings.Join(ids, ", "))
+	}
+	if len(d.grants) > 0 {
+		b.WriteString(" It would set acting these standing grants, which allow the master's calls of their class without the user:")
+		now := time.Now()
+		for _, g := range d.grants {
+			fmt.Fprintf(&b, "\n%s", grantLine(g, now))
+		}
+	}
+	return b.String()
+}
+
+func (d *daemon) goAwayLocked(caller, words string) (string, error) {
+	d.away = &Away{Since: time.Now(), By: role(caller), Words: words}
+	d.parked = nil
+	a := *d.away
+	d.broadcastLocked(Event{Kind: "away", Away: &a})
+	d.logLocked(Entry{Kind: "away", By: role(caller), From: caller, Text: words})
+	log.Print("away mode on")
+	waiting := d.waitingOnUserLocked()
 	for _, dec := range waiting {
 		d.parkLocked(dec)
 	}

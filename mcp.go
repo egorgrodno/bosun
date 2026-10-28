@@ -51,17 +51,23 @@ When the user asks you to approve, deny or answer a decision that waits on them,
 
 First call answer with the decision's id and the answer, and leave out words. For a permission, pass allow, and a message when you deny. For a question, pass answer. bosun gives nothing yet: it holds the answer and returns the decision in full. Show the user all of it, with its id, its session and the whole tool call or question, and the answer you will give. Ask whether to give it, and end your turn. When what the user asked could fit more than one decision, show each from status, ask which they mean, and propose only that one.
 
-Only the user's next message, typed to you or sent through bosun tell, can say yes. When it does, call answer again with the same id, with allow, message or answer unchanged, and with words quoted exactly from that message. bosun gives the answer only then, and bosun tui and bosun status show the user what you gave and on which words. When the user replies with anything but a plain yes to that answer, such as a question or a change, there is no yes: deal with the reply, then call answer without words again before you ask anew.
+Only the user's next message, typed to you or sent through bosun tell, can say yes. When it does, call answer again with the same id, with allow, message or answer unchanged, and with words that quote all of that message exactly. bosun gives the answer only then, and bosun tui and bosun status show the user what you gave and on which words. When the user replies with anything but a plain yes to that answer, such as a question or a change, there is no yes: deal with the reply, then call answer without words again before you ask anew.
 
 bosun refuses a notice, a decision that waits on the master, a decision of your own, and one with userOnly set. Pass on what the user wants done with one that waits on the master with tell_master. Show the user any other in full, and point them at the bosun panel or bosun tui, as status says.`
 
-	awayHelp = `Turn the away mode on when the user says they are leaving the fleet to work without them, such as "I'm logging off" or "going to bed", and off when they say they are back. Call it on their word alone, quoting it exactly from their latest message, and never of your own judgement, such as because they have gone quiet.
+	awayHelp = `Turn the away mode on when the user says they are leaving the fleet to work without them, such as "I'm logging off" or "going to bed", and off when they say they are back. Act on their word alone, never of your own judgement, such as because they have gone quiet.
+
+Turning it on takes two calls, with the user's yes between them, as answer does. First call away with on true, and leave out words. bosun turns nothing on yet: it returns what turning it on would do, the decisions it would park and the standing grants it would set acting. Show the user all of it, ask whether to turn it on, and end your turn. Do this at once, since the user is leaving: tell them it goes on only once they say yes. Only the user's next message can say yes. When it does, call away again with on true and words that quote all of that message exactly. A reply other than a plain yes, such as a question or "not yet", is no yes: deal with it, then call away without words again before you ask anew.
+
+Turning it off takes one call, with on false and the user's words that say they are back, quoted exactly from their latest message.
 
 While it is on, bosun parks what would wait on the user, such as the master's push, a reserved action on the user's list, a decision the master escalates or a notice. It denies each call and answers each question with a note that it waits for the user's return, so the fleet works on without them. bosun status shows it on and lists what it parked.
 
 Turning it off returns the list of what was parked, the one whose approval unblocks the most first. Show it to the user, and pass on what they want done with each item to the master with tell_master. A parked call was denied, so the master runs it again, or resumes the worker that made it. When the user turns it off themselves, as with bosun away off, bosun hands you the same list as a prompt.`
 
-	grantHelp = `Give a standing grant when the user asks ahead of time that bosun settle a class of the master's calls without them, such as "push whatever you merge tonight". Call it on their word alone, quoting it exactly from their latest message. A grant acts only while away mode is on, and ends at until or when revoked. bosun status lists the grants.
+	grantHelp = `Give a standing grant when the user asks ahead of time that bosun settle a class of the master's calls without them, such as "push whatever you merge tonight". Act on their word alone. A grant acts only while away mode is on, and ends at until or when revoked. bosun status lists the grants.
+
+It takes two calls, with the user's yes between them, as answer does. First call grant with the class and until, and leave out words. bosun gives nothing yet: it holds the grant and returns it in full, with its class, when it ends and what it would allow. Show the user all of it, ask whether to give it, and end your turn. Only the user's next message, typed to you or sent through bosun tell, can say yes. When it does, call grant again with the same class and until, and with words that quote all of that message exactly. bosun gives the grant only then, and bosun status, bosun tui and the log show it with those words. When the user replies with anything but a plain yes to that grant, such as a question, a refusal or another end, there is no yes: deal with the reply, then call grant without words again before you ask anew.
 
 No grant covers anything but its class, such as a worker's call, a reserved action on the user's list or a question. Tell the user so when they ask for more. The classes:`
 
@@ -175,16 +181,16 @@ func roleTools(node string) []tool {
 				"allow":   map[string]any{"type": "boolean", "description": "For a permission: true to allow the tool call, false to deny it."},
 				"message": str("For a permission you deny, why. It reaches the session verbatim, so say what to do instead, as the user put it."),
 				"answer":  str("For a question, the user's answer."),
-				"words":   str("Leave it out on the first call. On the second, the user's yes, quoted exactly from their latest message."),
+				"words":   str("Leave it out on the first call. On the second, the user's yes: all of their latest message, quoted exactly."),
 			})},
-			{"away", awayHelp, object([]string{"on", "words"}, map[string]any{
+			{"away", awayHelp, object([]string{"on"}, map[string]any{
 				"on":    map[string]any{"type": "boolean", "description": "true when the user leaves, false when they are back."},
-				"words": str("The user's words that say so, quoted exactly from their latest message."),
+				"words": str("Turning it on, leave it out on the first call, and on the second give the user's yes: all of their latest message, quoted exactly. Turning it off, the user's words that say they are back, quoted exactly from their latest message."),
 			})},
-			{"grant", grantHelp + classList(), object([]string{"class", "until", "words"}, map[string]any{
+			{"grant", grantHelp + classList(), object([]string{"class", "until"}, map[string]any{
 				"class": str("push or rebuild."),
-				"until": str("When it ends, at most a day away: a time of day such as 09:00, which means its next coming, or a duration such as 8h."),
-				"words": str("The user's words that ask for it, quoted exactly from their latest message."),
+				"until": str("When it ends, at most a day away: a time of day such as 09:00, which means its next coming, or a duration such as 8h. Pass the same on both calls: the grant ends when the first call showed."),
+				"words": str("Leave it out on the first call. On the second, the user's yes: all of their latest message, quoted exactly."),
 			})},
 			{"revoke", revokeHelp, object([]string{"id", "words"}, map[string]any{
 				"id":    str("The grant's id, such as g1, as status shows it."),

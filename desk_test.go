@@ -706,11 +706,11 @@ func TestDeskAnswerAwaitsNextMessage(t *testing.T) {
 	mustCall(t, Request{Op: "tell", Text: "yes, use haiku"})
 	haiku("yes")
 	stopHook(t, deskNode, "Answer a: use haiku?")
-	if text := haiku("use haiku"); !strings.Contains(text, "said nothing since") {
+	if text := haiku("yes, use haiku"); !strings.Contains(text, "said nothing since") {
 		t.Fatalf("an answer on a tell sent before it was shown returned %q", text)
 	}
 	tellInTurn("yes, use haiku")
-	if text := haiku("use haiku"); text != "bosun answered decision 1 on the user's word." {
+	if text := haiku("yes, use haiku"); text != "bosun answered decision 1 on the user's word." {
 		t.Fatalf("the answer on the user's tell returned %q", text)
 	}
 	if got := receive(t, asked); got != "Use haiku." {
@@ -747,7 +747,7 @@ func TestDeskAnswerAwaitsNextMessage(t *testing.T) {
 		t.Fatalf("an answer on a yes from before it was asked again returned %q", text)
 	}
 	deskSays(t, "yes")
-	if text, _ := deskAnswer(`{"id":"2","answer":"Use haiku.","words":"yes"}`); !strings.HasPrefix(text, "It differs from the answer you last showed") {
+	if text, _ := deskAnswer(`{"id":"2","answer":"Use haiku.","words":"yes"}`); !strings.HasPrefix(text, "It differs from what you last showed") {
 		t.Fatalf("an answer other than the one shown returned %q", text)
 	}
 	// A clear leaves the desk no memory of what it showed.

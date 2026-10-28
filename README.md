@@ -25,7 +25,7 @@ bosun interrupt worker-a
 bosun attach <id>
 ```
 
-`bosun` alone lists every command. `bosun pause` stops every session, such as before a reboot, and `bosun unpause` resumes the turns it cut. `bosun away on 'off to bed'` keeps the fleet working while you are gone: bosun parks what would wait on you, and `bosun away off` hands you the list through the desk. Telling the desk you are leaving, or back, does the same. `bosun grant push 09:00` lets bosun allow the master's pushes while you are away, until 09:00, and `bosun revoke g1` takes it back. `bosun model -effort low desk sonnet` moves the desk to another model and effort, keeping its conversation, and `m` in `bosun tui` does the same for the master or the desk.
+`bosun` alone lists every command. `bosun pause` stops every session, such as before a reboot, and `bosun unpause` resumes the turns it cut. `bosun away on 'off to bed'` keeps the fleet working while you are gone: bosun parks what would wait on you, and `bosun away off` hands you the list through the desk. Telling the desk you are leaving does the same once you say yes to what it shows you, and telling it you are back turns the mode off. `bosun grant push 09:00` lets bosun allow the master's pushes while you are away, until 09:00, and `bosun revoke g1` takes it back. `bosun model -effort low desk sonnet` moves the desk to another model and effort, keeping its conversation, and `m` in `bosun tui` does the same for the master or the desk.
 
 While a session other than the desk works, the daemon holds a logind sleep lock, so the machine does not sleep mid-run. It lets go after 10 quiet minutes, and your own idle step suspends the machine then. `-sleep-lock off|battery` and `-sleep-lock-quiet` tune it.
 
