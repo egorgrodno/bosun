@@ -615,6 +615,7 @@ func TestReservedUnsandboxedReads(t *testing.T) {
 		"cd / && ls",
 		"du -sh ~",
 		"echo ~/.claude/settings.json",
+		"echo ~/.ssh/id_ed25519 | wc -c",
 		// Scratch folders, whoever's, and a claude-<uid> folder anywhere.
 		"cp x " + state + "/nodes/a/tmp/x",
 		"rm -rf " + state + "/nodes/b/tmp/claude-1000/build",

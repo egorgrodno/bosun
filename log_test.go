@@ -231,29 +231,29 @@ func TestLogOutlastsRestart(t *testing.T) {
 	d.mu.Lock()
 	d.logLocked(Entry{Kind: "paused", By: "user"})
 	d.mu.Unlock()
-	if n, old := lines(d.logPath()), lines(oldLogPath(dir)); n != keptLog || old != 2*keptLog {
+	if n, old := lines(d.logPath()), lines(oldLogFile(dir)); n != 0 || old != 2*keptLog {
 		t.Fatalf("after the rotation log.jsonl holds %d lines and log.1.jsonl %d", n, old)
 	}
 
+	// The daemon keeps the latest entries from log.1.jsonl while log.jsonl holds fewer.
 	d = load()
-	if d.logged[keptLog-1].Kind != "paused" || d.logSeq != 2*keptLog-1 {
-		t.Fatalf("after the rotation loaded up to %d, the last %+v", d.logSeq, d.logged[keptLog-1])
+	if len(d.logged) != keptLog || d.logged[keptLog-1].Kind != "paused" || d.logSeq != 2*keptLog-1 {
+		t.Fatalf("after the rotation loaded %d up to %d", len(d.logged), d.logSeq)
 	}
 	d.mu.Lock()
 	d.logLocked(Entry{Kind: "unpaused", By: "user"})
 	d.mu.Unlock()
-	var seqs []int
-	if err := readLogs(dir, func(e Entry) { seqs = append(seqs, e.Seq) }); err != nil {
-		t.Fatal(err)
-	}
-	if len(seqs) != 2*keptLog || seqs[0] != 1 || !slices.IsSorted(seqs) || seqs[len(seqs)-1] != 2*keptLog {
-		t.Fatalf("readLogs read %d entries, %v to %v", len(seqs), seqs[0], seqs[len(seqs)-1])
+	d = load()
+	if len(d.logged) != keptLog || d.logged[keptLog-2].Kind != "paused" || d.logged[keptLog-1].Kind != "unpaused" || d.logSeq != 2*keptLog {
+		t.Fatalf("across both files loaded %d up to %d", len(d.logged), d.logSeq)
 	}
 
-	// A crash between a rotation's two steps leaves log.1.jsonl alone, and Seq still rises.
-	os.Remove(d.logPath())
-	if d = load(); d.logSeq != 2*keptLog-1 {
-		t.Fatalf("with log.1.jsonl alone loaded up to %d", d.logSeq)
+	all, err := readLogs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2*keptLog || all[0].Seq != 1 || !slices.IsSortedFunc(all, func(a, b Entry) int { return a.Seq - b.Seq }) || all[len(all)-1].Seq != 2*keptLog {
+		t.Fatalf("readLogs read %d entries, %d to %d", len(all), all[0].Seq, all[len(all)-1].Seq)
 	}
 }
 

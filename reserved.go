@@ -236,11 +236,11 @@ func inner(argv []string, i int) (script string, lo, hi int, ok bool) {
 }
 
 func (g gate) git(args, dirs []string) reservation {
-	cd, sub, rest, plain := gitCommand(args)
+	cd, sub, rest, opt := gitCommand(args)
 	switch sub {
 	case "push":
-		if !plain {
-			return reservation{"a push with an option bosun does not check", true, rulePushOption, gitOption(args)}
+		if opt != "" {
+			return pushOption.on(opt)
 		}
 		named, r := pushArgs(rest)
 		if r.reason != "" {
@@ -280,23 +280,12 @@ func (g gate) git(args, dirs []string) reservation {
 	return reservation{}
 }
 
-// gitOption is the first of git's own options in args other than -C, which is what makes a push not plain.
-func gitOption(args []string) string {
-	for i := 0; i < len(args) && strings.HasPrefix(args[i], "-"); i++ {
-		if args[i] != "-C" {
-			return args[i]
-		}
-		i++
-	}
-	return ""
-}
-
-// gitCommand splits git's arguments into the directories its -C options name, its subcommand and the subcommand's arguments. plain reports whether git has no other option, any of which could move the repository or its config.
-func gitCommand(args []string) (cd []string, sub string, rest []string, plain bool) {
-	plain = true
+// gitCommand splits git's arguments into the directories its -C options name, its subcommand and the subcommand's arguments. opt is git's first other option, any of which could move the repository or its config, or "" when it has none.
+func gitCommand(args []string) (cd []string, sub string, rest []string, opt string) {
 	i := 0
 	for ; i < len(args) && strings.HasPrefix(args[i], "-"); i++ {
-		switch args[i] {
+		a := args[i]
+		switch a {
 		case "-C":
 			if i+1 < len(args) {
 				cd = append(cd, args[i+1])
@@ -306,12 +295,12 @@ func gitCommand(args []string) (cd []string, sub string, rest []string, plain bo
 		case "-c", "--git-dir", "--work-tree", "--namespace", "--config-env":
 			i++
 		}
-		plain = false
+		opt = cmp.Or(opt, a)
 	}
 	if i >= len(args) {
-		return cd, "", nil, plain
+		return cd, "", nil, opt
 	}
-	return cd, args[i], args[i+1:], plain
+	return cd, args[i], args[i+1:], opt
 }
 
 // pushFlags are git push's options that take no value and change neither where it pushes nor what it may overwrite.
@@ -426,15 +415,18 @@ func (g gate) outside(script string) reservation {
 		return reservation{}
 	}
 	if !slices.ContainsFunc(argv, func(w string) bool { return !plainWord.MatchString(w) }) && argv[0] == "git" {
-		if _, sub, _, plain := gitCommand(argv[1:]); sub == "push" && plain {
+		if _, sub, _, opt := gitCommand(argv[1:]); sub == "push" && opt == "" {
 			return reservation{}
 		}
 	}
 	if r := g.userUnboxed(script, g.cwd); r.reason != "" {
 		return r
 	}
-	first, _, _ := strings.Cut(strings.TrimSpace(script), " ")
-	return reservation{"a command outside the sandbox", false, ruleUnboxed, first}
+	r := reservation{"a command outside the sandbox", false, ruleUnboxed, ""}
+	if cmds := simpleCommands(script); len(cmds) > 0 && len(cmds[0].argv) > 0 {
+		r.match = cmds[0].argv[0]
+	}
+	return r
 }
 
 // userUnboxed says what in script, run outside the sandbox in dir, only the user may allow. dir is "" when bosun cannot tell where a command runs.
@@ -443,8 +435,10 @@ func (g gate) userUnboxed(script, dir string) reservation {
 	for _, cmd := range simpleCommands(script) {
 		argv := cmd.argv
 		var words []string
-		for _, w := range argv {
-			words = append(words, g.list.words(w, dir)...)
+		expanded := make([][]string, len(argv))
+		for i, w := range argv {
+			expanded[i] = g.list.words(w, dir)
+			words = append(words, expanded[i]...)
 		}
 		// A rebuild the allowlist takes stays the master's beside other commands, which this checks apart.
 		if r := asRoot(words); r.reason != "" && !rebuild(argv) {
@@ -460,13 +454,13 @@ func (g gate) userUnboxed(script, dir string) reservation {
 				}
 			}
 		}
-		for i, w := range argv {
-			if r := g.uses(w, dir, acc[i]); r.reason != "" {
+		for i := range argv {
+			if r := g.uses(expanded[i], dir, acc[i]); r.reason != "" {
 				return r
 			}
 		}
 		for _, f := range cmd.files {
-			if r := g.uses(f.word, dir, f.access); r.reason != "" {
+			if r := g.uses(g.list.words(f.word, dir), dir, f.access); r.reason != "" {
 				return r
 			}
 		}
@@ -486,18 +480,17 @@ func (g gate) userUnboxed(script, dir string) reservation {
 	return reservation{}
 }
 
-// uses says whether word, used as a in a command run in dir, names a path on the user's list that only the user may let it use: any it may write, and a credential it reads.
-func (g gate) uses(word, dir string, a access) reservation {
+// uses says whether a word that expands to paths, used as a in a command run in dir, names a path on the user's list that only the user may let it use: any it may write, and a credential it reads.
+func (g gate) uses(paths []string, dir string, a access) reservation {
 	if a == text {
 		return reservation{}
 	}
-	for _, p := range g.list.words(word, dir) {
+	for _, p := range paths {
 		what := g.names(p, dir)
 		if what == "" || a == reads && what != credentials {
 			continue
 		}
-		rule := map[access]string{reads: ruleUnboxRead, writes: ruleUnboxWrite, unclear: ruleUnboxNames}[a]
-		return reservation{"a command outside the sandbox that names " + what, true, rule, p}
+		return reservation{"a command outside the sandbox that names " + what, true, accessRules[a], p}
 	}
 	return reservation{}
 }
@@ -514,9 +507,14 @@ const (
 	text
 )
 
+// accessRules are the rules that a path on the user's list meets, by what the command does with it.
+var accessRules = [...]string{unclear: ruleUnboxNames, reads: ruleUnboxRead, writes: ruleUnboxWrite}
+
 var (
 	// readers write no file their arguments name.
-	readers = []string{"cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "ls", "wc", "stat", "du", "df", "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum", "realpath", "readlink", "basename", "dirname", "test", "[", "echo", "printf", "pwd", "cd", "pushd", "column", "cut", "nl", "od", "hexdump", "strings"}
+	readers = []string{"cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "ls", "wc", "stat", "du", "df", "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum", "realpath", "readlink", "basename", "dirname", "test", "[", "pwd", "cd", "pushd", "column", "cut", "nl", "od", "hexdump", "strings"}
+	// texters take text, and open no file their arguments name.
+	texters = []string{"echo", "printf"}
 	// findActions make find write or run a command.
 	findActions = []string{"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"}
 	// writers may write every file their arguments name.
@@ -559,8 +557,8 @@ func accesses(argv []string) (acc []access, reader bool) {
 		}
 	}
 	switch name := filepath.Base(argv[i]); {
-	case name == "bosun" && (i+1 == len(argv) || argv[i+1] != "daemon"):
-		// Its commands write nothing but what the daemon keeps.
+	// bosun's commands other than daemon write nothing but what the daemon keeps.
+	case slices.Contains(texters, name), name == "bosun" && (i+1 == len(argv) || argv[i+1] != "daemon"):
 		set(text)
 		return acc, true
 	case name == "jq":
@@ -709,7 +707,7 @@ const (
 
 // newUserList places the user's list in home, Claude Code's config directory claude, bosun's state directory state, and the XDG directories that getenv names.
 func newUserList(home, claude, state string, getenv func(string) string) userList {
-	l := userList{home: home, vars: map[string]string{"HOME": home, "CLAUDE_CONFIG_DIR": claude}, scratch: components(filepath.Join(state, "nodes", "*", "tmp"))}
+	l := userList{home: home, vars: map[string]string{"HOME": home, "CLAUDE_CONFIG_DIR": claude}, scratch: components(nodeTempDir(state, "*"))}
 	if user := getenv("USER"); user != "" {
 		l.vars["USER"] = user
 	}
@@ -748,7 +746,7 @@ var (
 // In the session's own worktree, only what the session's next start runs outside the sandbox counts.
 func (l userList) holds(path string, worktree bool) string {
 	comps := components(path)
-	if filepath.IsAbs(path) && len(comps) >= len(l.scratch) && slices.EqualFunc(comps[:len(l.scratch)], l.scratch, func(c, s string) bool { return s == "*" || c == s }) {
+	if filepath.IsAbs(path) && len(comps) >= len(l.scratch) && slices.EqualFunc(l.scratch, comps[:len(l.scratch)], like) {
 		return ""
 	}
 	is := func(c string, names ...string) bool {

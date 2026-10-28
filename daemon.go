@@ -564,7 +564,12 @@ func (d *daemon) deskDir() string {
 
 // tempDir is the node's TMPDIR.
 func (d *daemon) tempDir(node string) string {
-	return filepath.Join(d.stateDir, "nodes", node, "tmp")
+	return nodeTempDir(d.stateDir, node)
+}
+
+// nodeTempDir is the TMPDIR of node in the state directory stateDir.
+func nodeTempDir(stateDir, node string) string {
+	return filepath.Join(stateDir, "nodes", node, "tmp")
 }
 
 // tempDirRoom is the most bytes a TMPDIR may hold beside the sockets Claude Code's sandbox creates in it.

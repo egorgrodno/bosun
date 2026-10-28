@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
@@ -10,6 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 )
 
@@ -23,7 +23,7 @@ var logRotate = 10000
 const logInputCut = 2000
 
 func (d *daemon) logPath() string {
-	return filepath.Join(d.stateDir, "log.jsonl")
+	return logFile(d.stateDir)
 }
 
 // logLocked adds e to the fleet's log, shows it to the frontends and appends it to log.jsonl.
@@ -59,47 +59,40 @@ func (d *daemon) logLocked(e Entry) {
 	}
 }
 
-// oldLogPath is where log.jsonl goes once it holds logRotate entries.
-func oldLogPath(stateDir string) string {
-	return filepath.Join(stateDir, "log.1.jsonl")
+// logFile is the log in stateDir, and oldLogFile where it goes once it holds logRotate entries.
+func logFile(stateDir string) string    { return filepath.Join(stateDir, "log.jsonl") }
+func oldLogFile(stateDir string) string { return filepath.Join(stateDir, "log.1.jsonl") }
+
+// rotateLog moves log.jsonl to log.1.jsonl, in place of the one before. The next entry starts a new log.jsonl.
+func (d *daemon) rotateLog() error {
+	d.logLines = 0
+	return os.Rename(d.logPath(), oldLogFile(d.stateDir))
 }
 
-// rotateLog moves log.jsonl to log.1.jsonl, in place of the one before, and starts log.jsonl anew with the entries the daemon keeps.
-// The two files then share those entries, which a reader of both tells apart by Seq.
-func (d *daemon) rotateLog() error {
-	if err := os.Rename(d.logPath(), oldLogPath(d.stateDir)); err != nil {
+// loadLog reads the latest entries of log.jsonl, and of log.1.jsonl where log.jsonl holds fewer, and rotates log.jsonl once it holds logRotate entries.
+func (d *daemon) loadLog() error {
+	data, err := os.ReadFile(d.logPath())
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
-	var buf bytes.Buffer
-	for _, e := range d.logged {
-		line, _ := json.Marshal(e)
-		buf.Write(append(line, '\n'))
-	}
-	d.logLines = len(d.logged)
-	return writeDurably(d.logPath(), buf.Bytes())
-}
-
-// loadLog reads the latest entries of log.jsonl, and rotates it once it holds logRotate entries.
-func (d *daemon) loadLog() error {
-	keep := func(e Entry) {
-		d.logged = append(d.logged, e)
-		d.logged = d.logged[max(0, len(d.logged)-keptLog):]
-		d.logSeq = max(d.logSeq, e.Seq)
-	}
-	lines, cut, err := readLog(d.logPath(), keep)
-	if errors.Is(err, fs.ErrNotExist) {
-		// A crash between a rotation's two steps leaves only log.1.jsonl, whose Seq the next entry must pass.
-		if _, _, err := readLog(oldLogPath(d.stateDir), keep); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	d.logged = lastEntries(data, keptLog)
+	if len(d.logged) < keptLog {
+		old, err := os.ReadFile(oldLogFile(d.stateDir))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
-		return nil
+		d.logged = append(lastEntries(old, keptLog-len(d.logged)), d.logged...)
 	}
-	if err != nil {
-		return err
+	for _, e := range d.logged {
+		d.logSeq = max(d.logSeq, e.Seq)
 	}
-	d.logLines = lines
+	cut := len(data) > 0 && data[len(data)-1] != '\n'
+	d.logLines = bytes.Count(data, []byte("\n"))
+	if cut {
+		d.logLines++
+	}
 	switch {
-	case lines >= logRotate:
+	case d.logLines >= logRotate:
 		return d.rotateLog()
 	case cut:
 		// The next entry would otherwise join the line a crash cut short.
@@ -116,39 +109,31 @@ func (d *daemon) loadLog() error {
 	return nil
 }
 
-// readLog hands each entry of the log file at path to fn, and returns how many lines it holds and whether its last line lacks its newline. A crash may cut that line short, and readLog skips any line that is no entry.
-func readLog(path string, fn func(Entry)) (lines int, cut bool, err error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, false, err
-	}
-	sc := bufio.NewScanner(bytes.NewReader(data))
-	sc.Buffer(nil, len(data)+1)
-	for sc.Scan() {
-		lines++
+// lastEntries returns the latest n entries of a log file's data, oldest first. It skips any line that is no entry, as a crash may cut the last one short, and parses no line older than it needs.
+func lastEntries(data []byte, n int) []Entry {
+	lines := bytes.Split(data, []byte("\n"))
+	var out []Entry
+	for i := len(lines) - 1; i >= 0 && len(out) < n; i-- {
 		var e Entry
-		if json.Unmarshal(sc.Bytes(), &e) == nil {
-			fn(e)
+		if json.Unmarshal(lines[i], &e) == nil {
+			out = append(out, e)
 		}
 	}
-	return lines, len(data) > 0 && data[len(data)-1] != '\n', sc.Err()
+	slices.Reverse(out)
+	return out
 }
 
-// readLogs hands fn every entry that log.1.jsonl and log.jsonl in stateDir hold, oldest first, each once.
-func readLogs(stateDir string, fn func(Entry)) error {
-	last := 0
-	for _, path := range []string{oldLogPath(stateDir), filepath.Join(stateDir, "log.jsonl")} {
-		_, _, err := readLog(path, func(e Entry) {
-			if e.Seq > last {
-				last = e.Seq
-				fn(e)
-			}
-		})
+// readLogs returns every entry that log.1.jsonl and log.jsonl in stateDir hold, oldest first.
+func readLogs(stateDir string) ([]Entry, error) {
+	var out []Entry
+	for _, path := range []string{oldLogFile(stateDir), logFile(stateDir)} {
+		data, err := os.ReadFile(path)
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			return err
+			return nil, err
 		}
+		out = append(out, lastEntries(data, math.MaxInt)...)
 	}
-	return nil
+	return out, nil
 }
 
 // cutInput cuts each long string in a tool call's input short.

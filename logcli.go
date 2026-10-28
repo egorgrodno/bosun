@@ -27,14 +27,15 @@ func runLog(args []string) error {
 	if err != nil {
 		return err
 	}
+	all, err := readLogs(stateDir())
+	if err != nil {
+		return err
+	}
 	var entries []Entry
-	err = readLogs(stateDir(), func(e Entry) {
+	for _, e := range all {
 		if !e.At.Before(from) && (!*reached || e.Kind == "settled" && reachedUser(e)) {
 			entries = append(entries, e)
 		}
-	})
-	if err != nil {
-		return err
 	}
 	switch {
 	case *asJSON:
