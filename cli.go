@@ -229,7 +229,28 @@ func runConversation(cmd string, args []string) error {
 	}
 }
 
+// masterHeld counts the decisions the master holds.
+func masterHeld(decisions []Decision) int {
+	n := 0
+	for _, d := range decisions {
+		if d.Holder == "master" {
+			n++
+		}
+	}
+	return n
+}
+
+func masterHoldsLine(n int) string {
+	return fmt.Sprintf("The master holds %d.", n)
+}
+
+// printStatus prints the fleet for the user: the decisions that wait on them, and the master's as a count.
 func printStatus(w io.Writer, s Response) {
+	printFleet(w, s, false)
+}
+
+// printFleet prints the fleet. withMaster lists the decisions the master holds too, as the master and the workers read them.
+func printFleet(w io.Writer, s Response, withMaster bool) {
 	if s.Paused {
 		fmt.Fprintln(w, "Paused: bosun unpause resumes the turns it stopped.")
 	}
@@ -252,7 +273,11 @@ func printStatus(w io.Writer, s Response) {
 		fmt.Fprintf(w, "  %-4s %-12s %s\n", p.Decision.ID, p.Decision.Node, parkedLine(p))
 		fmt.Fprintf(w, "       because %s\n", p.Why)
 	}
-	for _, holder := range []string{"user", "master"} {
+	holders := []string{"user"}
+	if withMaster {
+		holders = append(holders, "master")
+	}
+	for _, holder := range holders {
 		first := true
 		for _, dec := range s.Decisions {
 			if dec.Holder != holder {
@@ -267,6 +292,9 @@ func printStatus(w io.Writer, s Response) {
 				fmt.Fprintf(w, "       master: %s\n", dec.Note)
 			}
 		}
+	}
+	if n := masterHeld(s.Decisions); n > 0 && !withMaster {
+		fmt.Fprintln(w, masterHoldsLine(n))
 	}
 	if len(s.Answered) > 0 {
 		fmt.Fprintln(w, "Answered by the desk on your word:")

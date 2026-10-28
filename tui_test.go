@@ -20,6 +20,7 @@ func testTUI() *tui {
 			{ID: "2", Kind: "question", Node: "a", Holder: "master", Question: "X or Y?"},
 			{ID: "3", Kind: "permission", Node: "a", Holder: "user", Tool: "Bash", Input: []byte(`{"command":"git push"}`), Reserved: "a git push"},
 			{ID: "4", Kind: "notice", Node: masterNode, Holder: "user", Note: "spawn failed"},
+			{ID: "6", Kind: "question", Node: "b", Holder: "user", Question: "red or blue?"},
 		},
 	}
 }
@@ -33,8 +34,8 @@ func TestTUIItems(t *testing.T) {
 			got = append(got, it.session.Node)
 		}
 	}
-	if want := []string{"3", "4", "2", deskNode, masterNode, "a", "b"}; !slices.Equal(got, want) {
-		t.Fatalf("items %v, want the user's decisions, the master's, then the desk and the tree: %v", got, want)
+	if want := []string{"3", "4", "6", deskNode, masterNode, "a", "b"}; !slices.Equal(got, want) {
+		t.Fatalf("items %v, want only the user's decisions, then the desk and the tree: %v", got, want)
 	}
 }
 
@@ -58,7 +59,7 @@ func TestTUIKeys(t *testing.T) {
 	for _, k := range splitKeys([]byte("Yes!\x7f")) {
 		tu.key(k)
 	}
-	if a, ok := tu.key("\r"); !ok || a != (tuiAction{op: "reply", id: "2", text: "Yes"}) {
+	if a, ok := tu.key("\r"); !ok || a != (tuiAction{op: "reply", id: "6", text: "Yes"}) {
 		t.Fatalf("an answer: %+v %v", a, ok)
 	}
 	tu.key("j")
@@ -77,10 +78,23 @@ func TestTUIKeys(t *testing.T) {
 func TestTUIRender(t *testing.T) {
 	tu := testTUI()
 	screen := strings.Join(tu.render(80, 20), "\n")
-	for _, want := range []string{"Waiting on you", "git push", "[a git push]", "spawn failed", "Waiting on the master", "X or Y?", "Sessions", "    b ", "y approve"} {
+	for _, want := range []string{"Waiting on you", "git push", "[a git push]", "spawn failed", "red or blue?", "The master holds 1.", "Sessions", "    b ", "y approve"} {
 		if !strings.Contains(screen, want) {
 			t.Errorf("the screen lacks %q:\n%s", want, screen)
 		}
+	}
+	if strings.Contains(screen, "X or Y?") || strings.Contains(screen, "Waiting on the master") {
+		t.Errorf("the screen lists the master's decision:\n%s", screen)
+	}
+	var b strings.Builder
+	printStatus(&b, Response{Sessions: tu.sessions, Decisions: tu.decisions})
+	if out := b.String(); strings.Contains(out, "X or Y?") || !strings.Contains(out, "red or blue?") || !strings.Contains(out, "The master holds 1.") {
+		t.Errorf("status lists the master's decision or lacks the user's:\n%s", out)
+	}
+	b.Reset()
+	printFleet(&b, Response{Decisions: tu.decisions}, true)
+	if out := b.String(); !strings.Contains(out, "X or Y?") || strings.Contains(out, "The master holds") {
+		t.Errorf("the master's view lacks its decision:\n%s", out)
 	}
 	if lines := tu.render(80, 5); len(lines) != 5 || !strings.Contains(strings.Join(lines, "\n"), reverse) {
 		t.Fatalf("a short screen loses the selected line: %q", lines)
@@ -96,7 +110,7 @@ func TestTUIApply(t *testing.T) {
 	for _, d := range tu.decisions {
 		ids = append(ids, d.ID)
 	}
-	if !slices.Equal(ids, []string{"3", "4", "10"}) {
+	if !slices.Equal(ids, []string{"3", "4", "6", "10"}) {
 		t.Fatalf("decisions %v", ids)
 	}
 

@@ -555,7 +555,7 @@ func fleetStatus(s Response) string {
 	var b strings.Builder
 	messages := s.Messages
 	s.Messages = nil
-	printStatus(&b, s)
+	printFleet(&b, s, true)
 	if len(s.Decisions) > 0 {
 		data, _ := json.MarshalIndent(s.Decisions, "", "  ")
 		fmt.Fprintf(&b, "\nThe decisions in full:\n%s\n", data)

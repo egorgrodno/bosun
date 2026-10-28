@@ -94,14 +94,12 @@ type tuiAction struct {
 	op, id, name, text string
 }
 
-// items lists the decisions waiting on the user, then those waiting on the master, then the standing grants, then the sessions depth first.
+// items lists the decisions waiting on the user, then the standing grants, then the sessions depth first. The master's decisions are no items: render counts them.
 func (t *tui) items() []tuiItem {
 	var items []tuiItem
-	for _, holder := range []string{"user", "master"} {
-		for i := range t.decisions {
-			if t.decisions[i].Holder == holder {
-				items = append(items, tuiItem{decision: &t.decisions[i]})
-			}
+	for i := range t.decisions {
+		if t.decisions[i].Holder == "user" {
+			items = append(items, tuiItem{decision: &t.decisions[i]})
 		}
 	}
 	for i := range t.grants {
@@ -312,15 +310,15 @@ func (t *tui) render(width, height int) []string {
 		}
 		add("", "", false)
 	}
+	if n := masterHeld(t.decisions); n > 0 {
+		add(dim, masterHoldsLine(n), false)
+	}
 	items := t.items()
 	section := ""
 	for i, it := range items {
 		title := "Sessions"
 		if it.decision != nil {
-			title = "Waiting on the " + it.decision.Holder
-			if it.decision.Holder == "user" {
-				title = "Waiting on you"
-			}
+			title = "Waiting on you"
 		}
 		if it.grant != nil {
 			title = grantsHeader(t.away != nil)
