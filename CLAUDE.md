@@ -203,7 +203,7 @@ The decision rides in `text`, not in `decision`, since `pendingLocked` drops an 
 
 ## Away mode
 
-**Away mode parks what would wait on you.** `bosun away on`, the tui or the desk's `away` tool turns it on, and `bosun away off` turns it off. The desk acts only on your words, quoted from your latest message. The mode lives in `state.json`, so it outlasts a restart and a cleared master. While it is on, every decision that would wait on you parks instead of opening, unless a standing grant allows it. That covers the master's and the desk's own permissions, reserved actions on your list, escalations and every notice, a `tell_desk` without a desk included. A notice for a permission left in its session's own prompt still opens, since only an answer there settles it. Turning the mode on parks the permissions and questions already waiting on you, or allows them under a grant.
+**Away mode parks what would wait on you.** `bosun away on`, the tui or the desk's `away` tool turns it on, and `bosun away off` turns it off. The desk acts only on your words, quoted from your latest message. The mode lives in `state.json`, so it outlasts a restart and a cleared master. While it is on, every decision that would wait on you parks instead of opening, unless a standing grant allows it. That covers the master's and the desk's own permissions, reserved actions on your list, escalations and every notice, a `tell_desk` without a desk included. A notice for a permission left in its session's own prompt still opens, since only an answer there settles it. Turning the mode on parks the permissions and questions already waiting on you.
 
 **Parked means answered at once.** A parked permission is denied, and a parked question answered, with a note that it waits for your return. The session then goes on with other work, where a held `PreToolUse` would block it for up to an hour. A parked notice waits on the list. The frontends get a `parked` event and no `decision` event, so nothing notifies you.
 
@@ -211,12 +211,12 @@ The decision rides in `text`, not in `decision`, since `pendingLocked` drops an 
 
 **Turning it off hands you one list.** The list groups identical requests and puts first what unblocks the most: pushes, then the larger groups. It goes into one notice, which `bosun status` and the tui show until you dismiss it. The desk gets it as a `back` event, the way it gets a tell. A desk that turned the mode off itself gets no `back` event, since the tool's result holds the list. A `back` event counts as no message of yours. A desk that cannot take it drops it, since the notice holds the list. A parked call was denied, so acting on an item means telling the master to run it again.
 
-**A standing grant allows a class of the master's own permissions while you are away.** `bosun grant`, the tui or the desk's `grant` tool gives one, on your words as for the away mode. `bosun revoke`, the tui or the desk's `revoke` tool ends it. A grant ends at its `until`, at most a day away, and outlasts a restart. It acts only while away mode is on, and never on a decision marked `userOnly`, whatever its class.
+**A standing grant allows a class of the master's own permissions while you are away.** `bosun grant`, the tui or the desk's `grant` tool gives one, on your words as for the away mode. `bosun revoke`, the tui or the desk's `revoke` tool ends it. A grant ends at its `until`, at most a day away, and outlasts a restart. It acts only on a decision as it opens while away mode is on. One already waiting parks, since its class was read when it opened and a worker may have changed the repository since. A grant never acts on a decision marked `userOnly`, whatever its class.
 
 **A class is a whole command of plain words.** `grantClasses` in `grants.go` holds the two:
 
-- `push`: a push that the allowlist passes, carrying only the options in `grantPushFlags`
-- `rebuild`: a rebuild that the allowlist passes, on `/etc/nixos` itself and not a worktree
+- `push`: a push that the allowlist passes, whose first `-C` names its repository by an absolute path, carrying only the options in `grantPushFlags`
+- `rebuild`: a rebuild that the allowlist passes, on `/etc/nixos` itself and not a worktree, while the git setup of `/etc/nixos` matches its record
 
 A command that chains, pipes or redirects matches no class. So each batch's away line names the live grants and the form each covers, and the master runs its call in that form.
 
@@ -375,7 +375,7 @@ The snapshot's `paused`, and the `paused` and `unpaused` events, show a pause. A
 
 The snapshot's `away` is `{"since":…,"by":"user","words":"off to bed"}` while away mode is on, and is left out otherwise. Its `parked` lists what parked since, each as `{"decision":…,"why":"it is the master's own permission","at":…}`. An `away` event starts the mode, in its `away`, with an empty list. Each `parked` event adds the item in its `parked`. A `back` event ends both. `away` takes `name` `on` or `off`, and `words`, as `{"op":"away","name":"on","words":"off to bed"}`.
 
-The snapshot's `grants` lists the grants that have not ended, each as `{"id":"g1","class":"push","since":…,"until":…,"by":"user","words":…}`. A `grants` event carries the whole list again after each change. `grant` takes the class in `name`, its end in `text` (`09:00`, `8h` or RFC 3339), and the user's words in `words`, as `{"op":"grant","name":"push","text":"09:00"}`. `revoke` takes the grant's `id`.
+The snapshot's `grants` lists the grants that have not ended, each as `{"id":"g1","class":"push","since":…,"until":…,"by":"user","words":…}`. A `grants` event carries the whole list again after each change, and leaves `grants` out once none is left. `grant` takes the class in `name`, its end in `text` (`09:00`, `8h` or RFC 3339), and the user's words in `words`, as `{"op":"grant","name":"push","text":"09:00"}`. `revoke` takes the grant's `id`.
 
 A session's `status` comes from Claude Code's listing, which shows it busy after its turn ended while a background command still runs, and for a few seconds after any turn. From a `Stop` or `StopFailure` until a hook of a new turn or a listing that shows the session idle or stopped, the snapshot and the `sessions` event show it `idle` with no `state`, and `say` and `interrupt` treat it as idle. The daemon's own record keeps the listing's status.
 

@@ -116,11 +116,8 @@ func (d *daemon) goAwayLocked(caller, words string) (string, error) {
 	}
 	d.saveLocked()
 	text := "Away mode is on: bosun parks what would wait on the user, and the master carries on with the rest."
-	if len(d.parked) > 0 {
-		text += fmt.Sprintf(" It parked the %d decisions that waited on the user already.", len(d.parked))
-	}
-	if granted := len(waiting) - len(d.parked); granted > 0 {
-		text += fmt.Sprintf(" It allowed %d under standing grants.", granted)
+	if len(waiting) > 0 {
+		text += fmt.Sprintf(" It parked the %d decisions that waited on the user already.", len(waiting))
 	}
 	return text, nil
 }

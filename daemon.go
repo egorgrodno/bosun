@@ -817,15 +817,17 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 	var reserved reservation
 	var class string
 	// The checks may run git, which a worker's repository can hold up, so they run outside the lock.
+	var g *gate
 	if in.Event == "PreToolUse" || in.Event == "PermissionRequest" && node == masterNode {
-		if g := d.gate(node, in.Cwd); g != nil {
-			if in.Event == "PreToolUse" {
-				reserved = g.reserved(in.ToolName, in.ToolInput)
-			}
-			if node == masterNode {
-				class = g.grantClass(in.ToolName, in.ToolInput)
-			}
-		}
+		g = d.gate(node, in.Cwd)
+	}
+	switch {
+	case g == nil:
+	case in.Event == "PreToolUse":
+		reserved = g.reserved(in.ToolName, in.ToolInput)
+	default:
+		// The allowlist lets every call a grant covers past the reserved check, so only a PermissionRequest asks about one.
+		class = g.grantClass(in.ToolName, in.ToolInput)
 	}
 	d.mu.Lock()
 	n := d.nodes[node]

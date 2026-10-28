@@ -36,6 +36,7 @@ func TestGrantClass(t *testing.T) {
 		"git -C /r push upstream main":                    "",
 		"git -C /changed push origin main":                "",
 		"git -C /r -c core.sshCommand=x push origin main": "",
+		"git -C r push origin main":                       "",
 		"nixos-rebuild test --sudo --flake /etc/nixos":    "rebuild",
 		"nixos-rebuild build --flake /etc/nixos#host":     "rebuild",
 		"nxt": "rebuild",
@@ -54,6 +55,22 @@ func TestGrantClass(t *testing.T) {
 	if got := g.grantClass("Write", json.RawMessage(`{"file_path":"/r/x"}`)); got != "" {
 		t.Errorf("a write falls in %q", got)
 	}
+	g.repos = fakeRepos{change: map[string]string{"/etc/nixos": "whose config's core.fsmonitor changed"}}
+	if got := g.grantClass("Bash", json.RawMessage(`{"command":"nxt"}`)); got != "" {
+		t.Errorf("nxt with /etc/nixos changed falls in %q", got)
+	}
+}
+
+// recordNixos points nixosRepo at a repository that d has a record of.
+func recordNixos(t *testing.T, d *daemon) {
+	t.Helper()
+	_, repo, _ := recorded(t)
+	if err := d.repos().record(repo); err != nil {
+		t.Fatal(err)
+	}
+	was := nixosRepo
+	nixosRepo = repo
+	t.Cleanup(func() { nixosRepo = was })
 }
 
 func TestParseUntil(t *testing.T) {
@@ -89,6 +106,7 @@ func masterAsks(t *testing.T, command string) string {
 // A grant settles the master's call of its class only while the user is away, and the log names it. The master's other calls park.
 func TestGrantSettlesWhileAway(t *testing.T) {
 	d, _ := testDaemon(t)
+	recordNixos(t, d)
 	_, next := watchKinds(t)
 	if text := grant(t, "rebuild", "8h"); !strings.Contains(text, "Grant g1") || !strings.Contains(text, "applies once it goes on") {
 		t.Fatalf("grant said %q", text)
@@ -100,10 +118,11 @@ func TestGrantSettlesWhileAway(t *testing.T) {
 	if dec.Holder != "user" || dec.Class != "rebuild" {
 		t.Fatalf("with away mode off, the master's rebuild opened %+v", dec)
 	}
-	mustCall(t, Request{Op: "deny", ID: dec.ID})
-	receive(t, hook)
-
+	// Its class was read before away mode went on, so it parks.
 	goAway(t, "off to bed")
+	if out := receive(t, hook); out != parkedDeny("PermissionRequest") {
+		t.Fatalf("the rebuild already waiting printed %s", out)
+	}
 	if out := masterAsks(t, "nxt"); out != allowed {
 		t.Fatalf("the master's rebuild printed %s", out)
 	}
@@ -182,6 +201,7 @@ func TestGrantNeverSettlesUserOnly(t *testing.T) {
 // A revoked grant and one past its time settle nothing, and each end is logged.
 func TestGrantEnds(t *testing.T) {
 	d, _ := testDaemon(t)
+	recordNixos(t, d)
 	grant(t, "rebuild", "8h")
 	goAway(t, "")
 	if text := mustCall(t, Request{Op: "revoke", ID: "g1"}).Text; text != "Revoked grant g1." {
@@ -219,6 +239,7 @@ func TestGrantEnds(t *testing.T) {
 // Grants outlast a restart of the daemon, and their ids keep counting.
 func TestGrantOutlastsRestart(t *testing.T) {
 	d, _ := testDaemon(t)
+	recordNixos(t, d)
 	grant(t, "rebuild", "8h")
 	goAway(t, "")
 	restart(t, d)

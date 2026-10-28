@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -25,6 +26,9 @@ var grantClasses = []grantClass{
 // grantMax bounds how long a grant lasts.
 const grantMax = 24 * time.Hour
 
+// nixosRepo is the repository that rebuild's /etc/nixos names, which a test points elsewhere.
+var nixosRepo = "/etc/nixos"
+
 // grantPushFlags are the options of git push that a grant's push may carry.
 var grantPushFlags = []string{"-u", "--set-upstream", "--follow-tags", "-q", "--quiet", "-v", "--verbose", "--porcelain"}
 
@@ -43,39 +47,33 @@ func (g gate) grantClass(tool string, input json.RawMessage) string {
 	argv := strings.Split(in.Command, " ")
 	// rebuild checks each word itself, and takes the # of a host attribute, which plainWord does not.
 	if rebuild(argv) {
-		// A worktree's configuration is code that only the master has read.
-		if slices.ContainsFunc(argv, func(w string) bool { return strings.Contains(w, "/.claude/worktrees/") }) {
+		// A worktree's configuration is code that only the master has read. nix reads /etc/nixos through git, whose config a worker can write.
+		if slices.ContainsFunc(argv, func(w string) bool { return strings.Contains(w, "/.claude/worktrees/") }) || g.repos.changed(nixosRepo) != "" {
 			return ""
 		}
 		return "rebuild"
 	}
-	if argv[0] != "git" || slices.ContainsFunc(argv, func(w string) bool { return !plainWord.MatchString(w) }) {
+	if argv[0] != "git" || !allPlain(argv) {
 		return ""
 	}
 	cd, sub, rest, opt := gitCommand(argv[1:])
-	if sub != "push" || opt != "" {
+	// The hook's cwd may not be where the shell runs, so the repository must not depend on it.
+	if sub != "push" || opt != "" || len(cd) == 0 || !filepath.IsAbs(cd[0]) {
 		return ""
 	}
 	if slices.ContainsFunc(rest, func(a string) bool { return strings.HasPrefix(a, "-") && !slices.Contains(grantPushFlags, a) }) {
 		return ""
 	}
-	named, r := pushArgs(rest)
-	if r.reason != "" {
-		return ""
-	}
-	dir := at(g.cwd, cd)
-	if dir == "" {
-		return ""
-	}
-	for _, name := range named {
-		if !slices.Contains(g.repos.remotes(dir), name) {
-			return ""
-		}
-	}
-	if g.repos.changed(dir) != "" {
+	g.unboxed = true
+	if g.git(argv[1:], []string{g.cwd}).reason != "" {
 		return ""
 	}
 	return "push"
+}
+
+// allPlain reports whether every word of argv is a plainWord.
+func allPlain(argv []string) bool {
+	return !slices.ContainsFunc(argv, func(w string) bool { return !plainWord.MatchString(w) })
 }
 
 func classWhat(name string) string {
@@ -231,6 +229,10 @@ func (d *daemon) broadcastGrantsLocked() {
 // Grants act only while the user is away, and never on a reserved action on the user's list, whatever its class.
 func (d *daemon) grantLocked(dec *Decision) bool {
 	if !d.awayLocked() || dec.UserOnly || dec.Kind != "permission" || dec.Node != masterNode || dec.Class == "" {
+		return false
+	}
+	// A decision already open, as when away mode goes on, had its class read when it opened, and a worker may have written the repository's git setup since.
+	if d.decisions[dec.ID] == dec {
 		return false
 	}
 	now := time.Now()

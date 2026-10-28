@@ -15,7 +15,7 @@ func (g gate) outside(script string) reservation {
 	if rebuild(argv) {
 		return reservation{}
 	}
-	if !slices.ContainsFunc(argv, func(w string) bool { return !plainWord.MatchString(w) }) && argv[0] == "git" {
+	if allPlain(argv) && argv[0] == "git" {
 		if _, sub, _, opt := gitCommand(argv[1:]); sub == "push" && opt == "" {
 			return reservation{}
 		}
