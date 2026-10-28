@@ -1852,7 +1852,7 @@ func TestSpawnLeavesRoomForSandboxSockets(t *testing.T) {
 		refused bool
 	}{{33, false}, {34, true}} {
 		// No repo, so a name the check lets through fails on that instead, before anything is written.
-		_, err := d.spawn("", strings.Repeat("n", tc.length), "", "", "", "x", nil, false)
+		_, err := d.spawn("", strings.Repeat("n", tc.length), "", "", "", "x", nil, false, 0)
 		if refused := err != nil && strings.Contains(err.Error(), "sockets"); refused != tc.refused {
 			t.Errorf("spawn of a %d-character name: %v", tc.length, err)
 		}

@@ -163,7 +163,7 @@ A rebuild on the allowlist that shares its command with others, as in `nxt 2>&1 
 | `spawn` | the master and workers | starts a child session |
 | `merge` | the master and workers | lands a finished worker's branch and removes the worker |
 | `ask` | workers | sends a question to the master and blocks until the answer |
-| `tell_master` | desk | queues the user's instruction for the master |
+| `tell_master` | desk | queues the user's instruction for the master, and returns its number |
 | `status` | every session | shows what `bosun status` shows. The desk's also shows each decision and message in full |
 | `conversation` | every session | shows a session's conversation entries, as `bosun conversation` prints them less the `meta` ones, 20 by default |
 | `log` | every session | reads the log, filtered by `since`, `node`, `kind`, `by` and `reached_user` |
@@ -267,6 +267,8 @@ The check covers only what a session sends: a message from outside bosun reaches
 **The daemon carries tells both ways.** A frontend's `tell` and the master's `tell_desk` queue text for the desk. The desk gets its queue the way a worker parent gets its children's reports. In a turn, the daemon blocks its `Stop` with the queue as the reason. Between turns, the daemon resumes it with the queue as the prompt, and a stopped desk resumes like an idle one. A turn cut short gives back the tells it took, marked `again`. Tells cut short twice go on to the master, so a desk whose every turn fails cannot loop on them. The desk's `tell_master` reaches the master as a `tell` event with `from` set to `desk`.
 
 **Without a desk, tells go to the master.** When the desk could not start, its session is gone or a usage limit stopped it, a `tell` goes to the master and a `tell_desk` reaches you as a notice. The master may run on a model the limit spares. A desk that the daemon fails to resume, or that a limit stops, hands on its queue the same way.
+
+**Instructions.** Each `tell_master` gets the next number, which its result gives as "instruction N". The counter lives in `state.json` and outlasts a restart. The `tell` log entry and the `tell` event the master gets carry it as `instruction`. The master's `tell_desk`, `spawn`, `resume` and `merge` take an optional `instruction`, filled in from the tell it acts on, which their `tell`, `spawned`, `resumed` and `merged` entries carry, so a frontend links an instruction to its outcome exactly. The desk's report of a `tell_desk` names the number. A worker's tools take none, and your own tells to the desk carry none. `notify` and `escalate` take none: they open decisions for you, which have their own entries, and a worker's decision cannot name an instruction.
 
 **The desk answers a decision only after your yes to it.** Its `answer` takes two calls. The first proposes an answer to one decision. The daemon holds it and returns the decision in full, for the desk to show you. The second gives the answer, under three conditions:
 
@@ -404,11 +406,11 @@ A session's `activity` shows what it does: `tool` with `arg`, the main argument 
 | `decision` | a decision or notice began to wait on you | `decision`, `rule`, `match`, `route` |
 | `escalated` | the master passed a decision to you | `decision`, `text`: the master's note, `rule`, `match`, `route` |
 | `settled` | a decision was settled | `decision`, and `behavior`, `text`, `words` or `withdrawn` with `cause`, `rule`, `match`, `route`, `waited`. `grant` names the grant that allowed it |
-| `tell` | the user, the desk or the master told `node`, `master` or `desk` | `text` |
+| `tell` | the user, the desk or the master told `node`, `master` or `desk` | `text`, and `instruction` (see Instructions) |
 | `message` | session `from` messaged `node` | `text` |
-| `spawned` | the user or a session started worker `node` | `text`: the prompt, `repo`, `model`, `effort` |
-| `resumed` | the master gave worker `node` a new prompt | `text`: the prompt, and the `model` and `effort` it runs at after |
-| `merged` | a session merged worker `node` | `repo`, `text`: what the merge did |
+| `spawned` | the user or a session started worker `node` | `text`: the prompt, `repo`, `model`, `effort`, `instruction` |
+| `resumed` | the master gave worker `node` a new prompt | `text`: the prompt, and the `model` and `effort` it runs at after, `instruction` |
+| `merged` | a session merged worker `node` | `repo`, `text`: what the merge did, `instruction` |
 | `killed` | the user stopped `node` | |
 | `paused` | the user paused the fleet | |
 | `unpaused` | the user resumed the fleet | `text`: which turns resumed |

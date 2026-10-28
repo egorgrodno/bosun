@@ -26,6 +26,8 @@ func object(required []string, props map[string]any) map[string]any {
 	return map[string]any{"type": "object", "properties": props, "required": required}
 }
 
+var instructionProp = map[string]any{"type": "integer", "description": "The instruction number of the tell you act on, as the tell event gave it. Left out for work no tell asked for."}
+
 func str(description string) map[string]any {
 	return map[string]any{"type": "string", "description": description}
 }
@@ -99,7 +101,7 @@ When the user leaves the fleet to work without them, as overnight, they turn on 
 - Answer tells with tell_desk as you would: the desk keeps your answers for the user, and without a desk they park.
 
 The events:
-- tell: an instruction from the user. Act on it, usually by starting workers with spawn. With from set to desk, the front desk relays it: the desk is the session the user talks to, which reads the fleet but changes nothing in it, so it passes the user's instructions to you. Act on such a tell as on the user's own. Answer every tell with tell_desk, whatever its from: that is how the user hears of it. Answer once you have acted on it, such as by spawning a worker for it, and again once you know how it ended. When acting on it is all it needs, one answer covers both.
+- tell: an instruction from the user. Act on it, usually by starting workers with spawn. With from set to desk, the front desk relays it: the desk is the session the user talks to, which reads the fleet but changes nothing in it, so it passes the user's instructions to you. Act on such a tell as on the user's own. Answer every tell with tell_desk, whatever its from: that is how the user hears of it. Answer once you have acted on it, such as by spawning a worker for it, and again once you know how it ended. When acting on it is all it needs, one answer covers both. A tell from the desk carries instruction, a number: pass it as instruction to the tell_desk, spawn, resume and merge that act on it, so the user can follow the instruction to its outcome.
 - decision of kind question: a worker asks something. Settle it with reply or escalate.
 - decision of kind permission: a worker wants to run a tool, or bosun holds a reserved action of the worker's. Settle it with decide or escalate.
 - turn_end: a worker finished a turn, and its last message says what it did, or that the turn failed on an API error. To give it more to do, such as a fix after review or another try, call resume. Once its work is right, call merge.
@@ -210,13 +212,14 @@ func roleTools(node string) []tool {
 	}
 	return []tool{
 		{"spawn", "Start a worker session in its own git worktree, branched from the repository's checked-out HEAD, with prompt as its task." + peersHelp, object([]string{"name", "repo", "prompt"}, map[string]any{
-			"name":       str(nameHelp),
-			"repo":       str("Path to a git repository Claude Code trusts."),
-			"prompt":     str("The worker's task. It sees nothing else, so say everything it needs."),
-			"model":      str(modelHelp),
-			"effort":     str(effortHelp),
-			"plugins":    map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": pluginsHelp},
-			"connectors": map[string]any{"type": "boolean", "description": connectorsHelp},
+			"name":        str(nameHelp),
+			"repo":        str("Path to a git repository Claude Code trusts."),
+			"prompt":      str("The worker's task. It sees nothing else, so say everything it needs."),
+			"model":       str(modelHelp),
+			"effort":      str(effortHelp),
+			"plugins":     map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": pluginsHelp},
+			"connectors":  map[string]any{"type": "boolean", "description": connectorsHelp},
+			"instruction": instructionProp,
 		})},
 		{"next_event", nextEventHelp, object([]string{}, map[string]any{})},
 		{"reply", "Answer a worker's question. The worker gets the answer as the result of its ask. Answer when the user's instructions or the worker's task settle the question, and escalate it otherwise.", object([]string{"id", "answer"}, map[string]any{
@@ -229,13 +232,15 @@ func roleTools(node string) []tool {
 			"message": str("When denying, why. It reaches the worker verbatim, so tell it what to do instead."),
 		})},
 		{"merge", "Merge a worker's branch into the branch it began from once you have reviewed it, then remove the worker with its worktree and branch. It only fast-forwards: when the worker's branch has fallen behind, resume the worker to rebase onto it first. When the merge needs the user, as when they switched the checkout to another branch, tell them with notify. Merge with this tool, never with git: your sandbox cannot write to a repository, so git would wait on the user.", object([]string{"name"}, map[string]any{
-			"name": str("The worker's node name."),
+			"name":        str("The worker's node name."),
+			"instruction": instructionProp,
 		})},
 		{"resume", "Give a worker that ended its turn, or stopped in the middle of one, a new prompt, such as a fix after review. It carries on in the same conversation and worktree, and its next turn_end comes as an event. Give a model or effort to switch it for this turn on, such as a higher effort after a failed attempt, or a lower one once the hard part is done. The switch moves the worker to a new session id, which the daemon follows.", object([]string{"name", "prompt"}, map[string]any{
-			"name":   str("The worker's node name."),
-			"prompt": str("What to do next. The worker remembers its task, so say only what is new."),
-			"model":  str("The model to switch to, as for spawn. Left out, it keeps its own."),
-			"effort": str("The effort to switch to, as for spawn. Left out, it keeps its own."),
+			"name":        str("The worker's node name."),
+			"prompt":      str("What to do next. The worker remembers its task, so say only what is new."),
+			"model":       str("The model to switch to, as for spawn. Left out, it keeps its own."),
+			"effort":      str("The effort to switch to, as for spawn. Left out, it keeps its own."),
+			"instruction": instructionProp,
 		})},
 		{"escalate", "Hand a question or permission request to the user, who answers it from bosun. Its worker keeps waiting, and the decision needs nothing more from you. While away mode is on, it reaches nobody: bosun parks the decision on the list the user gets when they come back, and denies the call or answers the question with a note that it waits for them, so the worker carries on.", object([]string{"id"}, map[string]any{
 			"id":   str("The decision's id."),
@@ -245,7 +250,8 @@ func roleTools(node string) []tool {
 			"message": str("What happened, and what the user can do about it."),
 		})},
 		{"tell_desk", "Answer a tell: tell the front desk, the session the user talks to, what became of an instruction, such as which worker took it, what merged, or what failed and waits on the user. The desk passes it on to the user, and when there is no desk, the user gets it as a notice. Keep it short, and say which instruction it answers. The desk takes no messages, so answer it only with this.", object([]string{"text"}, map[string]any{
-			"text": str("The answer."),
+			"text":        str("The answer."),
+			"instruction": instructionProp,
 		})},
 	}
 }
@@ -418,6 +424,7 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		Message     string   `json:"message"`
 		Note        string   `json:"note"`
 		Text        string   `json:"text"`
+		Instruction int      `json:"instruction"`
 		Turns       int      `json:"turns"`
 		Words       string   `json:"words"`
 		Before      string   `json:"before"`
@@ -446,10 +453,13 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	case "spawn":
 		req.Name, req.Repo, req.Model, req.Effort, req.Text = args.Name, args.Repo, args.Model, args.Effort, args.Prompt
 		req.Plugins, req.Connectors = args.Plugins, args.Connectors
+		req.Instruction = args.Instruction
 	case "resume":
 		req.Name, req.Model, req.Effort, req.Text = args.Name, args.Model, args.Effort, args.Prompt
+		req.Instruction = args.Instruction
 	case "merge":
 		req.Name = args.Name
+		req.Instruction = args.Instruction
 	case "ask":
 		req.Text = args.Question
 	case "reply":
@@ -488,7 +498,7 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 		req.Words = args.Words
 	case "tell_master", "tell_desk":
 		// The daemon passes a tell on by who sends it.
-		req.Op, req.Text = "tell", args.Text
+		req.Op, req.Text, req.Instruction = "tell", args.Text, args.Instruction
 	case "transcript":
 		req.Name, req.Turns = args.Name, args.Turns
 	case "activity":
@@ -498,6 +508,10 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	case "conversation":
 		req.Name, req.Before, req.Limit = args.Name, args.Before, cmp.Or(args.Limit, mcpConvLimit)
 		return s.conversation(ctx, req)
+	}
+	if s.node != masterNode {
+		// Only the master acts on the desk's instructions.
+		req.Instruction = 0
 	}
 	send := call
 	if name == "ask" || name == "next_event" {
@@ -518,7 +532,7 @@ func (s *mcpServer) run(ctx context.Context, name string, raw json.RawMessage) (
 	case "status":
 		return fleetStatus(resp), nil
 	case "tell_master":
-		return "The master has it. Its answer comes to you through bosun.", nil
+		return fmt.Sprintf("The master has it as instruction %d. Its answer comes to you through bosun.", resp.Instruction), nil
 	case "tell_desk":
 		return "The user will hear of it through the desk.", nil
 	case "next_event":

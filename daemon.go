@@ -165,6 +165,8 @@ type daemon struct {
 	// grants are the user's standing grants that have not ended, and nextGrant numbers the last one given.
 	grants    []Grant
 	nextGrant int
+	// nextInstruction numbers the last instruction the desk passed to the master.
+	nextInstruction int
 	// sleep is the sleep lock the daemon holds while the fleet works.
 	sleep sleepLock
 }
@@ -194,18 +196,19 @@ type preCall struct {
 }
 
 type savedState struct {
-	NextID    int             `json:"nextId"`
-	Sessions  []*Session      `json:"sessions"`
-	Events    []Event         `json:"events,omitempty"`
-	Taken     []Event         `json:"taken,omitempty"`
-	TakenKey  string          `json:"takenKey,omitempty"`
-	Decisions []savedDecision `json:"decisions,omitempty"`
-	Answered  []Answered      `json:"answered,omitempty"`
-	Paused    bool            `json:"paused,omitempty"`
-	Away      *Away           `json:"away,omitempty"`
-	Parked    []Parked        `json:"parked,omitempty"`
-	Grants    []Grant         `json:"grants,omitempty"`
-	NextGrant int             `json:"nextGrant,omitempty"`
+	NextID          int             `json:"nextId"`
+	Sessions        []*Session      `json:"sessions"`
+	Events          []Event         `json:"events,omitempty"`
+	Taken           []Event         `json:"taken,omitempty"`
+	TakenKey        string          `json:"takenKey,omitempty"`
+	Decisions       []savedDecision `json:"decisions,omitempty"`
+	Answered        []Answered      `json:"answered,omitempty"`
+	Paused          bool            `json:"paused,omitempty"`
+	Away            *Away           `json:"away,omitempty"`
+	Parked          []Parked        `json:"parked,omitempty"`
+	Grants          []Grant         `json:"grants,omitempty"`
+	NextGrant       int             `json:"nextGrant,omitempty"`
+	NextInstruction int             `json:"nextInstruction,omitempty"`
 }
 
 // savedDecision is a decision with what the protocol leaves out of it.
@@ -418,6 +421,7 @@ func (d *daemon) load() error {
 	d.events, d.taken, d.takenKey, d.paused, d.answered = st.Events, st.Taken, st.TakenKey, st.Paused, st.Answered
 	d.away, d.parked = st.Away, st.Parked
 	d.grants, d.nextGrant = st.Grants, st.NextGrant
+	d.nextInstruction = st.NextInstruction
 	for _, sd := range st.Decisions {
 		dec := sd.Decision
 		dec.toolUseID, dec.key, dec.opened, dec.rule, dec.match = sd.ToolUseID, sd.Key, sd.Opened, sd.Rule, sd.Match
@@ -443,7 +447,7 @@ func (d *daemon) saveLocked() {
 	if d.stopping {
 		return
 	}
-	st := savedState{NextID: d.nextID, Events: d.events, Taken: d.taken, TakenKey: d.takenKey, Answered: d.answered, Paused: d.paused, Away: d.away, Parked: d.parked, Grants: d.grants, NextGrant: d.nextGrant}
+	st := savedState{NextID: d.nextID, Events: d.events, Taken: d.taken, TakenKey: d.takenKey, Answered: d.answered, Paused: d.paused, Away: d.away, Parked: d.parked, Grants: d.grants, NextGrant: d.nextGrant, NextInstruction: d.nextInstruction}
 	for _, n := range d.sortedLocked() {
 		st.Sessions = append(st.Sessions, n)
 	}
@@ -753,7 +757,7 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	case "dismiss":
 		resp.Text, err = d.answer(r.Node, r.ID, r.Words, "notice", answer{})
 	case "tell":
-		err = d.tell(r.Node, r.Text)
+		resp.Instruction, err = d.tell(r.Node, r.Text, r.Instruction)
 	case "say":
 		resp.Text, err = d.say(ctx, r.Node, r.Name, r.Text)
 	case "interrupt":
@@ -773,9 +777,9 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	case "activity":
 		resp.Text, err = d.activityReport(r.Node, r.Name)
 	case "spawn":
-		resp.Session, err = d.spawn(r.Node, r.Name, r.Repo, r.Model, r.Effort, r.Text, r.Plugins, r.Connectors)
+		resp.Session, err = d.spawn(r.Node, r.Name, r.Repo, r.Model, r.Effort, r.Text, r.Plugins, r.Connectors, r.Instruction)
 	case "resume":
-		err = d.resume(ctx, r.Node, r.Name, r.Model, r.Effort, r.Text)
+		err = d.resume(ctx, r.Node, r.Name, r.Model, r.Effort, r.Text, r.Instruction)
 	case "attach":
 		err = d.attach(r.ID)
 	case "attached":
@@ -783,7 +787,7 @@ func (d *daemon) handle(ctx context.Context, r Request) Response {
 	case "kill":
 		err = d.kill(r.Name)
 	case "merge":
-		resp.Text, err = d.merge(ctx, r.Node, r.Name)
+		resp.Text, err = d.merge(ctx, r.Node, r.Name, r.Instruction)
 	case "model":
 		err = d.switchSession(ctx, cmp.Or(r.Name, masterNode), r.Model, r.Effort)
 	case "pause":
@@ -1611,9 +1615,10 @@ func (d *daemon) deskLocked() *Session {
 
 // tell passes on text from caller: the user's from a frontend to the desk, the desk's to the master, and the master's to the desk.
 // When the desk could not start, its session is gone or a usage limit stopped it, the user's goes to the master and the master's to the user.
-func (d *daemon) tell(caller, text string) error {
+// The desk's tell gets the next instruction number, which tell returns. The master's carries the number of the instruction it answers, if any.
+func (d *daemon) tell(caller, text string, answers int) (int, error) {
 	if text == "" {
-		return errors.New("nothing to tell")
+		return 0, errors.New("nothing to tell")
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
@@ -1621,16 +1626,20 @@ func (d *daemon) tell(caller, text string) error {
 	e := Entry{Kind: "tell", By: role(caller), From: caller, Node: masterNode, Text: text}
 	switch {
 	case caller == deskNode:
-		d.pushLocked(Event{Kind: "tell", From: deskNode, Text: text})
+		d.nextInstruction++
+		e.Instruction = d.nextInstruction
+		// pushLocked saves the counter with the event.
+		d.pushLocked(Event{Kind: "tell", From: deskNode, Text: text, Instruction: e.Instruction})
 	case caller == masterNode && desk == nil:
 		// The notice logs it.
 		d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: "The master answers: " + text, from: masterNode})
-		return nil
+		return 0, nil
 	case caller == masterNode:
-		d.queueLocked(desk, Event{Kind: "tell", From: masterNode, Text: text})
+		e.Instruction = answers
+		d.queueLocked(desk, Event{Kind: "tell", From: masterNode, Text: text, Instruction: answers})
 		e.Node = deskNode
 	case caller != "":
-		return errors.New("only the user, the desk and the master tell")
+		return 0, errors.New("only the user, the desk and the master tell")
 	case desk == nil:
 		d.pushLocked(Event{Kind: "tell", Text: text})
 	default:
@@ -1638,7 +1647,7 @@ func (d *daemon) tell(caller, text string) error {
 		e.Node = deskNode
 	}
 	d.logLocked(e)
-	return nil
+	return e.Instruction, nil
 }
 
 // deskReport is what bosun hands the desk: the user's tells and the master's answers.
@@ -1651,6 +1660,9 @@ func deskReport(evs []Event) string {
 			part = "bosun: the user turned away mode off. While they were away, bosun parked what would have waited on them: it denied each call and answered each question with a note that it waits for their return, and kept each notice. Show the user this list, the one whose approval unblocks the most first, and pass on what they want done with each to the master with tell_master. bosun also shows it as a notice in bosun status:\n"
 		case ev.From == masterNode:
 			part = "bosun: the master answers:\n"
+			if ev.Instruction > 0 {
+				part = fmt.Sprintf("bosun: the master answers instruction %d:\n", ev.Instruction)
+			}
 		}
 		if ev.Again {
 			part = "bosun: a turn of yours that took this was cut short, so you may have acted on it already.\n" + part
@@ -2133,8 +2145,8 @@ func (d *daemon) snapshotLocked() Response {
 }
 
 // spawn starts a child of caller, or of the master when a frontend asks. A child of the master needs repo; a deeper one branches from its parent's worktree.
-func (d *daemon) spawn(caller, name, repo, model, effort, prompt string, plugins []string, connectors bool) (*Session, error) {
-	spawned := Entry{Kind: "spawned", By: role(caller), From: caller, Node: name, Text: prompt}
+func (d *daemon) spawn(caller, name, repo, model, effort, prompt string, plugins []string, connectors bool, instruction int) (*Session, error) {
+	spawned := Entry{Kind: "spawned", By: role(caller), From: caller, Node: name, Text: prompt, Instruction: instruction}
 	caller = cmp.Or(caller, masterNode)
 	if caller == deskNode {
 		return nil, errors.New("the desk starts no sessions: pass the user's instruction to the master with tell_master")
@@ -2563,7 +2575,7 @@ func (d *daemon) kill(name string) error {
 
 // merge fast-forwards the branch that worker name began from to the worker's branch, then removes the worker: its session, worktree and branch.
 // Its parent or the master may merge it, since the master hears of a worker whose parent the user stopped.
-func (d *daemon) merge(ctx context.Context, caller, name string) (string, error) {
+func (d *daemon) merge(ctx context.Context, caller, name string, instruction int) (string, error) {
 	d.mu.Lock()
 	n := d.nodes[name]
 	var id string
@@ -2576,7 +2588,7 @@ func (d *daemon) merge(ctx context.Context, caller, name string) (string, error)
 		text, err := d.dropGone(n)
 		if err == nil {
 			d.mu.Lock()
-			d.logLocked(Entry{Kind: "merged", By: role(caller), From: caller, Node: name, Repo: n.Repo, Text: text})
+			d.logLocked(Entry{Kind: "merged", By: role(caller), From: caller, Node: name, Repo: n.Repo, Text: text, Instruction: instruction})
 			d.mu.Unlock()
 		}
 		return text, err
@@ -2616,7 +2628,7 @@ func (d *daemon) merge(ctx context.Context, caller, name string) (string, error)
 	d.dropLocked(name)
 	d.saveLocked()
 	d.broadcastSessionsLocked()
-	d.logLocked(Entry{Kind: "merged", By: role(caller), From: caller, Node: name, Repo: n.Repo, Text: text})
+	d.logLocked(Entry{Kind: "merged", By: role(caller), From: caller, Node: name, Repo: n.Repo, Text: text, Instruction: instruction})
 	log.Printf("merged and removed %s", name)
 	return text, nil
 }
@@ -2803,7 +2815,7 @@ func checkEffort(effort string) error {
 }
 
 // resume gives a worker that ended its turn a new prompt, on another model or effort when asked.
-func (d *daemon) resume(ctx context.Context, caller, name, model, effort, prompt string) error {
+func (d *daemon) resume(ctx context.Context, caller, name, model, effort, prompt string, instruction int) error {
 	if caller != masterNode {
 		return errors.New("only the master resumes a worker")
 	}
@@ -2827,7 +2839,7 @@ func (d *daemon) resume(ctx context.Context, caller, name, model, effort, prompt
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	e := Entry{Kind: "resumed", By: masterNode, From: masterNode, Node: name, Text: prompt}
+	e := Entry{Kind: "resumed", By: masterNode, From: masterNode, Node: name, Text: prompt, Instruction: instruction}
 	if n := d.nodes[name]; n != nil {
 		e.Model, e.Effort = n.Model, n.Effort
 	}

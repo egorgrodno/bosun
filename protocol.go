@@ -37,8 +37,10 @@ type Request struct {
 	// Words quotes the user's message that the desk's answer to a decision acts on.
 	Words string `json:"words,omitempty"`
 	// Plugins and Connectors are what a spawn adds to the worker's lean start.
-	Plugins    []string `json:"plugins,omitempty"`
-	Connectors bool     `json:"connectors,omitempty"`
+	// Instruction is the number of the desk's instruction that a master's tell_desk, spawn, resume or merge acts on.
+	Instruction int      `json:"instruction,omitempty"`
+	Plugins     []string `json:"plugins,omitempty"`
+	Connectors  bool     `json:"connectors,omitempty"`
 
 	// Key names a request that its client sends again, unchanged, once the daemon is back from a restart.
 	Key string `json:"key,omitempty"`
@@ -46,18 +48,20 @@ type Request struct {
 
 // Response is a line the daemon sends: a "result" for each request, and on a watch a "snapshot" followed by "event"s.
 type Response struct {
-	Type      string     `json:"type"`
-	Error     string     `json:"error,omitempty"`
-	Behavior  string     `json:"behavior,omitempty"`
-	Text      string     `json:"text,omitempty"`
-	Session   *Session   `json:"session,omitempty"`
-	Events    []Event    `json:"events,omitempty"`
-	Event     *Event     `json:"event,omitempty"`
-	Sessions  []Session  `json:"sessions,omitempty"`
-	Decisions []Decision `json:"decisions,omitempty"`
-	Messages  []Event    `json:"messages,omitempty"`
-	Answered  []Answered `json:"answered,omitempty"`
-	Paused    bool       `json:"paused,omitempty"`
+	Type     string `json:"type"`
+	Error    string `json:"error,omitempty"`
+	Behavior string `json:"behavior,omitempty"`
+	Text     string `json:"text,omitempty"`
+	// Instruction numbers the instruction a tell from the desk became.
+	Instruction int        `json:"instruction,omitempty"`
+	Session     *Session   `json:"session,omitempty"`
+	Events      []Event    `json:"events,omitempty"`
+	Event       *Event     `json:"event,omitempty"`
+	Sessions    []Session  `json:"sessions,omitempty"`
+	Decisions   []Decision `json:"decisions,omitempty"`
+	Messages    []Event    `json:"messages,omitempty"`
+	Answered    []Answered `json:"answered,omitempty"`
+	Paused      bool       `json:"paused,omitempty"`
 	// Away is the away mode while it is on, and Parked what it has parked since it went on.
 	Away   *Away    `json:"away,omitempty"`
 	Parked []Parked `json:"parked,omitempty"`
@@ -93,6 +97,8 @@ type Event struct {
 	Answered *Answered `json:"answered,omitempty"`
 	Entry    *Entry    `json:"entry,omitempty"`
 	Again    bool      `json:"again,omitempty"`
+	// Instruction numbers the desk's instruction that a tell event carries, or that the master's answer to the desk is about.
+	Instruction int `json:"instruction,omitempty"`
 	// Activity is the latest activity of session Node, in an activity event.
 	Activity *Activity `json:"activity,omitempty"`
 	// Context is the context use of session Node, in a context event.
@@ -144,6 +150,8 @@ type Entry struct {
 	Waited float64 `json:"waited,omitempty"`
 	// Grant is the standing grant that a granted, revoked or expired entry is about, or that settled a decision.
 	Grant *Grant `json:"grant,omitempty"`
+	// Instruction numbers the desk's instruction that a tell, spawned, resumed or merged entry is about.
+	Instruction int `json:"instruction,omitempty"`
 }
 
 // Away is the user's away mode, on since Since. By is user or desk, and Words the user's words that turned it on, if any.
@@ -249,8 +257,10 @@ type Session struct {
 	// Retired holds the ids a worker had before a switch of its model or effort moved it to a new one. The first began the worker's worktree, so merge removes them too.
 	Retired []string `json:"retired,omitempty"`
 	// Plugins and Connectors are what the parent added to the worker's lean start, which each start of it repeats.
-	Plugins    []string `json:"plugins,omitempty"`
-	Connectors bool     `json:"connectors,omitempty"`
+	// Instruction is the number of the desk's instruction that a master's tell_desk, spawn, resume or merge acts on.
+	Instruction int      `json:"instruction,omitempty"`
+	Plugins     []string `json:"plugins,omitempty"`
+	Connectors  bool     `json:"connectors,omitempty"`
 	// Activity is the latest tool call of the session or, with none in its turn, the start of its last message.
 	Activity *Activity `json:"activity,omitempty"`
 	// Context is how full the window of the session's current conversation is, left out until its transcript shows an assistant message.
