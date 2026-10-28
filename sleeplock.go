@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -69,14 +70,13 @@ func checkSleepLockMode(mode string) error {
 func (d *daemon) workingLocked() int {
 	waiting := map[string]bool{}
 	for _, dec := range d.decisions {
-		// A notice is for the user to dismiss, except one that says a session waits in its own prompt.
-		if dec.Holder == "user" && (dec.Kind != "notice" || dec.Prompt) {
+		if waitsOnUser(dec) {
 			waiting[dec.Node] = true
 		}
 	}
 	working := 0
 	for _, n := range d.nodes {
-		if n.Node == deskNode || !n.Turn || n.Killed || n.Paused || n.LimitedUntil != nil || waiting[n.Node] || betweenTurns(n.Status) || n.Node == masterNode && d.asleep {
+		if n.Node == deskNode || !workingTurn(n) || waiting[n.Node] || n.Node == masterNode && d.asleep {
 			continue
 		}
 		working++
@@ -93,10 +93,11 @@ func (d *daemon) checkSleepLock(now time.Time) {
 	if s.mode == "off" || d.stopping {
 		return
 	}
+	var lost error
 	if s.hold != nil {
 		select {
 		case <-s.hold.Done():
-			d.sleepFailedLocked(now, fmt.Errorf("the lock ended of itself: %w", s.hold.Err()))
+			lost = fmt.Errorf("the lock ended of itself: %v", s.hold.Err())
 			s.hold = nil
 		default:
 		}
@@ -107,6 +108,9 @@ func (d *daemon) checkSleepLock(now time.Time) {
 		s.working = now
 	}
 	hold := allowed && !s.working.IsZero() && (n > 0 || now.Sub(s.working) < s.quiet)
+	if lost != nil && hold {
+		d.sleepFailedLocked(now, lost)
+	}
 	switch {
 	case hold && s.hold == nil && !now.Before(s.retryAt):
 		h, err := s.inhibitor.Inhibit("bosun: the fleet is working")
@@ -114,12 +118,12 @@ func (d *daemon) checkSleepLock(now time.Time) {
 			d.sleepFailedLocked(now, err)
 			break
 		}
-		s.hold = h
+		s.hold, s.failing = h, false
 		d.logLocked(Entry{Kind: "sleeplock", By: "bosun", Text: fmt.Sprintf("took the sleep lock: %d sessions work", n)})
 		log.Printf("sleep lock taken, since %d sessions work", n)
 	case !hold && s.hold != nil:
 		s.hold.Release()
-		s.hold, s.failing = nil, false
+		s.hold = nil
 		why := fmt.Sprintf("the fleet has been quiet for %s", since(now, s.working))
 		if !allowed {
 			why = "the machine runs on mains power"
@@ -127,7 +131,7 @@ func (d *daemon) checkSleepLock(now time.Time) {
 		d.logLocked(Entry{Kind: "sleeplock", By: "bosun", Text: "let go of the sleep lock: " + why})
 		log.Printf("sleep lock released: %s", why)
 	}
-	d.publishSleepLockLocked(n)
+	d.publishSleepLockLocked(now, n)
 }
 
 // sleepFailedLocked notes that no lock is held although one is wanted, tells the log of the first failure of a run, and waits before it tries again.
@@ -142,11 +146,11 @@ func (d *daemon) sleepFailedLocked(now time.Time, err error) {
 }
 
 // publishSleepLockLocked tells the frontends when the lock was taken or released, or the fleet went quiet or began to work again.
-func (d *daemon) publishSleepLockLocked(working int) {
+func (d *daemon) publishSleepLockLocked(at time.Time, working int) {
 	s := &d.sleep
 	var now *SleepLock
 	if s.hold != nil {
-		now = &SleepLock{Since: s.shown.sinceOr(time.Now())}
+		now = &SleepLock{Since: s.shown.sinceOr(at)}
 		if working == 0 {
 			now.Until = s.working.Add(s.quiet).Round(0)
 		}
@@ -251,9 +255,13 @@ func (h *systemdHold) run(why string, started chan<- error) {
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		<-exited
 	case err := <-exited:
-		h.err = err
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			h.err = fmt.Errorf("%v: %s", err, msg)
+		msg := "systemd-inhibit exited"
+		if err != nil {
+			msg += ": " + err.Error()
 		}
+		if out := strings.TrimSpace(stderr.String()); out != "" {
+			msg += ": " + out
+		}
+		h.err = errors.New(msg)
 	}
 }

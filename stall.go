@@ -26,8 +26,7 @@ func (d *daemon) checkStalls(now time.Time) {
 	waiting := map[string]bool{}
 	for _, dec := range d.decisions {
 		waiting[dec.Node] = true
-		// A notice is for the user to dismiss, except one that says a session waits in its own prompt.
-		if dec.Holder == "user" && dec.Node != masterNode && (dec.Kind != "notice" || dec.Prompt) && !dec.stalled && now.Sub(dec.opened) > d.stallAfter {
+		if waitsOnUser(dec) && dec.Node != masterNode && !dec.stalled && now.Sub(dec.opened) > d.stallAfter {
 			held = append(held, dec)
 		}
 	}
@@ -40,7 +39,7 @@ func (d *daemon) checkStalls(now time.Time) {
 		log.Printf("decision %s: waited on the user for %s", dec.ID, since(now, dec.opened))
 	}
 	for _, n := range d.sortedLocked() {
-		if !isWorker(n.Node) || !n.Turn || n.Killed || n.Paused || n.held || n.LimitedUntil != nil || waiting[n.Node] || n.Status == "starting" || betweenTurns(n.Status) {
+		if !isWorker(n.Node) || !workingTurn(n) || waiting[n.Node] {
 			continue
 		}
 		// A daemon that restarted in the worker's turn cannot know when its last hook ran.
@@ -72,6 +71,16 @@ func stallText(n *Session, quiet time.Duration, now time.Time) string {
 		fmt.Fprintf(&b, "\nOpen call: %s", c)
 	}
 	return b.String()
+}
+
+// waitsOnUser reports whether dec waits on the user. A notice is for the user to dismiss, except one that says a session waits in its own prompt.
+func waitsOnUser(dec *Decision) bool {
+	return dec.Holder == "user" && (dec.Kind != "notice" || dec.Prompt)
+}
+
+// workingTurn reports whether session n is in a turn that runs, not one that waits to be resumed or is being switched.
+func workingTurn(n *Session) bool {
+	return n.Turn && !n.Killed && !n.Paused && !n.held && n.LimitedUntil == nil && n.Status != "starting" && !betweenTurns(n.Status)
 }
 
 // waitingOn says what dec is, and that only the user settles it.

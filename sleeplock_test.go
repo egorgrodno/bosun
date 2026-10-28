@@ -154,7 +154,7 @@ func TestSleepLockCountsNoDeskAndNoSleepingMaster(t *testing.T) {
 	d, f := sleepDaemon(t)
 	endTurn(d, "a")
 	d.mu.Lock()
-	d.nodes[masterNode].Turn, d.asleep = true, true
+	d.nodes[masterNode].Turn, d.nodes[masterNode].Status, d.asleep = true, "busy", true
 	d.nodes[deskNode] = &Session{Node: deskNode, Turn: true, Status: "busy"}
 	d.mu.Unlock()
 	d.checkSleepLock(time.Now())
@@ -226,6 +226,9 @@ func TestSleepLockFailureAndLoss(t *testing.T) {
 	d.checkSleepLock(lostAt.Add(sleepRetry))
 	if f.taken != 2 {
 		t.Fatalf("not retaken after the wait: %d", f.taken)
+	}
+	if entries := sleepEntries(d); len(entries) != 4 || !strings.Contains(entries[2].Error, "killed") {
+		t.Fatalf("a lock that ended of itself is logged: %+v", entries)
 	}
 }
 

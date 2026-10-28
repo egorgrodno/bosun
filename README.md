@@ -25,7 +25,9 @@ bosun interrupt worker-a
 bosun attach <id>
 ```
 
-`bosun` alone lists every command. `bosun pause` stops every session, such as before a reboot, and `bosun unpause` resumes the turns it cut. `bosun away on 'off to bed'` keeps the fleet working while you are gone: bosun parks what would wait on you, and `bosun away off` hands you the list through the desk. Telling the desk you are leaving, or back, does the same. While a session other than the desk works, the daemon holds a logind sleep lock, so the machine does not sleep mid-run. `-sleep-lock off|battery` and `-sleep-lock-quiet` tune it, and the idle step you already have suspends the machine after it. `bosun model -effort low desk sonnet` moves the desk to another model and effort, keeping its conversation, and `m` in `bosun tui` does the same for the master or the desk.
+`bosun` alone lists every command. `bosun pause` stops every session, such as before a reboot, and `bosun unpause` resumes the turns it cut. `bosun away on 'off to bed'` keeps the fleet working while you are gone: bosun parks what would wait on you, and `bosun away off` hands you the list through the desk. Telling the desk you are leaving, or back, does the same. `bosun model -effort low desk sonnet` moves the desk to another model and effort, keeping its conversation, and `m` in `bosun tui` does the same for the master or the desk.
+
+While a session other than the desk works, the daemon holds a logind sleep lock, so the machine does not sleep mid-run. It lets go after 10 quiet minutes, and your own idle step suspends the machine then. `-sleep-lock off|battery` and `-sleep-lock-quiet` tune it.
 
 `bosun tui` takes its movement keys from the keyboard layout: `j`/`k` on qwerty, the default, and `a`/`e` on hallmack. Arrows work on both, and every other key is the same on both. Pick the layout with `bosun tui -layout hallmack` or `BOSUN_LAYOUT=hallmack`. Any other value means qwerty.
 

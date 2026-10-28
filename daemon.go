@@ -329,6 +329,7 @@ func runDaemon(args []string) error {
 			d.mu.Lock()
 			d.stopping = true
 			d.mu.Unlock()
+			d.releaseSleepLock()
 			return nil
 		case <-tick.C:
 			if d.pollDue(time.Now()) {
@@ -337,6 +338,7 @@ func runDaemon(args []string) error {
 			d.recoverLimited(time.Now())
 			d.expireOrphans(time.Now())
 			d.checkStalls(time.Now())
+			d.checkSleepLock(time.Now())
 		}
 	}
 }
