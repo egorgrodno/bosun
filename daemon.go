@@ -499,10 +499,19 @@ func (d *daemon) sortedLocked() []*Session {
 func (s *Session) public() Session {
 	c := *s
 	c.pre, c.Events, c.Taken, c.Prompts, c.usage = nil, nil, nil, nil, nil
-	if s.settled() {
+	switch {
+	case s.settled():
 		c.Status, c.State = "idle", ""
+	case s.started():
+		c.Status, c.State = "busy", ""
 	}
 	return c
+}
+
+// started reports whether session s began a turn that a listing taken before the hook still shows idle.
+// The hook outranks the listing for turnSettle, after which refresh counts a listing between turns as the turn's end.
+func (s *Session) started() bool {
+	return s.Turn && s.Status == "idle" && time.Since(s.turnAt) < turnSettle
 }
 
 // settled reports whether session s ended its turn while Claude Code's listing still shows it running.
@@ -842,7 +851,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 		n.Socket = socket
 		d.saveLocked()
 	}
-	wasSettled := n.settled()
+	wasShown := n.public()
 	d.stirred = true
 	n.hookAt = time.Now()
 	if contextEvents[in.Event] {
@@ -856,7 +865,7 @@ func (d *daemon) hook(ctx context.Context, node, socket, key string, raw json.Ra
 	case "UserPromptSubmit", "PreToolUse", "PermissionRequest", "PostToolUse", "PostToolUseFailure":
 		d.turnLocked(n)
 	}
-	if wasSettled && !n.settled() {
+	if now := n.public(); now.Status != wasShown.Status || now.State != wasShown.State {
 		d.broadcastSessionsLocked()
 	}
 	var dec *Decision
