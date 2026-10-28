@@ -30,6 +30,8 @@ type repos interface {
 	remotes(dir string) []string
 	// changed says how dir's repository differs from bosun's record of its git setup, completing "a repository …", or returns "".
 	changed(dir string) string
+	// hooks is changed cut to the hooks a push from dir runs.
+	hooks(dir string) string
 }
 
 // reservation says why a tool call is a reserved action, and whether only the user may allow it. The zero value is a call that is none.
@@ -50,6 +52,8 @@ const (
 	rulePushRemote  = "push.remote"
 	rulePushOption  = "push.option"
 	rulePushSetup   = "push.setup"
+	rulePushHooks   = "push.hooks"
+	ruleGitHooks    = "git.hooks"
 	ruleBranch      = "branch.delete"
 	ruleWriteDesk   = "write.desk"
 	ruleWriteList   = "write.list"
@@ -91,6 +95,9 @@ func (g gate) reserved(tool string, input json.RawMessage) reservation {
 		}
 		if json.Unmarshal(input, &in) == nil {
 			g.unboxed = in.Unboxed
+			if r := pushEnv(in.Command); r.user {
+				return r
+			}
 			if r := g.command(in.Command, []string{g.cwd}); r.user || !in.Unboxed {
 				return r
 			}
@@ -267,6 +274,7 @@ func inner(argv []string, i int) (script string, lo, hi int, ok bool) {
 }
 
 func (g gate) git(args, dirs []string) reservation {
+	hooks := ""
 	// An alias can stand for any subcommand, a force push included.
 	for j := 0; j < len(args) && strings.HasPrefix(args[j], "-"); j++ {
 		v := ""
@@ -282,8 +290,18 @@ func (g gate) git(args, dirs []string) reservation {
 		if strings.HasPrefix(v, "alias.") {
 			return reservation{"a git command through an alias bosun cannot check", true, ruleGitAlias, v}
 		}
+		if key, _, _ := strings.Cut(v, "="); hooks == "" && hookKey(key) {
+			hooks = v
+		}
 	}
 	cd, sub, rest, opt := gitCommand(args)
+	if hooks != "" {
+		if sub == "push" {
+			return pushHooks.on(hooks)
+		}
+		// git passes its -c options on to the git commands it runs, such as a push that submodule foreach runs.
+		return gitHooks.on(hooks)
+	}
 	switch sub {
 	case "push":
 		if opt != "" {
@@ -300,16 +318,22 @@ func (g gate) git(args, dirs []string) reservation {
 				}
 			}
 		}
-		if !g.unboxed {
-			break
+		// Outside the sandbox, the record of the whole setup covers the hooks too.
+		check, res, from := g.repos.hooks, pushHooks, "a push from a repository "
+		if g.unboxed {
+			check, res, from = g.repos.changed, pushSetup, "a push outside the sandbox from a repository "
 		}
 		for _, dir := range dirs {
 			if dir == "" {
-				return reservation{"a push outside the sandbox from a repository bosun cannot find", true, rulePushSetup, ""}
+				return res.because(from+"bosun cannot find", "")
 			}
-			if r := g.repos.changed(at(dir, cd)); r != "" {
-				return reservation{"a push outside the sandbox from a repository " + r, true, rulePushSetup, at(dir, cd)}
+			if r := check(at(dir, cd)); r != "" {
+				return res.because(from+r, at(dir, cd))
 			}
+		}
+	case "config":
+		if w := configHooks(rest); w != "" {
+			return gitHooks.on(w)
 		}
 	case "branch":
 		for _, a := range rest {
@@ -352,7 +376,7 @@ func gitCommand(args []string) (cd []string, sub string, rest []string, opt stri
 
 // pushFlags are git push's options that take no value and change neither where it pushes nor what it may overwrite.
 // git takes any unambiguous prefix of a long option, so one missing here counts as unknown.
-var pushFlags = []string{"--set-upstream", "--tags", "--follow-tags", "--dry-run", "--porcelain", "--verbose", "--quiet", "--progress", "--no-progress", "--verify", "--no-verify", "--atomic", "--ipv4", "--ipv6"}
+var pushFlags = []string{"--set-upstream", "--tags", "--follow-tags", "--dry-run", "--porcelain", "--verbose", "--quiet", "--progress", "--no-progress", "--verify", "--atomic", "--ipv4", "--ipv6"}
 
 // The pushes only the user may approve, before on names what matched.
 var (
@@ -361,7 +385,17 @@ var (
 	pushEvery  = reservation{"a push of every branch", true, rulePushEvery, ""}
 	pushMirror = reservation{"a mirror push", true, rulePushMirror, ""}
 	pushOption = reservation{"a push with an option bosun does not check", true, rulePushOption, ""}
+	// git push --no-verify is how the user pushes past a secret that the pre-push scan found.
+	pushHooks = reservation{"a push that skips or replaces git's hooks", true, rulePushHooks, ""}
+	pushSetup = reservation{"", true, rulePushSetup, ""}
+	gitHooks  = reservation{"a git command that skips or replaces git's hooks", true, ruleGitHooks, ""}
 )
+
+// because is r for reason, matched on word.
+func (r reservation) because(reason, word string) reservation {
+	r.reason, r.match = reason, word
+	return r
+}
 
 // on is r matched on word.
 func (r reservation) on(word string) reservation {
@@ -390,6 +424,8 @@ func pushArgs(args []string) (repos []string, r reservation) {
 			repos = append(repos, args[i])
 		case strings.HasPrefix(a, "--repo="):
 			repos = append(repos, strings.TrimPrefix(a, "--repo="))
+		case len(a) >= len("--no-v") && strings.HasPrefix("--no-verify", a):
+			return nil, pushHooks.on(a)
 		case a == "--push-option":
 			i++
 		case strings.HasPrefix(a, "--push-option="), slices.Contains(pushFlags, a):
@@ -431,6 +467,75 @@ func pushArgs(args []string) (repos []string, r reservation) {
 		}
 	}
 	return append(repos, pos[0]), reservation{}
+}
+
+// hookKey reports whether a git config key names a hook or moves the hooks' directory, which can drop the user's hooks or replace them. hook alone is the section.
+func hookKey(key string) bool {
+	key = strings.ToLower(key)
+	return key == "core.hookspath" || key == "hook" || strings.HasPrefix(key, "hook.")
+}
+
+// hookVars are the variables beside the GIT_CONFIG ones that move git's config or repository, and with them the hooks a push runs.
+var hookVars = []string{"HOME", "XDG_CONFIG_HOME", "GIT_DIR", "GIT_COMMON_DIR", "GIT_WORK_TREE"}
+
+func hookVar(name string) bool {
+	return strings.HasPrefix(name, "GIT_CONFIG") || slices.Contains(hookVars, name)
+}
+
+// pushEnv says whether script pushes with git while it sets or clears a variable that hookVar names, or may set or clear any.
+func pushEnv(script string) reservation {
+	if !pushes(script) {
+		return reservation{}
+	}
+	names, every, _ := rebinds(simpleCommands(script))
+	if every {
+		return pushHooks.because("a push beside a command that may set or clear any variable", "")
+	}
+	if i := slices.IndexFunc(names, hookVar); i >= 0 {
+		return pushHooks.on(names[i])
+	}
+	return reservation{}
+}
+
+// gitConfigWrites are git config's subcommands and options that write. Without one, a key and a value write in the old form.
+var gitConfigWrites = []string{"set", "unset", "rename-section", "remove-section", "edit", "--add", "--unset", "--unset-all", "--replace-all", "--rename-section", "--remove-section", "-e", "--edit"}
+
+// gitConfigValues are git config's options that take the next word.
+var gitConfigValues = []string{"-f", "--file", "--blob", "--type", "--default", "--comment", "--value"}
+
+// configHooks returns the word with which git config's arguments write a key that hookKey names, or open an editor that may, or "".
+func configHooks(args []string) string {
+	var keys []string
+	write := ""
+	for i := 0; i < len(args); i++ {
+		switch a := args[i]; {
+		case slices.Contains(gitConfigValues, a):
+			i++
+		case strings.HasPrefix(a, "-"):
+			if slices.Contains(gitConfigReads, a) {
+				return ""
+			}
+			if slices.Contains(gitConfigWrites, a) {
+				write = a
+			}
+		case len(keys) == 0 && write == "" && slices.Contains(gitConfigReads, a):
+			return ""
+		case len(keys) == 0 && write == "" && slices.Contains(gitConfigWrites, a):
+			write = a
+		default:
+			keys = append(keys, a)
+		}
+	}
+	switch {
+	case write == "" && len(keys) < 2:
+		return ""
+	case write == "edit", write == "-e", write == "--edit":
+		return write
+	}
+	if i := slices.IndexFunc(keys, hookKey); i >= 0 {
+		return keys[i]
+	}
+	return ""
 }
 
 // at is where git started in dir runs with -C options cd.
@@ -596,7 +701,7 @@ func newUserList(home, claude, state string, getenv func(string) string) userLis
 		env, dir string
 		places   []place
 	}{
-		{"XDG_CONFIG_HOME", config, []place{{"gh", credentials}, {"glab-cli", credentials}, {"tea", credentials}, {"git", gitConfig}, {"fish", shellStartup}, {"environment.d", shellStartup}, {"systemd", unitFile}, {"autostart", unitFile}}},
+		{"XDG_CONFIG_HOME", config, []place{{"gh", credentials}, {"glab-cli", credentials}, {"tea", credentials}, {"git", gitConfig}, {"gitleaks", gitConfig}, {"fish", shellStartup}, {"environment.d", shellStartup}, {"systemd", unitFile}, {"autostart", unitFile}}},
 		{"XDG_DATA_HOME", data, []place{{"keyrings", credentials}, {"systemd", unitFile}}},
 	} {
 		dirs := []string{x.dir}

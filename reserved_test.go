@@ -9,14 +9,16 @@ import (
 	"testing"
 )
 
-// fakeRepos has the remotes in remote and the changed setups in change, each by directory.
+// fakeRepos has the remotes in remote, the changed setups in change and the changed hooks in hookChange, each by directory.
 type fakeRepos struct {
-	remote map[string][]string
-	change map[string]string
+	remote     map[string][]string
+	change     map[string]string
+	hookChange map[string]string
 }
 
 func (f fakeRepos) remotes(dir string) []string { return f.remote[dir] }
 func (f fakeRepos) changed(dir string) string   { return f.change[dir] }
+func (f fakeRepos) hooks(dir string) string     { return f.hookChange[dir] }
 
 const (
 	home    = "/home/u"
@@ -33,8 +35,9 @@ func noEnv(string) string { return "" }
 
 func testGate() gate {
 	g := gate{cwd: "/wt", writable: []string{"/wt", scratch, memory, job}, list: testList(noEnv), repos: fakeRepos{
-		remote: map[string][]string{"/wt": {"origin", "github"}, "/wt/sub": {"origin", "github"}, "/other": {"origin"}},
-		change: map[string]string{"/other": "whose hook pre-push changed"},
+		remote:     map[string][]string{"/wt": {"origin", "github"}, "/wt/sub": {"origin", "github"}, "/other": {"origin"}, "/hooked": {"origin"}},
+		change:     map[string]string{"/other": "whose hook pre-push changed"},
+		hookChange: map[string]string{"/hooked": "whose config's hook.secret-scan.enabled changed"},
 	}}
 	g.list.vars["TMPDIR"] = scratch
 	return g
@@ -81,7 +84,7 @@ func TestReservedCommand(t *testing.T) {
 		{"git push -uo ci.skip origin main", none},
 		{"git push -oci.skip origin main", none},
 		{"git push --push-option=ci.skip origin main", none},
-		{"git push --no-verify --atomic origin main", none},
+		{"git push --verify --atomic origin main", none},
 		{"git push --repo=origin", none},
 		{"git push origin tag v1.0", none},
 
@@ -546,6 +549,10 @@ func TestReservedRules(t *testing.T) {
 		{"Write", home + "/.claude/settings.json", false, ruleWriteList, home + "/.claude/settings.json", true},
 		{"Write", state + "/nodes/a/mcp.json", false, ruleWriteList, state + "/nodes/a/mcp.json", true},
 		{"Write", "/tmp/x", false, ruleWriteOut, "/tmp/x", false},
+		// The pre-push secret scan's allowlists, which it reads only from there (egor/nix#155).
+		{"Write", home + "/.config/gitleaks/etc-nixos.gitleaksignore", false, ruleWriteList, home + "/.config/gitleaks/etc-nixos.gitleaksignore", true},
+		{"Bash", "echo abc:x:1 >> ~/.config/gitleaks/etc-nixos.gitleaksignore", true, ruleUnboxWrite, home + "/.config/gitleaks/etc-nixos.gitleaksignore", true},
+		{"Write", "/wt/.gitleaksignore", false, "", "", false},
 		{"Write", state + "/nodes/b/tmp/claude-1000/x", false, ruleWriteOut, state + "/nodes/b/tmp/claude-1000/x", false},
 	} {
 		var input []byte
@@ -563,6 +570,155 @@ func TestReservedRules(t *testing.T) {
 	input, _ := json.Marshal(map[string]any{"file_path": "/wt/desk/.claude/settings.json"})
 	if got := g.reserved("Write", input); got.rule != ruleWriteDesk || got.match != "/wt/desk/.claude/settings.json" {
 		t.Errorf("Write into the desk: reserved = %+v", got)
+	}
+}
+
+// Whatever skips or replaces the hooks a push runs, such as the user's pre-push secret scan, stays with the user, inside the sandbox or outside it (egor/nix#155).
+func TestReservedHookBypasses(t *testing.T) {
+	g := testGate()
+	for _, tc := range []struct {
+		cmd, rule, match string
+	}{
+		{"git push --no-verify", rulePushHooks, "--no-verify"},
+		{"git push --no-verify origin main", rulePushHooks, "--no-verify"},
+		{"git push origin main --no-verify", rulePushHooks, "--no-verify"},
+		{"git push -u --no-veri origin HEAD", rulePushHooks, "--no-veri"},
+		{"git push --no-ver origin main", rulePushHooks, "--no-ver"},
+		{"git push --no-v origin main", rulePushHooks, "--no-v"},
+		{"git push --no-verify 2>&1 | tail -5", rulePushHooks, "--no-verify"},
+		{"git -C /other push --no-verify origin main", rulePushHooks, "--no-verify"},
+
+		{"git -c core.hooksPath=/dev/null push", rulePushHooks, "core.hooksPath=/dev/null"},
+		{"git -c core.hookspath push origin main", rulePushHooks, "core.hookspath"},
+		{"git -c CORE.HOOKSPATH=x push", rulePushHooks, "CORE.HOOKSPATH=x"},
+		{"git -c hook.secret-scan.enabled=false push", rulePushHooks, "hook.secret-scan.enabled=false"},
+		{"git -c hook.pre-push.enabled=false push origin main", rulePushHooks, "hook.pre-push.enabled=false"},
+		{"git -c hook.secret-scan.command=true push", rulePushHooks, "hook.secret-scan.command=true"},
+		{"git -c hook.secret-scan.event= push", rulePushHooks, "hook.secret-scan.event="},
+		{"git -c Hook.secret-scan.enabled=no push", rulePushHooks, "Hook.secret-scan.enabled=no"},
+		{"git -c user.name=x -c hook.secret-scan.enabled=0 push", rulePushHooks, "hook.secret-scan.enabled=0"},
+		{"git -C /other -c core.hooksPath=/dev/null push origin main", rulePushHooks, "core.hooksPath=/dev/null"},
+		{"git --config-env=hook.secret-scan.enabled=OFF push", rulePushHooks, "hook.secret-scan.enabled=OFF"},
+		{"git --config-env hook.secret-scan.command=X push", rulePushHooks, "hook.secret-scan.command=X"},
+		{"bash -c 'git -c core.hooksPath=/dev/null push'", rulePushHooks, "core.hooksPath=/dev/null"},
+
+		{`GIT_CONFIG_PARAMETERS="'hook.secret-scan.enabled'='false'" git push`, rulePushHooks, "GIT_CONFIG_PARAMETERS"},
+		{"GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=hook.secret-scan.enabled GIT_CONFIG_VALUE_0=false git push", rulePushHooks, "GIT_CONFIG_COUNT"},
+		{"GIT_CONFIG_GLOBAL=/dev/null git push origin main", rulePushHooks, "GIT_CONFIG_GLOBAL"},
+		{"GIT_CONFIG_SYSTEM=/dev/null git push", rulePushHooks, "GIT_CONFIG_SYSTEM"},
+		{"GIT_CONFIG_NOSYSTEM=1 git push", rulePushHooks, "GIT_CONFIG_NOSYSTEM"},
+		{"HOME=" + scratch + " git push", rulePushHooks, "HOME"},
+		{"XDG_CONFIG_HOME=" + scratch + " git push", rulePushHooks, "XDG_CONFIG_HOME"},
+		{"GIT_DIR=" + scratch + "/x.git git push origin main", rulePushHooks, "GIT_DIR"},
+		{"GIT_COMMON_DIR=" + scratch + " git push", rulePushHooks, "GIT_COMMON_DIR"},
+		{"GIT_WORK_TREE=" + scratch + " git push", rulePushHooks, "GIT_WORK_TREE"},
+		{"env GIT_CONFIG_GLOBAL=/dev/null git push", rulePushHooks, "GIT_CONFIG_GLOBAL"},
+		{"export GIT_CONFIG_GLOBAL=/dev/null; git push", rulePushHooks, "GIT_CONFIG_GLOBAL"},
+		{"export HOME=" + scratch + " && git push origin main", rulePushHooks, "HOME"},
+		{"declare -x GIT_CONFIG_COUNT=1; git push", rulePushHooks, "GIT_CONFIG_COUNT"},
+		{"unset HOME; git push", rulePushHooks, "HOME"},
+		{"git push; export GIT_CONFIG_GLOBAL=/dev/null", rulePushHooks, "GIT_CONFIG_GLOBAL"},
+		{"HOME=" + scratch + " bash -c 'git push'", rulePushHooks, "HOME"},
+		{"bash -c 'GIT_CONFIG_GLOBAL=/dev/null git push'", rulePushHooks, "GIT_CONFIG_GLOBAL"},
+		{"source ./env.sh && git push", rulePushHooks, ""},
+		{"env -i git push", rulePushHooks, ""},
+		{"env --ignore-environment PATH=/bin git push", rulePushHooks, ""},
+		{"env -u HOME git push", rulePushHooks, "HOME"},
+		{"env -uHOME git push", rulePushHooks, "HOME"},
+		{"env --unset=XDG_CONFIG_HOME git push", rulePushHooks, "XDG_CONFIG_HOME"},
+		{"env -i bash -c 'git push'", rulePushHooks, ""},
+
+		{"git config hook.secret-scan.enabled false", ruleGitHooks, "hook.secret-scan.enabled"},
+		{"git config --local hook.secret-scan.enabled false", ruleGitHooks, "hook.secret-scan.enabled"},
+		{"git config --worktree core.hooksPath /dev/null", ruleGitHooks, "core.hooksPath"},
+		{"git config --global core.hooksPath " + scratch, ruleGitHooks, "core.hooksPath"},
+		{"git config --system hook.secret-scan.enabled false", ruleGitHooks, "hook.secret-scan.enabled"},
+		{"git config set hook.secret-scan.enabled false", ruleGitHooks, "hook.secret-scan.enabled"},
+		{"git config set --local core.hooksPath x", ruleGitHooks, "core.hooksPath"},
+		{"git config --add hook.x.event pre-push", ruleGitHooks, "hook.x.event"},
+		{"git config --replace-all hook.secret-scan.event push", ruleGitHooks, "hook.secret-scan.event"},
+		{"git config --unset hook.secret-scan.command", ruleGitHooks, "hook.secret-scan.command"},
+		{"git config --unset-all hook.secret-scan.event", ruleGitHooks, "hook.secret-scan.event"},
+		{"git config unset hook.secret-scan.event", ruleGitHooks, "hook.secret-scan.event"},
+		{"git config --remove-section hook.secret-scan", ruleGitHooks, "hook.secret-scan"},
+		{"git config remove-section hook", ruleGitHooks, "hook"},
+		{"git config --rename-section hook.secret-scan off", ruleGitHooks, "hook.secret-scan"},
+		{"git config rename-section x hook.y", ruleGitHooks, "hook.y"},
+		{"git config -f .git/config hook.x.enabled false", ruleGitHooks, "hook.x.enabled"},
+		{"git config --file=" + scratch + "/g Hook.Secret-Scan.Enabled false", ruleGitHooks, "Hook.Secret-Scan.Enabled"},
+		{"git config --type bool hook.x.enabled false", ruleGitHooks, "hook.x.enabled"},
+		{"git config -e", ruleGitHooks, "-e"},
+		{"git config --local --edit", ruleGitHooks, "--edit"},
+		{"GIT_EDITOR=true git config edit", ruleGitHooks, "edit"},
+		{"git -C /etc/nixos config core.hooksPath /dev/null", ruleGitHooks, "core.hooksPath"},
+		{"cd /other && git config hook.secret-scan.enabled false && git push", ruleGitHooks, "hook.secret-scan.enabled"},
+		// git passes -c on to the git commands it runs.
+		{"git -c core.hooksPath=/dev/null commit -m x", ruleGitHooks, "core.hooksPath=/dev/null"},
+		{"git -c hook.secret-scan.enabled=false submodule foreach git push", ruleGitHooks, "hook.secret-scan.enabled=false"},
+	} {
+		for _, unboxed := range []bool{false, true} {
+			input, _ := json.Marshal(map[string]any{"command": tc.cmd, "dangerouslyDisableSandbox": unboxed})
+			if got := g.reserved("Bash", input); got.rule != tc.rule || got.match != tc.match || !got.user {
+				t.Errorf("%q, outside the sandbox %v: reserved = %+v, want the user's rule %s on %q", tc.cmd, unboxed, got, tc.rule, tc.match)
+			}
+		}
+	}
+
+	// Inside the sandbox, the gate reads the hooks of the push's repository. Outside it, the record of the whole setup covers them.
+	for _, tc := range []struct {
+		cmd, reason, match string
+	}{
+		{"git -C /hooked push origin main", "a push from a repository whose config's hook.secret-scan.enabled changed", "/hooked"},
+		{"cd /hooked && git push", "a push from a repository whose config's hook.secret-scan.enabled changed", "/hooked"},
+		{"cd $DIR && git push", "a push from a repository bosun cannot find", ""},
+	} {
+		input, _ := json.Marshal(map[string]any{"command": tc.cmd})
+		if got := g.reserved("Bash", input); got != (reservation{tc.reason, true, rulePushHooks, tc.match}) {
+			t.Errorf("sandboxed %q: reserved = %+v", tc.cmd, got)
+		}
+	}
+
+	// Plain pushes and other git commands stay as they were.
+	for cmd, want := range map[string]reservation{
+		"git push":                                         none,
+		"git push --verify origin main":                    none,
+		"git push --no-progress -v origin main":            none,
+		"git push -u origin HEAD 2>&1 | tail -3":           none,
+		"git -C /other push origin main":                   none,
+		"env git push -u origin HOME":                      none,
+		"FOO=1 GIT_SSH_COMMAND=x GIT_TRACE=1 git push":     none,
+		"env FOO=1 git push origin main":                   none,
+		"env -u FOO git push origin main":                  none,
+		"echo GIT_CONFIG_GLOBAL=x HOME=y; git push":        none,
+		"export HOME=" + scratch + "; git status":          none,
+		"HOME=" + scratch + " git -c core.hooksPath=x log": {reason: "a git command that skips or replaces git's hooks", user: true},
+		"git commit --no-verify -m x":                      none,
+		"git -c user.name=x commit -m y":                   none,
+		"git log --grep=no-verify":                         none,
+		`git commit -m "git push --no-verify later"`:       none,
+		"git config hook.secret-scan.enabled":              none,
+		"git config core.hooksPath":                        none,
+		"git config --get hook.secret-scan.command":        none,
+		"git config get hook.secret-scan.event":            none,
+		"git config get --all hook.secret-scan.event":      none,
+		"git config --get-regexp '^hook'":                  none,
+		"git config --list --show-origin | grep hook":      none,
+		"git config list --show-scope":                     none,
+		"git config user.name x":                           none,
+		"git config set user.email x":                      none,
+		"git config --local core.editor vim":               none,
+		"git config hooks.foo bar":                         none,
+		"git config --unset core.editor":                   none,
+		"git hook list pre-push":                           none,
+		"git hook run pre-push":                            none,
+		"grep -rn core.hooksPath .":                        none,
+		"git -c color.ui=never push origin main":           option,
+		"git --config-env=core.sshCommand=X push":          option,
+	} {
+		input, _ := json.Marshal(map[string]any{"command": cmd})
+		if got := g.reserved("Bash", input); bare(got) != want {
+			t.Errorf("sandboxed %q: reserved = %+v, want %+v", cmd, got, want)
+		}
 	}
 }
 

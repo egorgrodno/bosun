@@ -116,6 +116,64 @@ func TestGitSetupKeepsRoutineChanges(t *testing.T) {
 	}
 }
 
+func TestGitSetupHooks(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		change func(t *testing.T, repo, wt string)
+		want   string
+	}{
+		{"nothing", func(*testing.T, string, string) {}, ""},
+		{"core.sshCommand", func(t *testing.T, _, wt string) {
+			git(t, wt, "config", "core.sshCommand", "/tmp/x")
+		}, ""},
+		{"a new remote", func(t *testing.T, _, wt string) {
+			git(t, wt, "remote", "add", "evil", "https://evil.example/x.git")
+		}, ""},
+		{"a disabled hook", func(t *testing.T, _, wt string) {
+			git(t, wt, "config", "hook.secret-scan.enabled", "false")
+		}, "whose config's hook.secret-scan.enabled changed"},
+		{"a disabled event", func(t *testing.T, _, wt string) {
+			git(t, wt, "config", "hook.pre-push.enabled", "false")
+		}, "whose config's hook.pre-push.enabled changed"},
+		{"core.hooksPath", func(t *testing.T, _, wt string) {
+			git(t, wt, "config", "core.hooksPath", "/dev/null")
+		}, "whose config's core.hookspath changed"},
+		{"an include", func(t *testing.T, _, wt string) {
+			writeFile(t, filepath.Join(wt, "off.cfg"), "[hook \"secret-scan\"]\n\tenabled = false\n", 0o644)
+			git(t, wt, "config", "include.path", filepath.Join(wt, "off.cfg"))
+		}, "whose config's hook.secret-scan.enabled changed"},
+		{"a pre-push hook", func(t *testing.T, repo, _ string) {
+			writeFile(t, filepath.Join(repo, ".git", "hooks", "pre-push"), "#!/bin/sh\n", 0o755)
+		}, "whose hook pre-push changed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, repo, wt := recorded(t)
+			tc.change(t, repo, wt)
+			if got := r.hooks(wt); got != tc.want {
+				t.Fatalf("hooks = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// A repository without a record, such as one a worker made, may hold hooks of its own, but its config may not touch the user's.
+func TestGitSetupHooksWithoutRecord(t *testing.T) {
+	r := gitRepos{dir: filepath.Join(t.TempDir(), "repos")}
+	repo := t.TempDir()
+	git(t, repo, "init", "-q")
+	writeFile(t, filepath.Join(repo, ".git", "hooks", "pre-push"), "#!/bin/sh\n", 0o755)
+	if got := r.hooks(repo); got != "" {
+		t.Fatalf("hooks = %q", got)
+	}
+	git(t, repo, "config", "hook.secret-scan.enabled", "false")
+	if got := r.hooks(repo); got != "whose config's hook.secret-scan.enabled changed" {
+		t.Fatalf("hooks with a disabled hook = %q", got)
+	}
+	if got := r.hooks(t.TempDir()); got != "bosun cannot read" {
+		t.Fatalf("hooks outside a repository = %q", got)
+	}
+}
+
 // A worker can point its worktree's .git at a repository of its own, which bosun has no record of.
 func TestGitSetupFollowsTheGitDir(t *testing.T) {
 	r, _, wt := recorded(t)

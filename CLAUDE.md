@@ -106,7 +106,9 @@ The check holds the call until the answer and returns `allow` or `deny`. A `PreT
 **The user's list stays with you alone.** It holds two kinds of action: those that change code that runs later where no bosun session sees it, and those that reach credentials for other machines. An action on it never reaches the master:
 
 - the pushes above, and a push outside the sandbox from a repository whose git setup does not match its record, or has none
-- a write through a file tool to a credential store, a shell startup file, Claude Code's configuration, git hooks or config, a systemd unit, autostart entry or cron table, or bosun's state directory
+- a push that skips or replaces git's hooks, rule `push.hooks`: `--no-verify` or a prefix of it, a `-c` or `--config-env` of `core.hooksPath` or `hook.*`, or a script that sets or clears `HOME`, `XDG_CONFIG_HOME`, `GIT_DIR`, `GIT_COMMON_DIR`, `GIT_WORK_TREE` or a `GIT_CONFIG` variable. Inside the sandbox, a push also needs a repository whose hook config and hooks match its record. A repository without a record must set no hook in its own config. `git push --no-verify` is how you push past a finding of the pre-push secret scan, which the NixOS configuration sets up.
+- a git command with a `-c` of a hook key, and a `git config` that writes one or opens an editor, at any scope, rule `git.hooks`. git passes `-c` on to the git commands it runs.
+- a write through a file tool to a credential store, a shell startup file, Claude Code's configuration, git hooks or config, the secret scan's allowlists in `~/.config/gitleaks`, a systemd unit, autostart entry or cron table, or bosun's state directory
 - a Bash command outside the sandbox that may write such a path, or reads a credential
 - a Bash command outside the sandbox that may write a path bosun cannot resolve, where it could lead to the list
 - a Bash command outside the sandbox that runs in a folder of the list, unless it only reads and the folder holds no credential
@@ -128,7 +130,7 @@ The check holds the call until the answer and returns `allow` or `deny`. A `PreT
 - a copier passes only options that keep its last argument the destination and its sources unchanged: not `-t`, `-S`, `-m`, `-e`, `--remove-source-files`, or cp's `-l` and `-s`
 - `find` has no action such as `-delete` or `-exec`, and `rg` no `--pre` or `--hostname-bin`
 - a `cd` leads where bosun can follow, with no option
-- no command of the script sets a variable: no assignment, `export`, `declare`, `read`, `printf -v`, `unset`, `for` or `source`. The environment can make a reader run a command, as `RIPGREP_CONFIG_PATH` and `LD_PRELOAD` do.
+- no command of the script sets a variable: no assignment, `export`, `declare`, `read`, `printf -v`, `unset`, `env -u` or `-i`, `for` or `source`. The environment can make a reader run a command, as `RIPGREP_CONFIG_PATH` and `LD_PRELOAD` do.
 
 A script that may set a variable bosun expands, such as `HOME`, `TMPDIR`, `USER`, an `XDG_` folder, `PWD` or `CDPATH`, also loses that expansion. Its `~`, `$TMPDIR` or relative `cd` then counts as a path bosun cannot resolve. A glob counts as each path it matches, and each folder its folder part matches, through links. zsh's `**` counts as unresolved.
 

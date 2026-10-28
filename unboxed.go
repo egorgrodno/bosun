@@ -106,8 +106,8 @@ func (g gate) userUnboxed(script, dir string) reservation {
 // setters are the builtins that set the variables their arguments name, and nameref marks the option that makes one variable stand for another.
 var setters = []string{"export", "declare", "typeset", "local", "readonly", "let", "unset", "read", "mapfile", "readarray", "getopts", "vared", "for", "select"}
 
-// rebinds says which variables cmds, and the scripts they run, may set: by an assignment, a builtin such as export, read or printf -v, or a for loop.
-// all marks a command that may set any, such as source or a nameref, and sets one that sets a variable at all.
+// rebinds says which variables cmds, and the scripts they run, may set or clear: by an assignment, a builtin such as export, read or printf -v, env -u, or a for loop.
+// all marks a command that may set or clear any, such as source, a nameref or env -i, and sets one that sets a variable at all.
 func rebinds(cmds []simple) (names []string, all, sets bool) {
 	for _, c := range cmds {
 		argv := c.argv
@@ -123,9 +123,22 @@ func rebinds(cmds []simple) (names []string, all, sets bool) {
 		case name == "source", name == ".":
 			return nil, true, true
 		case name == "env":
-			for _, a := range args {
-				if assignment.MatchString(a) {
+			// env's own options stop at its program.
+			opts := true
+			for j := 0; j < len(args); j++ {
+				switch a := args[j]; {
+				case assignment.MatchString(a):
 					names, sets = append(names, varName(a)), true
+				case !opts:
+				case a == "-i", a == "--ignore-environment", a == "-":
+					return nil, true, true
+				case (a == "-u" || a == "--unset") && j+1 < len(args):
+					j++
+					names, sets = append(names, args[j]), true
+				case strings.HasPrefix(a, "--unset="), strings.HasPrefix(a, "-u"):
+					names, sets = append(names, strings.TrimPrefix(strings.TrimPrefix(a, "--unset="), "-u")), true
+				case !strings.HasPrefix(a, "-"):
+					opts = false
 				}
 			}
 		case name == "printf":

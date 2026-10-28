@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -62,18 +63,52 @@ func (r gitRepos) record(dir string) error {
 	return writeJSON(path, s)
 }
 
-func (r gitRepos) changed(dir string) string {
+// load reads the git setup of dir's repository and bosun's record of it, which is the zero gitSetup when bosun has none. why says what keeps it from either, completing "a repository …".
+func (r gitRepos) load(dir string) (rec, s gitSetup, why string) {
 	s, err := readSetup(dir)
 	if err != nil {
 		log.Printf("reading the git setup in %s: %v", dir, err)
-		return "bosun cannot read"
+		return rec, s, "bosun cannot read"
 	}
-	var rec gitSetup
 	data, err := os.ReadFile(r.path(s.Root))
-	if err != nil || json.Unmarshal(data, &rec) != nil || rec.Root != s.Root {
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil || json.Unmarshal(data, &rec) != nil || rec.Root != s.Root:
+		return gitSetup{}, s, "whose record bosun cannot read"
+	}
+	return rec, s, ""
+}
+
+func (r gitRepos) changed(dir string) string {
+	rec, s, why := r.load(dir)
+	switch {
+	case why != "":
+		return why
+	case rec.Root == "":
 		return "bosun has no record of"
 	}
 	return rec.changed(s)
+}
+
+// hooks says how the hooks a push from dir runs differ from bosun's record of its repository, completing "a repository …", or returns "".
+// A repository without a record must set no hook in its own config. The hooks in its hooks directory run after the user's own.
+func (r gitRepos) hooks(dir string) string {
+	rec, s, why := r.load(dir)
+	if why != "" {
+		return why
+	}
+	if rec.Root == "" {
+		rec.Hooks = s.Hooks
+	}
+	return rec.hookSetup().changed(s.hookSetup())
+}
+
+// hookSetup is s cut to what decides the hooks a push runs: the hooks directory, and the config entries that hookKey names.
+func (s gitSetup) hookSetup() gitSetup {
+	return gitSetup{Hooks: s.Hooks, Config: slices.DeleteFunc(slices.Clone(s.Config), func(e string) bool {
+		key, _, _ := strings.Cut(e, "\n")
+		return !hookKey(key)
+	})}
 }
 
 // changed says how s differs from the record rec, completing "a repository …", or returns "".
@@ -139,7 +174,8 @@ func readSetup(dir string) (gitSetup, error) {
 		return s, err
 	}
 	entries, err := os.ReadDir(hooks)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+	// core.hooksPath=/dev/null turns every hook off.
+	if err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
 		return s, err
 	}
 	for _, e := range entries {
