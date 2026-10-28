@@ -270,3 +270,19 @@ func TestParkedList(t *testing.T) {
 		t.Fatalf("list\n%s", got)
 	}
 }
+
+func TestPushes(t *testing.T) {
+	for script, want := range map[string]bool{
+		"git push":                       true,
+		"cd /repo && git -C . push o m":  true,
+		"sudo git push":                  true,
+		"env X=1 git push":               true,
+		"sh -c 'git push origin master'": true,
+		"git status && echo push":        false,
+		"npm publish":                    false,
+	} {
+		if got := pushes(script); got != want {
+			t.Errorf("pushes(%q) = %v", script, got)
+		}
+	}
+}

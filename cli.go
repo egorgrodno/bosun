@@ -123,7 +123,7 @@ func runCommand(cmd string, args []string) error {
 		req.Model, req.Effort, args = *model, *effort, flags.Args()
 	}
 	need := map[string]int{"approve": 1, "dismiss": 1, "deny": 1, "reply": 2, "tell": 1, "spawn": 3, "kill": 1, "say": 2, "interrupt": 1, "compact": 1, "clear": 1, "away": 1}[cmd]
-	if len(args) < need || cmd == "away" && (args[0] != "on" && args[0] != "off" || args[0] == "off" && len(args) > 1) {
+	if len(args) < need {
 		return errors.New(usage)
 	}
 	switch cmd {

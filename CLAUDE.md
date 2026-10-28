@@ -130,14 +130,6 @@ A rebuild on the allowlist that shares its command with others, as in `nxt 2>&1 
 
 **Questions go to the master, whatever the depth.** Workers run without `AskUserQuestion`, which would wait on a person, and ask through `ask` instead.
 
-**Away mode parks what would wait on you.** `bosun away on`, `w` twice in `bosun tui`, or the desk's `away` tool on your quoted words turns it on, and `off` turns it off. The daemon keeps it in `state.json`, with when it went on and your words, so it outlasts a restart and a cleared master. While it is on, every decision whose holder would be you goes through `parkLocked` instead of opening. The master's own permissions, the desk's, reserved actions on your list, escalations, `notify` and bosun's own notices all park this way. A notice whose permission waits in its session's own prompt does not park, since only an answer there settles it. Turning it on also parks the permissions and questions already waiting on you.
-
-**Parked means answered at once.** A parked permission is denied, and a parked question answered, with a standard text: you are away, the call waits on a list for your return, so do not retry it and carry on with the rest. A held `PreToolUse` would block its session until the hook's timeout, while a denial lets it go on with other work. A parked notice simply waits on the list. Each parked item records the decision as it stood, why it would have reached you, and when. The frontends get a `parked` event and no `decision` event, so nothing notifies you, and the log gets a `parked` entry.
-
-**The master learns of it from each batch.** While away mode is on, `next_event`'s result begins with a line that says so. `escalate` and `notify` answer that they parked. The rules for the master live in the descriptions of `next_event`, `escalate`, `notify` and `decide`, since its system prompt never changes. The master escalates what needs you as it would, and merges on into the local checkout rather than wait on a push.
-
-**Turning it off hands you one list.** `parkedList` groups identical requests and orders them so one approval unblocks the most: pushes first, then the larger groups, then permissions, questions and notices. The daemon opens one notice holding the list, which `bosun status` and the tui show until you dismiss it. It also queues the list for the desk as a `back` event, which the desk gets as it gets a tell, unless the desk turned the mode off itself and so read the list in the tool's result. A `back` event is no message of yours, and a desk that cannot take it drops it, since the notice holds the list. A parked call was denied, so acting on an item means telling the master to run it again.
-
 | MCP tool | Held by | Does |
 |---|---|---|
 | `spawn` | the master and workers | starts a child session |
@@ -179,6 +171,16 @@ The decision rides in `text`, not in `decision`, since `pendingLocked` drops an 
 **Blocking tools send progress.** Claude Code aborts a stdio tool call that sends nothing for 30 seconds. While `next_event` or `ask` blocks, it sends `notifications/progress` on the call's `progressToken` every 10 seconds. Claude Code also moves a call still running after 120 seconds to the background, unless the settings' `env` sets `CLAUDE_CODE_MCP_AUTO_BACKGROUND_MS` to `0`.
 
 **Typing to the master.** Text typed into a sleeping master starts its turn. Text typed while a tool call runs waits until the call returns, so `next_event` must return empty within five minutes. While `bosun attach` or `bosun tui` runs `claude attach` on the master, it holds an `attached` request on the daemon, and `next_event` then returns within seconds. A bare `claude attach` holds nothing, so text typed there waits until `next_event` returns empty.
+
+## Away mode
+
+**Away mode parks what would wait on you.** `bosun away on`, the tui or the desk's `away` tool turns it on, and `bosun away off` turns it off. The desk acts only on your words, quoted from your latest message. The mode lives in `state.json`, so it outlasts a restart and a cleared master. While it is on, every decision that would wait on you parks instead of opening. That covers the master's and the desk's own permissions, reserved actions on your list, escalations and every notice, a `tell_desk` without a desk included. A notice for a permission left in its session's own prompt still opens, since only an answer there settles it. Turning the mode on parks the permissions and questions already waiting on you.
+
+**Parked means answered at once.** A parked permission is denied, and a parked question answered, with a note that it waits for your return. The session then goes on with other work, where a held `PreToolUse` would block it for up to an hour. A parked notice waits on the list. The frontends get a `parked` event and no `decision` event, so nothing notifies you.
+
+**The master learns of it from each batch.** `next_event`'s result begins with a line that says so, and `escalate` and `notify` answer that they parked. The rules live in the tool descriptions, as "Upgrades" requires. The master escalates what needs you as it would, and merges on into the local checkout rather than wait on a push.
+
+**Turning it off hands you one list.** The list groups identical requests and puts first what unblocks the most: pushes, then the larger groups. It goes into one notice, which `bosun status` and the tui show until you dismiss it. The desk gets it as a `back` event, the way it gets a tell. A desk that turned the mode off itself gets no `back` event, since the tool's result holds the list. A `back` event counts as no message of yours. A desk that cannot take it drops it, since the notice holds the list. A parked call was denied, so acting on an item means telling the master to run it again.
 
 ## Messages
 
@@ -319,7 +321,7 @@ A frontend should show the `answered` event and the snapshot's `answered`: each 
 
 The snapshot's `paused`, and the `paused` and `unpaused` events, show a pause. A session's `paused` marks a turn that `unpause` resumes.
 
-The snapshot's `away` is `{"since":…,"by":"user","words":"off to bed"}` while away mode is on, and is left out otherwise. Its `parked` lists what parked since, each as `{"decision":…,"why":"it is the master's own permission","at":…}`. An `away` event carries `away` and starts an empty list. A `parked` event carries one item in `parked`, and a `back` event ends the mode and the list. `away` takes `name` `on` or `off`, and `words`, as `{"op":"away","name":"on","words":"off to bed"}`.
+The snapshot's `away` is `{"since":…,"by":"user","words":"off to bed"}` while away mode is on, and is left out otherwise. Its `parked` lists what parked since, each as `{"decision":…,"why":"it is the master's own permission","at":…}`. An `away` event starts the mode, in its `away`, with an empty list. Each `parked` event adds the item in its `parked`. A `back` event ends both. `away` takes `name` `on` or `off`, and `words`, as `{"op":"away","name":"on","words":"off to bed"}`.
 
 A session's `status` comes from Claude Code's listing, which shows it busy after its turn ended while a background command still runs, and for a few seconds after any turn. From a `Stop` or `StopFailure` until a hook of a new turn or a listing that shows the session idle or stopped, the snapshot and the `sessions` event show it `idle` with no `state`, and `say` and `interrupt` treat it as idle. The daemon's own record keeps the listing's status.
 
@@ -357,7 +359,7 @@ A session's `activity` shows what it does: `tool` with `arg`, the main argument 
 | `paused` | the user paused the fleet | |
 | `unpaused` | the user resumed the fleet | `text`: which turns resumed |
 | `away` | the user or the desk turned away mode on | `text`: the user's words |
-| `back` | the user or the desk turned away mode off | `text`: the list of what parked |
+| `back` | the user or the desk turned away mode off | `text`: what the switch answered, with the list of what parked |
 | `parked` | bosun parked `node`'s decision while the user was away | `decision`, `text`: why it would have reached the user |
 | `model` | the user switched the master or the desk | `model`, `effort` |
 | `turn_end`, `exit` | worker `node` ended its turn, or stopped in it, other than by a kill | `text` |

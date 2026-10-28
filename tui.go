@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"slices"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -166,11 +165,7 @@ func (t *tui) apply(r Response) {
 	case r.Event.Kind == "decision" && r.Event.Decision != nil:
 		d := *r.Event.Decision
 		t.decisions = append(slices.DeleteFunc(t.decisions, func(o Decision) bool { return o.ID == d.ID }), d)
-		slices.SortFunc(t.decisions, func(a, b Decision) int {
-			x, _ := strconv.Atoi(a.ID)
-			y, _ := strconv.Atoi(b.ID)
-			return x - y
-		})
+		slices.SortFunc(t.decisions, func(a, b Decision) int { return byID(a.ID, b.ID) })
 	case r.Event.Kind == "settled":
 		t.decisions = slices.DeleteFunc(t.decisions, func(o Decision) bool { return o.ID == r.Event.ID })
 		if t.answering == r.Event.ID {
@@ -288,12 +283,10 @@ func (t *tui) render(width, height int) []string {
 	}
 	if len(t.parked) > 0 {
 		add(dim, "Parked while you are away", false)
-	}
-	for _, p := range t.parked {
-		add("", fmt.Sprintf("  %-4s %-14s %s", p.Decision.ID, p.Decision.Node, parkedLine(p)), false)
-		add(dim, "       because "+p.Why, false)
-	}
-	if len(t.parked) > 0 {
+		for _, p := range t.parked {
+			add("", fmt.Sprintf("  %-4s %-14s %s", p.Decision.ID, p.Decision.Node, parkedLine(p)), false)
+			add(dim, "       because "+p.Why, false)
+		}
 		add("", "", false)
 	}
 	items := t.items()

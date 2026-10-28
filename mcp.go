@@ -55,9 +55,9 @@ bosun refuses a notice, a decision that waits on the master, a decision of your 
 
 	awayHelp = `Turn the away mode on when the user says they are leaving the fleet to work without them, such as "I'm logging off" or "going to bed", and off when they say they are back. Call it on their word alone, quoting it exactly from their latest message, and never of your own judgement, such as because they have gone quiet.
 
-While it is on, nothing waits on the user: bosun parks what would, such as the master's push, a reserved action on the user's list, a decision the master escalates or a notice. It denies each call and answers each question with a note that it waits for the user's return, so the fleet works on without them. bosun status shows it on and lists what it parked.
+While it is on, bosun parks what would wait on the user, such as the master's push, a reserved action on the user's list, a decision the master escalates or a notice. It denies each call and answers each question with a note that it waits for the user's return, so the fleet works on without them. bosun status shows it on and lists what it parked.
 
-Turning it off returns the list of what was parked, the one whose approval unblocks the most first. Show it to the user, and pass on what they want done with each item to the master with tell_master: a parked call was denied, so the master runs it again or resumes its worker to. When the user turns it off themselves, as with bosun away off, bosun hands you the same list as a prompt.`
+Turning it off returns the list of what was parked, the one whose approval unblocks the most first. Show it to the user, and pass on what they want done with each item to the master with tell_master. A parked call was denied, so the master runs it again, or resumes the worker that made it. When the user turns it off themselves, as with bosun away off, bosun hands you the same list as a prompt.`
 
 	transcriptHelp = `Show the last turns of a session's conversation: the prompt that began each turn, the session's text, and a line for each tool call, oldest first. Use it to answer what a session is doing or did, after status names the sessions. A turn's tool results do not show.`
 
@@ -87,10 +87,10 @@ The user waits on you. A tell waits until your next call to next_event, and what
 Once you have merged every worker and an hour has passed since your last turn, bosun clears your conversation before the next event wakes you, so you wake with no earlier conversation. Whenever you learn something that must outlast a clear, such as how the user wants decisions handled, write it to your memory directory then.
 
 When the user leaves the fleet to work without them, as overnight, they turn on the away mode, and each batch next_event returns begins with a line that says so. Until a batch comes without that line:
-- Send nothing to the user. escalate and notify reach nobody: bosun parks what they get on a list for the user's return, and a parked permission or question is denied or answered with a note that it waits for the user. So escalate what needs the user as you would, and move on: it needs nothing more from you, and the user gets the list once they are back.
+- escalate and notify reach nobody. bosun parks what they get on a list for the user's return, and denies a parked permission or answers a parked question with a note that it waits for the user. Escalate what needs the user as you would, then move on: the user gets the list once they are back.
 - Your own permissions and the reserved actions on the user's list park the same way, such as a push of yours. Do not try them again, nor another way to the same end.
 - Carry on with everything else. Decide and reply as you would. Merge on into the local checkout rather than wait on a push, and start the next piece of work on what merged. A worker whose call was parked carries on with the rest of its task, and its turn_end says what waits.
-- Answer tells with tell_desk as you would: the desk keeps your answers for the user.
+- Answer tells with tell_desk as you would: the desk keeps your answers for the user, and without a desk they park.
 
 The events:
 - tell: an instruction from the user. Act on it, usually by starting workers with spawn. With from set to desk, the front desk relays it: the desk is the session the user talks to, which reads the fleet but changes nothing in it, so it passes the user's instructions to you. Act on such a tell as on the user's own. Answer every tell with tell_desk, whatever its from: that is how the user hears of it. Answer once you have acted on it, such as by spawning a worker for it, and again once you know how it ended. When acting on it is all it needs, one answer covers both.

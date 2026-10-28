@@ -1219,7 +1219,8 @@ func (d *daemon) adoptLocked(dec *Decision) *Decision {
 	return dec
 }
 
-func (d *daemon) openLocked(dec *Decision) {
+// openLocked opens dec, and reports whether parkLocked parked it instead.
+func (d *daemon) openLocked(dec *Decision) (parked bool) {
 	d.nextID++
 	dec.ID = strconv.Itoa(d.nextID)
 	dec.opened = time.Now()
@@ -1227,7 +1228,7 @@ func (d *daemon) openLocked(dec *Decision) {
 	dec.Expires = holdDeadline(dec)
 	dec.answer = make(chan answer, 1)
 	if dec.Holder == "user" && d.parkLocked(dec) {
-		return
+		return true
 	}
 	d.decisions[dec.ID] = dec
 	d.saveLocked()
@@ -1246,6 +1247,7 @@ func (d *daemon) openLocked(dec *Decision) {
 		d.logLocked(e)
 	}
 	log.Printf("decision %s: %s from %s, for the %s", dec.ID, dec.Kind, dec.Node, dec.Holder)
+	return false
 }
 
 // holdTimed reports whether the daemon stops holding dec on a timer: a permission that no reserved rule caught.
@@ -1536,8 +1538,7 @@ func (d *daemon) notify(caller, text string) (string, error) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: text, from: masterNode})
-	if d.awayLocked() {
+	if d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: text, from: masterNode}) {
 		return "The user is away, so bosun parked the notice on the list they get when they come back.", nil
 	}
 	return "The user will see it.", nil
@@ -2060,7 +2061,7 @@ func (d *daemon) broadcastSessionsLocked() {
 }
 
 func (d *daemon) snapshotLocked() Response {
-	resp := Response{Type: "snapshot", Sessions: []Session{}, Decisions: []Decision{}, Paused: d.paused, Away: d.away, Parked: slices.Clone(d.parked)}
+	resp := Response{Type: "snapshot", Sessions: []Session{}, Decisions: []Decision{}, Paused: d.paused, Away: d.away, Parked: d.parked}
 	for _, n := range d.sortedLocked() {
 		resp.Sessions = append(resp.Sessions, n.public())
 	}
@@ -2070,11 +2071,7 @@ func (d *daemon) snapshotLocked() Response {
 	resp.Messages = slices.Clone(d.messages)
 	resp.Answered = slices.Clone(d.answered)
 	resp.Log = slices.Clone(d.logged)
-	slices.SortFunc(resp.Decisions, func(a, b Decision) int {
-		x, _ := strconv.Atoi(a.ID)
-		y, _ := strconv.Atoi(b.ID)
-		return x - y
-	})
+	slices.SortFunc(resp.Decisions, func(a, b Decision) int { return byID(a.ID, b.ID) })
 	return resp
 }
 

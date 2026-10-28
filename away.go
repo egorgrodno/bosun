@@ -34,16 +34,16 @@ func (d *daemon) parkLocked(dec *Decision) bool {
 	c.Input, c.Expires = cutInput(c.Input), ""
 	p := Parked{Decision: c, Why: reachesUser(dec), At: time.Now()}
 	d.parked = append(d.parked, p)
-	switch {
-	case dec.Kind == "notice":
-	case d.decisions[dec.ID] == dec:
+	if d.decisions[dec.ID] == dec {
 		d.settleLocked(dec, parkedAnswer(dec), outcome{by: "bosun"})
-	default:
-		dec.answer <- parkedAnswer(dec)
+	} else {
+		if dec.Kind != "notice" {
+			dec.answer <- parkedAnswer(dec)
+		}
+		d.saveLocked()
 	}
-	d.saveLocked()
 	d.broadcastLocked(Event{Kind: "parked", Parked: &p})
-	d.logLocked(Entry{Kind: "parked", By: "bosun", From: dec.from, Node: dec.Node, Decision: &c, Text: p.Why})
+	d.logLocked(Entry{Kind: "parked", By: "bosun", From: dec.from, Node: dec.Node, Decision: dec, Text: p.Why})
 	log.Printf("decision %s: parked, since the user is away", dec.ID)
 	return true
 }
@@ -107,14 +107,13 @@ func (d *daemon) goAwayLocked(caller, words string) (string, error) {
 	d.broadcastLocked(Event{Kind: "away", Away: &a})
 	d.logLocked(Entry{Kind: "away", By: role(caller), From: caller, Text: words})
 	log.Print("away mode on")
-	waiting := slices.Collect(func(yield func(*Decision) bool) {
-		for _, dec := range d.decisions {
-			if dec.Holder == "user" && dec.Kind != "notice" && !yield(dec) {
-				return
-			}
+	var waiting []*Decision
+	for _, dec := range d.decisions {
+		if dec.Holder == "user" && dec.Kind != "notice" {
+			waiting = append(waiting, dec)
 		}
-	})
-	slices.SortFunc(waiting, byID)
+	}
+	slices.SortFunc(waiting, func(a, b *Decision) int { return byID(a.ID, b.ID) })
 	for _, dec := range waiting {
 		d.parkLocked(dec)
 	}
@@ -139,21 +138,23 @@ func (d *daemon) comeBackLocked(caller string) (string, error) {
 	d.broadcastLocked(Event{Kind: "back"})
 	d.logLocked(Entry{Kind: "back", By: role(caller), From: caller, Text: text})
 	log.Print("away mode off")
-	if list != "" {
-		d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: text})
-		// The desk that turned it off reads the list in its tool's result.
-		if desk := d.deskLocked(); caller != deskNode && desk != nil {
-			d.queueLocked(desk, Event{Kind: "back", Text: list})
-		}
+	if list == "" {
+		d.saveLocked()
+		return text, nil
 	}
-	d.saveLocked()
+	// The desk that turned it off reads the list in its tool's result.
+	if desk := d.deskLocked(); caller != deskNode && desk != nil {
+		d.queueLocked(desk, Event{Kind: "back", Text: list})
+	}
+	d.openLocked(&Decision{Kind: "notice", Node: masterNode, Holder: "user", Note: text})
 	return text, nil
 }
 
-func byID(a, b *Decision) int {
-	x, _ := strconv.Atoi(a.ID)
-	y, _ := strconv.Atoi(b.ID)
-	return x - y
+// byID orders decision ids, which count up from 1, by number.
+func byID(a, b string) int {
+	x, _ := strconv.Atoi(a)
+	y, _ := strconv.Atoi(b)
+	return cmp.Compare(x, y)
 }
 
 // parkedList shows what was parked, one group to each request that several sessions or several tries share, the group whose approval unblocks the most first.
@@ -168,7 +169,11 @@ func parkedList(parked []Parked) string {
 	byKey := map[string]*group{}
 	for _, p := range parked {
 		dec := p.Decision
-		key := strings.Join([]string{dec.Kind, dec.Tool, compact(dec.Input), dec.Question, dec.Note}, "\x00")
+		// An escalation's note is the master's, so it does not tell requests apart.
+		key := strings.Join([]string{dec.Kind, dec.Tool, compact(dec.Input), dec.Question}, "\x00")
+		if dec.Kind == "notice" {
+			key += "\x00" + dec.Note
+		}
 		g := byKey[key]
 		if g == nil {
 			g = &group{push: isPush(dec), rank: slices.Index([]string{"permission", "question", "notice"}, dec.Kind)}
@@ -178,16 +183,7 @@ func parkedList(parked []Parked) string {
 		g.items = append(g.items, p)
 	}
 	slices.SortStableFunc(groups, func(a, b *group) int {
-		switch {
-		case a.push != b.push:
-			if a.push {
-				return -1
-			}
-			return 1
-		case len(a.items) != len(b.items):
-			return len(b.items) - len(a.items)
-		}
-		return cmp.Compare(a.rank, b.rank)
+		return cmp.Or(compareBool(b.push, a.push), cmp.Compare(len(b.items), len(a.items)), cmp.Compare(a.rank, b.rank))
 	})
 	var b strings.Builder
 	for i, g := range groups {
@@ -207,7 +203,18 @@ func parkedList(parked []Parked) string {
 	return strings.TrimSuffix(b.String(), "\n")
 }
 
-// isPush reports whether dec runs git push, whichever command of its script does.
+// compareBool orders false before true.
+func compareBool(a, b bool) int {
+	switch {
+	case a == b:
+		return 0
+	case a:
+		return 1
+	}
+	return -1
+}
+
+// isPush reports whether dec runs git push anywhere in its script.
 func isPush(dec Decision) bool {
 	if dec.Kind != "permission" || dec.Tool != "Bash" {
 		return false
@@ -216,10 +223,23 @@ func isPush(dec Decision) bool {
 		Command string `json:"command"`
 	}
 	_ = json.Unmarshal(dec.Input, &in)
-	for _, c := range simpleCommands(in.Command) {
-		if len(c.argv) > 0 && filepath.Base(c.argv[0]) == "git" {
-			if _, sub, _, _ := gitCommand(c.argv[1:]); sub == "push" {
-				return true
+	return pushes(in.Command)
+}
+
+// pushes walks script as the gate's command and argv do, finding git behind wrappers such as sudo or env and inside sh -c or eval.
+func pushes(script string) bool {
+	for _, c := range simpleCommands(script) {
+		for i, w := range c.argv {
+			if filepath.Base(w) == "git" {
+				if _, sub, _, _ := gitCommand(c.argv[i+1:]); sub == "push" {
+					return true
+				}
+			}
+			if s, ok := inner(c.argv, i); ok {
+				if pushes(s) {
+					return true
+				}
+				break
 			}
 		}
 	}
