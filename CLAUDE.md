@@ -108,26 +108,36 @@ The check holds the call until the answer and returns `allow` or `deny`. A `PreT
 - the pushes above, and a push outside the sandbox from a repository whose git setup does not match its record, or has none
 - a write through a file tool to a credential store, a shell startup file, Claude Code's configuration, git hooks or config, a systemd unit, autostart entry or cron table, or bosun's state directory
 - a Bash command outside the sandbox that may write such a path, or reads a credential
+- a Bash command outside the sandbox that may write a path bosun cannot resolve, where it could lead to the list
 - a Bash command outside the sandbox that runs in a folder of the list, unless it only reads and the folder holds no credential
-- a Bash command outside the sandbox that runs as root, as through `sudo`, edits a cron table through `crontab`, or activates a NixOS configuration other than through a rebuild on the allowlist
-- a Bash command outside the sandbox that runs a `bosun` subcommand other than `status`, `conversation`, `log`, `follow`, `watch` and `help`
+- a Bash command outside the sandbox that runs as root, as through `sudo`, or activates a NixOS configuration other than through a rebuild on the allowlist
+- a Bash command outside the sandbox that schedules a job or changes a unit: `crontab`, `at`, `batch`, `systemd-run`, or `systemctl enable`, `link`, `edit` and the like
+- a Bash command outside the sandbox that writes git config through `git config --global` or `--system`, or runs git through an alias that `-c` sets
+- a Bash command outside the sandbox that runs a `bosun` subcommand other than `status`, `conversation`, `log`, `follow`, `watch` and `help`, or a program that a variable or a substitution names
 
 `userList` in `reserved.go` holds the exact paths. The sessions' temporary folders, `nodes/*/tmp` in the state directory, are off the list. In a worker's own worktree, only what its next start runs outside the sandbox counts, such as `.claude/settings.json`. The merge's review sees the rest.
 
-**The list cannot bind a command outside the sandbox.** Such a command can write anywhere. The check reads two things: the paths a command's words and redirections name, and whether a word runs as root. Some words name no path. A redirection's descriptor, as in `2>&1`, is one. A `/` or `..` that leads to the root is another when it is a piece of a longer word, such as jq's `//` or the end of sed's `s/x//`. jq's program is a third, since jq opens no file it names. So are a shell's `-c` script, which the check reads as a command of its own, and the arguments of `echo`, `printf` and the reading subcommands of `bosun`. A path built at run time, as by a script or an unknown variable, escapes it. So the `decide` description tells the master to read the command whole, and to escalate anything it cannot follow or that touches the list.
+**The list cannot bind a command outside the sandbox.** Such a command can write anywhere. The check reads two things: the paths a command's words and redirections name, and whether a word runs as root. It follows a symlink along a path, as a file tool does, so a link a session made in its scratch folder counts as its target. Some words name no path. A redirection's descriptor, as in `2>&1`, is one. A `/` or `..` that leads to the root is another when it is a piece of a longer word, such as jq's `//` or the end of sed's `s/x//`. jq's program is a third, since jq opens no file it names, unless it imports a module. So are a shell's `-c` script, and the scripts of `eval`, `script -c`, `flock -c`, `env -S` and `nix-shell --run`, which the check reads as commands of their own. A path built at run time escapes it: a variable bosun does not know, a `~name`, a substitution or an ANSI-C escape. The check counts such a path where what comes before or after the unknown part could lead to the list, and always as the target of a sure write. So the `decide` description tells the master to read the command whole, and to escalate anything it cannot follow or that touches the list.
 
-**A `bosun` subcommand that acts as you stays with you.** `steers` in `reserved.go` holds every subcommand but the reading ones, under rule `unboxed.steer`, and also one bosun does not know. That covers `approve`, `say`, `interrupt`, `away` and `tui`, which answers decisions. It finds `bosun` behind a path, assignments, `env` or `timeout`, after `xargs`, and inside a shell's `-c` script. Outside the sandbox, a session's `bosun say` reaches the daemon the way your own does, and the daemon uses the control key only for your actions. So `bosun say` stays reserved, though #63 counted it a false positive. A session reads the fleet through the read tools instead.
+**A `bosun` subcommand that acts as you stays with you.** `steers` in `unboxed.go` holds every subcommand but the reading ones, under rule `unboxed.steer`, and also one bosun does not know. That covers `approve`, `say`, `interrupt`, `away` and `tui`, which answers decisions. Outside the sandbox, a session's `bosun say` reaches the daemon the way your own does, and the daemon uses the control key only for your actions. So `bosun say` stays reserved, though #63 counted it a false positive. A session reads the fleet through the read tools instead.
 
-**A path the command only reads stays off the list, unless it is a credential.** `accesses` in `reserved.go` sorts each word:
+**A path the command only reads stays off the list, unless it is a credential.** bosun trusts that only when it understands every command of the script. One command it does not understand, such as `xargs` fed by a pipe, may write any path the others name. So in such a script every word counts as a possible write, as the check did before it told reads from writes. bosun understands a command when it knows the program and every option the command passes:
+
+- the program is a reader, a writer or a copier below, `jq`, `dd`, `bosun`, `echo` or `printf`, and not a variable
+- each wrapper before it, such as `env`, `timeout`, `nice`, `stdbuf`, `setsid` or `ionice`, passes only options bosun knows. `env -C` and `time -o` are ones it does not.
+- a copier passes only options that keep its last argument the destination and its sources unchanged: not `-t`, `-S`, `-m`, `-e`, `--remove-source-files`, or cp's `-l` and `-s`
+- `find` has no action such as `-delete` or `-exec`, and `rg` no `--pre` or `--hostname-bin`
+- a `cd` leads where bosun can follow, with no option
+
+In a script bosun understands, `accesses` in `unboxed.go` sorts each word:
 
 | The word | Counts as |
 |---|---|
-| an argument of a reader such as `cat`, `jq`, `grep`, `ls`, `diff`, or `find` without an action such as `-delete` or `-exec` | a read |
-| a source of `cp`, `install`, `ln`, `rsync` or `scp`, the target of `<`, the argument of `cd` | a read |
-| an argument of `rm`, `mv`, `tee`, `touch`, `chmod` and the like, the last argument of a copier or the target of its `-t`, `dd`'s `of=`, the target of `>` | a write |
-| a word of any other command, `sed` and `awk` included | a possible write |
+| an argument of a reader such as `cat`, `jq`, `grep`, `ls`, `diff` or `find` | a read |
+| a source of `cp`, `install`, `rsync` or `scp`, the target of `<`, the argument of `cd` | a read |
+| an argument of `rm`, `mv`, `tee`, `touch`, `chmod`, `ln` and the like, the last argument of a copier, `dd`'s `of=`, the target of `>`, `>|` or zsh's `>!` | a write |
 
-A bare program name names no path, since it runs from `PATH`. A program named by its path counts as a read.
+A bare program name names no path, since it runs from `PATH`. A program named by its path counts as a read. Where bosun does not understand the script, it looks for `bosun`, `crontab`, `at`, `systemd-run` and `systemctl` in every word, as `xargs` and `find -exec` run one.
 
 **The allowlist lets a few commands outside the sandbox take the normal flow.** Each must be the whole command: plain words, with nothing chained, piped, substituted, redirected or assigned before it.
 

@@ -57,6 +57,10 @@ const (
 	ruleRoot        = "unboxed.root"
 	ruleCron        = "unboxed.cron"
 	ruleSteer       = "unboxed.steer"
+	ruleSchedule    = "unboxed.schedule"
+	ruleProgram     = "unboxed.program"
+	ruleUnresolved  = "unboxed.unresolved"
+	ruleGitAlias    = "git.alias"
 	ruleActivate    = "unboxed.activate"
 	ruleUnboxWrite  = "unboxed.write"
 	ruleUnboxRead   = "unboxed.read"
@@ -114,18 +118,22 @@ func (g gate) write(path string) reservation {
 	path = filepath.Clean(path)
 	r := g.writeAt(path)
 	if real := resolve(path); real != path {
-		// The session's own folders may lie behind symlinks too.
-		h := g
-		h.writable, h.fenced = make([]string, len(g.writable)), make([]string, len(g.fenced))
-		for i, dir := range g.writable {
-			h.writable[i] = resolve(dir)
-		}
-		for i, dir := range g.fenced {
-			h.fenced[i] = resolve(dir)
-		}
-		r = r.or(h.writeAt(real))
+		r = r.or(g.resolved().writeAt(real))
 	}
 	return r
+}
+
+// resolved is g with the symlinks along its folders followed, as the session's own folders may lie behind them too.
+func (g gate) resolved() gate {
+	h := g
+	h.writable, h.fenced = make([]string, len(g.writable)), make([]string, len(g.fenced))
+	for i, dir := range g.writable {
+		h.writable[i] = resolve(dir)
+	}
+	for i, dir := range g.fenced {
+		h.fenced[i] = resolve(dir)
+	}
+	return h
 }
 
 func (g gate) writeAt(path string) reservation {
@@ -221,8 +229,24 @@ func (g gate) argv(argv, dirs []string) reservation {
 	return r
 }
 
-// inner returns the script that argv[i] runs when it is eval or a shell's -c, which argv[lo:hi] hold.
+// inner returns the script that argv[i] runs, which argv[lo:hi] hold: eval's words, a shell's -c, the -c of script and flock, env's -S and nix-shell's --run.
 func inner(argv []string, i int) (script string, lo, hi int, ok bool) {
+	// after returns the word that follows one of opts, a short one closing a bundle such as -qc included, or what follows a short one in the same word.
+	after := func(opts ...string) (string, int, int, bool) {
+		for j := i + 1; j < len(argv); j++ {
+			a := argv[j]
+			for _, o := range opts {
+				bundle := len(o) == 2 && len(a) > 2 && a[1] != '-' && a[0] == '-' && strings.HasSuffix(a, o[1:])
+				switch {
+				case (a == o || bundle) && j+1 < len(argv):
+					return argv[j+1], j + 1, j + 2, true
+				case len(o) == 2 && len(a) > 2 && strings.HasPrefix(a, o):
+					return a[2:], j, j + 1, true
+				}
+			}
+		}
+		return "", 0, 0, false
+	}
 	switch filepath.Base(argv[i]) {
 	case "eval":
 		return strings.Join(argv[i+1:], " "), i + 1, len(argv), true
@@ -232,11 +256,33 @@ func inner(argv []string, i int) (script string, lo, hi int, ok bool) {
 				return argv[j+1], j + 1, j + 2, true
 			}
 		}
+	case "script", "flock":
+		return after("-c", "--command")
+	case "env":
+		return after("-S", "--split-string")
+	case "nix-shell":
+		return after("--run", "--command")
 	}
 	return "", 0, 0, false
 }
 
 func (g gate) git(args, dirs []string) reservation {
+	// An alias can stand for any subcommand, a force push included.
+	for j := 0; j < len(args) && strings.HasPrefix(args[j], "-"); j++ {
+		v := ""
+		switch a := args[j]; {
+		case a == "-C":
+			j++
+		case (a == "-c" || a == "--config-env") && j+1 < len(args):
+			j++
+			v = args[j]
+		case strings.HasPrefix(a, "--config-env="):
+			v = strings.TrimPrefix(a, "--config-env=")
+		}
+		if strings.HasPrefix(v, "alias.") {
+			return reservation{"a git command through an alias bosun cannot check", true, ruleGitAlias, v}
+		}
+	}
 	cd, sub, rest, opt := gitCommand(args)
 	switch sub {
 	case "push":
@@ -407,238 +453,6 @@ func chdir(dir string, args []string) string {
 	return at(dir, args)
 }
 
-// outside checks a command outside the sandbox that command found nothing for the user in, so whose pushes come from repositories as bosun recorded them.
-// Only a whole command of plain words on the allowlist takes the normal flow: a rebuild that adds no boot entry, or a push.
-// Of the rest, the user keeps what runs as root or names a path on the user's list, and the master gets everything else.
-func (g gate) outside(script string) reservation {
-	argv := strings.Split(script, " ")
-	if rebuild(argv) {
-		return reservation{}
-	}
-	if !slices.ContainsFunc(argv, func(w string) bool { return !plainWord.MatchString(w) }) && argv[0] == "git" {
-		if _, sub, _, opt := gitCommand(argv[1:]); sub == "push" && opt == "" {
-			return reservation{}
-		}
-	}
-	if r := g.userUnboxed(script, g.cwd); r.reason != "" {
-		return r
-	}
-	r := reservation{"a command outside the sandbox", false, ruleUnboxed, ""}
-	if cmds := simpleCommands(script); len(cmds) > 0 && len(cmds[0].argv) > 0 {
-		r.match = cmds[0].argv[0]
-	}
-	return r
-}
-
-// userUnboxed says what in script, run outside the sandbox in dir, only the user may allow. dir is "" when bosun cannot tell where a command runs.
-// A command there can write anywhere, so this catches only what a word names: a path on the user's list that the command may write, wherever in the word, a credential it reads, or a command that runs as root.
-func (g gate) userUnboxed(script, dir string) reservation {
-	for _, cmd := range simpleCommands(script) {
-		argv := cmd.argv
-		var words []string
-		expanded := make([][]string, len(argv))
-		for i, w := range argv {
-			expanded[i] = g.list.words(w, dir)
-			words = append(words, expanded[i]...)
-		}
-		// A rebuild the allowlist takes stays the master's beside other commands, which this checks apart.
-		if r := asRoot(words); r.reason != "" && !rebuild(argv) {
-			return r
-		}
-		if r := steers(argv); r.reason != "" {
-			return r
-		}
-		acc, reader := accesses(argv)
-		var scripts []string
-		for i := range argv {
-			if s, lo, hi, ok := inner(argv, i); ok {
-				scripts = append(scripts, s)
-				for j := lo; j < hi; j++ {
-					acc[j] = text
-				}
-			}
-		}
-		for i := range argv {
-			if r := g.uses(expanded[i], dir, acc[i]); r.reason != "" {
-				return r
-			}
-		}
-		for _, f := range cmd.files {
-			if r := g.uses(g.list.words(f.word, dir), dir, f.access); r.reason != "" {
-				return r
-			}
-		}
-		for _, s := range scripts {
-			if r := g.userUnboxed(s, dir); r.reason != "" {
-				return r
-			}
-		}
-		// A command that writes may write where it runs without naming the place.
-		if what := g.names(dir, ""); what != "" && (!reader || what == credentials) {
-			return reservation{"a command outside the sandbox that runs in " + what, true, ruleUnboxRunsIn, dir}
-		}
-		if len(argv) > 0 && (argv[0] == "cd" || argv[0] == "pushd") {
-			dir = g.list.cd(dir, argv[1:])
-		}
-	}
-	return reservation{}
-}
-
-// uses says whether a word that expands to paths, used as a in a command run in dir, names a path on the user's list that only the user may let it use: any it may write, and a credential it reads.
-func (g gate) uses(paths []string, dir string, a access) reservation {
-	if a == text {
-		return reservation{}
-	}
-	for _, p := range paths {
-		what := g.names(p, dir)
-		if what == "" || a == reads && what != credentials {
-			continue
-		}
-		return reservation{"a command outside the sandbox that names " + what, true, accessRules[a], p}
-	}
-	return reservation{}
-}
-
-// access is what a command does with the path a word of it names.
-type access int
-
-const (
-	// unclear is a word of a command bosun does not know, which may write what it names.
-	unclear access = iota
-	reads
-	writes
-	// text names no path, such as jq's program or a shell's script, which bosun checks apart.
-	text
-)
-
-// accessRules are the rules that a path on the user's list meets, by what the command does with it.
-var accessRules = [...]string{unclear: ruleUnboxNames, reads: ruleUnboxRead, writes: ruleUnboxWrite}
-
-var (
-	// readers write no file their arguments name.
-	readers = []string{"cat", "head", "tail", "grep", "egrep", "fgrep", "rg", "ls", "wc", "stat", "du", "df", "diff", "cmp", "md5sum", "sha1sum", "sha256sum", "sha512sum", "b2sum", "cksum", "realpath", "readlink", "basename", "dirname", "test", "[", "pwd", "cd", "pushd", "column", "cut", "nl", "od", "hexdump", "strings"}
-	// texters take text, and open no file their arguments name.
-	texters = []string{"echo", "printf"}
-	// findActions make find write or run a command.
-	findActions = []string{"-delete", "-exec", "-execdir", "-ok", "-okdir", "-fprint", "-fprint0", "-fprintf", "-fls"}
-	// writers may write every file their arguments name.
-	writers = []string{"rm", "rmdir", "unlink", "shred", "truncate", "touch", "mkdir", "chmod", "chown", "chgrp", "chattr", "setfacl", "tee", "mv"}
-	// copiers write their last argument, or what -t names, and read the rest.
-	copiers = []string{"cp", "install", "ln", "rsync", "scp"}
-	// wrappers run the command that follows their options, and timeout's duration.
-	wrappers = []string{"env", "command", "exec", "nohup", "nice", "time", "timeout"}
-	// assignment matches a variable's assignment before a command.
-	assignment = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*=`)
-)
-
-// commandAt is the index of the program argv runs, past the assignments and wrappers before it, or len(argv) when it runs none.
-func commandAt(argv []string) int {
-	i := 0
-	for i < len(argv) && assignment.MatchString(argv[i]) {
-		i++
-	}
-	for i < len(argv) && slices.Contains(wrappers, filepath.Base(argv[i])) {
-		w := filepath.Base(argv[i])
-		for i++; i < len(argv) && (strings.HasPrefix(argv[i], "-") || w == "env" && assignment.MatchString(argv[i])); i++ {
-		}
-		if w == "timeout" && i < len(argv) {
-			i++
-		}
-	}
-	return i
-}
-
-// bosunReads are the bosun subcommands that only read. The empty one prints the usage.
-var bosunReads = []string{"", "status", "conversation", "log", "follow", "watch", "help", "-h", "-help", "--help"}
-
-// steers says whether argv runs a bosun subcommand that acts as the user, which the daemon cannot tell from the user's own frontend, or one bosun does not know.
-// xargs runs bosun with the words that follow its options, so bosun counts anywhere after it.
-func steers(argv []string) reservation {
-	i := commandAt(argv)
-	if i < len(argv) && filepath.Base(argv[i]) == "xargs" {
-		if j := slices.IndexFunc(argv[i:], func(w string) bool { return filepath.Base(w) == "bosun" }); j >= 0 {
-			i += j
-		}
-	}
-	if i == len(argv) || filepath.Base(argv[i]) != "bosun" {
-		return reservation{}
-	}
-	sub := ""
-	if i+1 < len(argv) {
-		sub = argv[i+1]
-	}
-	if slices.Contains(bosunReads, sub) {
-		return reservation{}
-	}
-	return reservation{"a command outside the sandbox that steers bosun as the user", true, ruleSteer, strings.TrimSpace("bosun " + sub)}
-}
-
-// accesses says what argv does with the path each of its words may name, and whether it writes none of them.
-func accesses(argv []string) (acc []access, reader bool) {
-	acc = make([]access, len(argv))
-	i := commandAt(argv)
-	if i == len(argv) {
-		return acc, true
-	}
-	// Running a program reads it, and a bare name runs one from PATH.
-	acc[i] = text
-	if strings.ContainsRune(argv[i], '/') {
-		acc[i] = reads
-	}
-	args := acc[i+1:]
-	set := func(a access) {
-		for j := range args {
-			args[j] = a
-		}
-	}
-	switch name := filepath.Base(argv[i]); {
-	// bosun's reading commands take words, not paths. steers holds the rest for the user.
-	case slices.Contains(texters, name), name == "bosun" && (i+1 == len(argv) || slices.Contains(bosunReads, argv[i+1])):
-		set(text)
-		return acc, true
-	case name == "jq":
-		set(reads)
-		if p := jqProgram(argv[i:]); p >= 0 {
-			acc[i+p] = text
-		}
-		return acc, true
-	case name == "find" && !slices.ContainsFunc(argv[i+1:], func(a string) bool { return slices.Contains(findActions, a) }),
-		slices.Contains(readers, name):
-		set(reads)
-		return acc, true
-	case slices.Contains(writers, name):
-		set(writes)
-	case name == "dd":
-		for j, a := range argv[i+1:] {
-			args[j] = reads
-			if strings.HasPrefix(a, "of=") {
-				args[j] = writes
-			}
-		}
-	case slices.Contains(copiers, name):
-		set(reads)
-		last := -1
-		for j := i + 1; j < len(argv); j++ {
-			switch a := argv[j]; {
-			case a == "-t" || a == "--target-directory":
-				if j+1 < len(argv) {
-					acc[j+1] = writes
-				}
-				return acc, false
-			case strings.HasPrefix(a, "--target-directory="):
-				acc[j] = writes
-				return acc, false
-			case !strings.HasPrefix(a, "-"):
-				last = j
-			}
-		}
-		if last >= 0 {
-			acc[last] = writes
-		}
-	}
-	return acc, false
-}
-
 // names says what on the user's list a word names, relative to dir when the word is, or returns "".
 // A word that begins with a variable or a ~ that bosun cannot expand, or that is relative to a dir bosun cannot tell, matches only the names the list holds wherever they lie.
 func (g gate) names(word, dir string) string {
@@ -653,6 +467,17 @@ func (g gate) names(word, dir string) string {
 		return g.list.holds(word, false)
 	}
 	path = filepath.Clean(path)
+	if what := g.nameAt(path); what != "" {
+		return what
+	}
+	// A link, such as one a session made in its scratch folder from inside the sandbox, leads a command to its target.
+	if real := resolve(path); real != path {
+		return g.resolved().nameAt(real)
+	}
+	return ""
+}
+
+func (g gate) nameAt(path string) string {
 	if within(g.writable[1:], path) {
 		return ""
 	}
@@ -676,7 +501,7 @@ func jqProgram(argv []string) int {
 			return -1
 		case a == "--arg", a == "--argjson", a == "--slurpfile", a == "--rawfile":
 			i += 2
-		case a == "--indent", a == "-L":
+		case a == "--indent", a == "-L", a == "--library-path":
 			i++
 		case len(a) > 1 && a[0] == '-':
 		default:
@@ -692,7 +517,7 @@ var rootCommands = []string{"sudo", "sudoedit", "doas", "pkexec", "su", "run0"}
 // activations are what nixos-rebuild runs a configuration's activation scripts as root for.
 var activations = []string{"switch", "boot", "test", "dry-activate"}
 
-// asRoot says what in a simple command's words runs as root, or installs a cron table. A word may come from a script that another word holds, such as ssh's.
+// asRoot says what in a simple command's words runs as root. A word may come from a script that another word holds, such as ssh's.
 // The allowlist has already let through the rebuilds the master may decide.
 func asRoot(words []string) reservation {
 	activates := reservation{"a command outside the sandbox that activates a NixOS configuration", true, ruleActivate, ""}
@@ -702,9 +527,6 @@ func asRoot(words []string) reservation {
 			return reservation{"a command outside the sandbox that runs " + b, true, ruleRoot, w}
 		case w == "--sudo", w == "--use-remote-sudo":
 			return reservation{"a command outside the sandbox that runs sudo", true, ruleRoot, w}
-		// crontab is setuid, and installs a table that cron runs later. Only -l reads one.
-		case b == "crontab" && !slices.Contains(words[i+1:], "-l"):
-			return reservation{"a command outside the sandbox that edits " + cronTable, true, ruleCron, w}
 		// nxt, nxs and nxb run nixos-rebuild test, switch and boot on /etc/nixos.
 		case b == "nxt", b == "nxs", b == "nxb":
 			return activates.on(w)
@@ -865,6 +687,8 @@ func (l userList) words(word, dir string) []string {
 			switch {
 			case w == "~" || strings.HasPrefix(w, "~/"):
 				w = l.home + w[1:]
+			case l.vars["USER"] != "" && (w == "~"+l.vars["USER"] || strings.HasPrefix(w, "~"+l.vars["USER"]+"/")):
+				w = l.home + w[1+len(l.vars["USER"]):]
 			case (w == "~+" || strings.HasPrefix(w, "~+/")) && dir != "":
 				w = dir + w[2:]
 			}
@@ -982,6 +806,9 @@ type redirect struct {
 	access access
 }
 
+// substituted stands in a word for a command substitution, whose output bosun cannot know, so that the word stays unresolved.
+const substituted = "$()"
+
 // simpleCommands splits a shell script into its simple commands, closely enough to find a git call. It honours quotes and comments, splits at operators, parentheses and backticks, and adds the commands substituted inside double quotes.
 func simpleCommands(script string) []simple {
 	var (
@@ -1037,6 +864,7 @@ func simpleCommands(script string) []simple {
 				case strings.HasPrefix(script[j:], "$("):
 					end := closingParen(script, j+2)
 					cmds = append(cmds, simpleCommands(script[j+2:end])...)
+					word.WriteString(substituted)
 					j = end
 				case script[j] == '`':
 					end := strings.IndexByte(script[j+1:], '`')
@@ -1044,12 +872,35 @@ func simpleCommands(script string) []simple {
 						end = len(script) - j - 1
 					}
 					cmds = append(cmds, simpleCommands(script[j+1:j+1+end])...)
+					word.WriteString(substituted)
 					j += end + 1
 				default:
 					word.WriteByte(script[j])
 				}
 			}
 			i = j
+			inWord = true
+		case strings.HasPrefix(script[i:], "$("):
+			end := closingParen(script, i+2)
+			cmds = append(cmds, simpleCommands(script[i+2:end])...)
+			word.WriteString(substituted)
+			i = end
+			inWord = true
+		case strings.HasPrefix(script[i:], "$'"):
+			// ANSI-C quoting. An escape such as \x2f may spell any byte, so a word that holds one stays unresolved.
+			end := i + 2
+			for end < len(script) && script[end] != '\'' {
+				if script[end] == '\\' {
+					end++
+				}
+				end++
+			}
+			s := script[i+2 : min(end, len(script))]
+			if strings.ContainsRune(s, '\\') {
+				s = "$" + s
+			}
+			word.WriteString(s)
+			i = end
 			inWord = true
 		case c == '#' && !inWord:
 			for i < len(script) && script[i] != '\n' {
@@ -1092,7 +943,8 @@ func redirection(script string, i int) (int, bool) {
 		j++
 	}
 	switch {
-	case j < len(script) && (script[j] == '|' || script[j] == '-'):
+	// zsh's >! overrides noclobber, as bash's >| does.
+	case j < len(script) && (script[j] == '|' || script[j] == '!' || script[j] == '-'):
 		j++
 	case j < len(script) && script[j] == '&':
 		k := j + 1

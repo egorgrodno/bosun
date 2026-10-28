@@ -599,7 +599,10 @@ func (d *daemon) gate(node, cwd string) *gate {
 		return nil
 	}
 	home, _ := os.UserHomeDir()
-	return &gate{cwd: cmp.Or(cwd, n.Dir), writable: d.writable(n), fenced: d.fenced(n), list: newUserList(home, claudeDir(), d.stateDir, os.Getenv), repos: d.repos()}
+	g := &gate{cwd: cmp.Or(cwd, n.Dir), writable: d.writable(n), fenced: d.fenced(n), list: newUserList(home, claudeDir(), d.stateDir, os.Getenv), repos: d.repos()}
+	// A command outside the sandbox names its scratch folder by TMPDIR.
+	g.list.vars["TMPDIR"] = d.scratchDir(n.Node)
+	return g
 }
 
 // fenced lists the folders within the session's own directory that it may not write: for the master, the desk's, whose settings and hooks would run outside the master's sandbox once the desk starts.
